@@ -1,7 +1,5 @@
 # 兼容AMQP/KAFKA/MQTT三种协议的通用消息平台
 
-合并 https://gitee.com/wanwuliandong/flowmq
-
 ## 参考项目
 
 - https://github.com/rushmore/zbus-server
