@@ -776,9 +776,33 @@ std::vector<uint8_t> Frame::serializeConnack(const ConnackPacket &packet) {
     buffer.push_back(connAckFlags);
 
     // Byte 2: Connect Return Code / Reason Code
-    // For MQTT 3.1.1 the reason code has to be a v3 return code, which is
-    // identical to the v5 codes for the values that matter here.
-    buffer.push_back(static_cast<uint8_t>(packet.reasonCode));
+    uint8_t code = static_cast<uint8_t>(packet.reasonCode);
+    if (version == Version::MQTT311 || version == Version::MQTT31) {
+        // MQTT 3.x uses the older return code table; the values that matter
+        // here differ from the v5 reason codes.
+        switch (packet.reasonCode) {
+        case ReasonCode::UNSUPPORTED_PROTOCOL_VERSION:
+            code = 0x01;
+            break;
+        case ReasonCode::CLIENT_IDENTIFIER_NOT_VALID:
+            code = 0x02;
+            break;
+        case ReasonCode::BAD_USERNAME_OR_PASSWORD:
+            code = 0x04;
+            break;
+        case ReasonCode::NOT_AUTHORIZED:
+            code = 0x05;
+            break;
+        case ReasonCode::SERVER_UNAVAILABLE:
+        case ReasonCode::SERVER_BUSY:
+            code = 0x03;
+            break;
+        default:
+            code = packet.reasonCode == ReasonCode::SUCCESS ? 0x00 : static_cast<uint8_t>(packet.reasonCode);
+            break;
+        }
+    }
+    buffer.push_back(code);
     return buffer;
 }
 

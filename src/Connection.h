@@ -13,6 +13,7 @@
 #include "Message.h"
 #include "Frame.h"
 #include "Session.h"
+#include "Auth.h"
 
 namespace MQTT {
 class Broker;
@@ -76,6 +77,7 @@ private:
     Frame frame;
     std::shared_ptr<Session> session;
     Broker* broker;
+    Auth* auth = nullptr;
     std::recursive_mutex writeMutex;
     std::atomic<bool> connected{false};
     std::chrono::steady_clock::time_point lastActivity;

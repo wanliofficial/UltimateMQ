@@ -11,6 +11,7 @@
 #include "Trie.h"
 #include "Message.h"
 #include "Subscription.h"
+#include "Auth.h"
 
 namespace MQTT {
 class Session;
@@ -32,12 +33,23 @@ class Broker {
     std::map<std::string, Message> retainedMessages;
     mutable std::recursive_mutex mutex;
 
+    //! Authentication / access control. The Broker does not own the Auth object:
+    //! it is owned by the Server and outlives the broker. It is immutable after
+    //! load, so queries need no locking here.
+    Auth* auth = nullptr;
+
     //! Resolve the target sessions; called with the broker lock held
     void collectTargets(const Message &message, std::vector<std::shared_ptr<Session>> &targets);
 
 public:
-    explicit Broker();
+    explicit Broker(Auth* auth = nullptr);
     ~Broker() = default;
+
+    //! Attach the authentication/access-control engine (must be done before
+    //! any client connects; the Auth object must outlive the broker)
+    void setAuth(Auth* authHandle) { auth = authHandle; }
+    Auth* getAuth() const { return auth; }
+
     void insertSession(const std::string &clientId, const std::shared_ptr<Session>& session);
     std::shared_ptr<Session> findSession(const std::string &clientId) const;
     //! Remove the session from the map if it is the one mapped to `session`

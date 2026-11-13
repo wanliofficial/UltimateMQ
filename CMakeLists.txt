@@ -17,6 +17,7 @@ add_library(flowmq_lib STATIC
     src/Listener.cpp
     src/Connection.cpp
     src/Session.cpp
+    src/Auth.cpp
 )
 
 # Set include directories for the library

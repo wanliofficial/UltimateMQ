@@ -228,6 +228,27 @@ TEST_F(FrameTest, SerializeConnackForMqtt311HasNoProperties)
     EXPECT_EQ(data, expected);
 }
 
+TEST_F(FrameTest, SerializeConnackForMqtt311MapsFailureCodes)
+{
+    Frame v4(Version::MQTT311);
+    // v5 reason codes must be translated into the v3.1.1 return code table
+    ConnackPacket badCredentials(false, ReasonCode::BAD_USERNAME_OR_PASSWORD);
+    EXPECT_EQ(v4.serialize(badCredentials), (std::vector<uint8_t>{0x20, 0x02, 0x00, 0x04}));
+
+    ConnackPacket notAuthorized(false, ReasonCode::NOT_AUTHORIZED);
+    EXPECT_EQ(v4.serialize(notAuthorized), (std::vector<uint8_t>{0x20, 0x02, 0x00, 0x05}));
+
+    ConnackPacket badProtocol(false, ReasonCode::UNSUPPORTED_PROTOCOL_VERSION);
+    EXPECT_EQ(v4.serialize(badProtocol), (std::vector<uint8_t>{0x20, 0x02, 0x00, 0x01}));
+}
+
+TEST_F(FrameTest, SerializeConnackForMqtt5KeepsV5ReasonCode)
+{
+    Frame v5(Version::MQTT5);
+    ConnackPacket badCredentials(false, ReasonCode::BAD_USERNAME_OR_PASSWORD);
+    EXPECT_EQ(v5.serialize(badCredentials), (std::vector<uint8_t>{0x20, 0x02, 0x00, 0x86}));
+}
+
 TEST_F(FrameTest, SerializePublishForMqtt311HasNoProperties)
 {
     Frame v4(Version::MQTT311);

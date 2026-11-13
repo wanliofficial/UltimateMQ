@@ -7,6 +7,7 @@
 #include <thread>
 #include "Listener.h"
 #include "Broker.h"
+#include "Auth.h"
 
 namespace MQTT {
 
@@ -31,6 +32,7 @@ private:
     void unregisterConnection(int clientSocket);
 
     Broker* broker;
+    std::unique_ptr<Auth> auth;
     std::unique_ptr<Listener> listener;
     std::atomic<bool> running{false};
     std::atomic<size_t> maxConnections;

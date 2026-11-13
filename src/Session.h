@@ -69,6 +69,10 @@ public:
     void resume(const std::shared_ptr<Client>& client);
     void setDisconnectCallback(std::function<void()> callback);
 
+    //! The username this session authenticated with (empty for anonymous / auth-disabled)
+    void setUsername(std::string username) { this->username = std::move(username); }
+    const std::string& getUsername() const { return username; }
+
     //! Queue a message for this session (thread safe)
     void deliver(const std::string& topic, const Message& message);
     //! Queue the retained messages matching a topic filter (honours the retain handling option)
@@ -93,6 +97,7 @@ private:
     std::atomic<bool> connected{false};
     bool cleanStart = true;
     bool persistent = false;
+    std::string username;
     //! Upper bound of the per-session delivery queue
     static constexpr size_t MAX_QUEUED_MESSAGES = 1000;
     uint16_t packetId = 1;
@@ -110,6 +115,7 @@ private:
     uint16_t nextPacketId();
 
     Broker* broker;
+    Auth* auth = nullptr;
     bool newSubscription = true;
 };
 

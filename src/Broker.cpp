@@ -9,7 +9,7 @@
 
 namespace MQTT {
 
-Broker::Broker() : trie(std::make_unique<Trie>()) {}
+Broker::Broker(Auth* auth) : trie(std::make_unique<Trie>()), auth(auth) {}
 
 void Broker::insertSession(const std::string &clientId, const std::shared_ptr<Session>& session) {
     std::lock_guard<std::recursive_mutex> lock(mutex);

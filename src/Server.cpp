@@ -3,6 +3,7 @@
 #include "Connection.h"
 #include <stdexcept>
 #include <cstring>
+#include <cstdlib>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <iostream>
@@ -13,7 +14,26 @@ namespace MQTT {
 Server::Server(int port, size_t maxConnections)
     : maxConnections(maxConnections == 0 ? 1024 : maxConnections) {
     listener = std::make_unique<Listener>(port);
-    broker = new Broker();
+    auth = std::make_unique<Auth>();
+    std::string error;
+    const char* passwordFile = getenv("FLOWMQ_PASSWORD_FILE");
+    if (passwordFile && *passwordFile) {
+        if (!auth->loadUsers(passwordFile, &error)) {
+            throw std::runtime_error("failed to load password file: " + error);
+        }
+    }
+    const char* aclFile = getenv("FLOWMQ_ACL_FILE");
+    if (aclFile && *aclFile) {
+        if (!auth->loadAcl(aclFile, &error)) {
+            throw std::runtime_error("failed to load acl file: " + error);
+        }
+    }
+    logInfo("authentication %s, acl %s", auth->authRequired() ? "enabled" : "disabled",
+            auth->aclEnabled() ? "enabled" : "disabled");
+    if (auth->aclEnabled() && !auth->authRequired()) {
+        logError("acl is enabled without authentication: clients can claim any username");
+    }
+    broker = new Broker(auth.get());
 }
 
 Server::~Server() {

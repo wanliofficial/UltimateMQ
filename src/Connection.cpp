@@ -3,6 +3,7 @@
 #include "Topic.h"
 #include "Session.h"
 #include "Broker.h"
+#include "Auth.h"
 #include <unistd.h>
 #include <sys/socket.h>
 #include <poll.h>
@@ -25,6 +26,7 @@ constexpr int POLL_SLICE_MS = 250;
 
 Connection::Connection(int sockfd, Broker* broker)
     : sockfd(sockfd), state(State::IDLE), broker(broker),
+      auth(broker ? broker->getAuth() : nullptr),
       lastActivity(std::chrono::steady_clock::now()) { }
 
 Connection::~Connection() {
@@ -160,6 +162,13 @@ void Connection::publishWill() {
     Message will = willMessage;
     will.qos = willMessage.qos;
     will.retain = willMessage.retain;
+    // The Will is published as the client, so the same write ACL applies as
+    // for a regular PUBLISH
+    const std::string username = session ? session->getUsername() : std::string();
+    if (auth && auth->isForbidden(username, will.topic, /*write=*/true)) {
+        logDebug("denied will on %s (acl)", will.topic.c_str());
+        return;
+    }
     broker->publish(will);
 }
 
@@ -209,6 +218,32 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     }
     frame.setVersion(connect->protocolVersion);
 
+    // Authenticate before any session state is touched (and before the Will is
+    // armed): a rejected client must not be able to take over an existing
+    // session, learn about its messages, or publish a Will message.
+    std::string username;
+    if (auth && auth->authRequired()) {
+        if (!connect->username) {
+            logInfo("rejecting client %s: username required", connect->clientId.c_str());
+            ConnackPacket connack{false, ReasonCode::BAD_USERNAME_OR_PASSWORD};
+            sendPacket(connack);
+            state = State::DISCONNECTED;
+            return;
+        }
+        username = *connect->username;
+        const std::string password = connect->password ? *connect->password : std::string();
+        if (!auth->authenticate(username, password)) {
+            logInfo("rejecting client %s: bad credentials for user %s",
+                    connect->clientId.c_str(), username.c_str());
+            ConnackPacket connack{false, ReasonCode::BAD_USERNAME_OR_PASSWORD};
+            sendPacket(connack);
+            state = State::DISCONNECTED;
+            return;
+        }
+    } else if (connect->username) {
+        username = *connect->username;
+    }
+
     keepAliveSeconds = connect->keepAlive;
     armKeepAliveTimer();
 
@@ -221,6 +256,15 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     // left behind by an earlier connection; otherwise the existing session is
     // reused so that its subscriptions and unacknowledged messages survive.
     auto existing = broker->findSession(connect->clientId);
+    // A session belongs to the user that authenticated for it: never hand the
+    // subscriptions and buffered messages of one user to another. If the
+    // username changes, drop the old session and start fresh.
+    if (existing && existing->getUsername() != username) {
+        logInfo("client %s changed user (%s -> %s), discarding its session",
+                connect->clientId.c_str(), existing->getUsername().c_str(), username.c_str());
+        existing->discard();
+        existing.reset();
+    }
     if (existing && connect->cleanStart) {
         existing->discard();
         existing.reset();
@@ -229,6 +273,7 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
 
     auto sessionToUse = resumed ? existing : std::make_shared<Session>(broker, connect->clientId,
                                                                         connect->cleanStart);
+    sessionToUse->setUsername(username);
     session = sessionToUse;
 
     setDisconnectCallback([weak = weak_from_this()]() {
@@ -267,6 +312,25 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
 void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
     if (!session) {
         throw std::runtime_error("PUBLISH before CONNECT");
+    }
+    // Access control: a client may only publish to topics it is allowed to write
+    if (auth && auth->isForbidden(session->getUsername(), publish->topicName, /*write=*/true)) {
+        logDebug("client %s: denied write on %s (acl)", session->getClientId().c_str(),
+                 publish->topicName.c_str());
+        if (publish->qos == QoS::QOS_1) {
+            PubackPacket puback{publish->packetId, ReasonCode::NOT_AUTHORIZED};
+            sendPacket(puback);
+        } else if (publish->qos == QoS::QOS_2) {
+            PubrecPacket pubrec{publish->packetId, ReasonCode::NOT_AUTHORIZED};
+            sendPacket(pubrec);
+        } else if (frame.getVersion() == Version::MQTT5) {
+            // MQTT 5: a QoS0 violation is reported with a DISCONNECT
+            DisconnectPacket disconnect{ReasonCode::NOT_AUTHORIZED};
+            sendPacket(disconnect);
+            state = State::DISCONNECTED;
+        }
+        // MQTT 3.1.1 has no way to report a QoS0 rejection; silently drop it
+        return;
     }
     Message message{publish->topicName, publish->payload, publish->qos, publish->retain};
     ReasonCode reason = session->publish(publish->packetId, message);
@@ -313,19 +377,41 @@ void Connection::handleSubscribe(std::shared_ptr<SubscribePacket> subscribe) {
     if (!session) {
         throw std::runtime_error("SUBSCRIBE before CONNECT");
     }
+    // Access control: subscribe only to filters the client may read. A denied
+    // filter is reported in the SUBACK and is not registered.
+    std::vector<bool> accepted;
     for (const auto& subscription : subscribe->subscriptions) {
-        session->subscribe(subscription.first, subscription.second);
+        bool allowed = !(auth && auth->isForbidden(session->getUsername(), subscription.first,
+                                                   /*write=*/false));
+        if (!allowed) {
+            logDebug("client %s: denied subscribe to %s (acl)", session->getClientId().c_str(),
+                     subscription.first.c_str());
+        } else {
+            session->subscribe(subscription.first, subscription.second);
+        }
+        accepted.push_back(allowed);
     }
     SubackPacket suback{subscribe->packetId};
 
-    // Grant the requested QoS
-    for (const auto& subscription : subscribe->subscriptions) {
-        suback.reasonCodes.push_back(static_cast<ReasonCode>(static_cast<uint8_t>(subscription.second.maximumQos)));
+    // Grant the requested QoS, or report the failure for the denied filters
+    const bool isV5 = frame.getVersion() == Version::MQTT5;
+    const uint8_t failureCode = isV5 ? static_cast<uint8_t>(ReasonCode::NOT_AUTHORIZED) : 0x80;
+    for (size_t i = 0; i < subscribe->subscriptions.size(); ++i) {
+        if (!accepted[i]) {
+            suback.reasonCodes.push_back(static_cast<ReasonCode>(failureCode));
+        } else {
+            suback.reasonCodes.push_back(static_cast<ReasonCode>(
+                static_cast<uint8_t>(subscribe->subscriptions[i].second.maximumQos)));
+        }
     }
     sendPacket(suback);
 
     // Retained messages are delivered after the SUBACK (MQTT-3.3.1-9)
-    for (const auto& subscription : subscribe->subscriptions) {
+    for (size_t i = 0; i < subscribe->subscriptions.size(); ++i) {
+        if (!accepted[i]) {
+            continue;
+        }
+        const auto& subscription = subscribe->subscriptions[i];
         if (!Topic::isShared(subscription.first)) {
             session->deliverRetained(subscription.first, subscription.second);
         }

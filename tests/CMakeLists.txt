@@ -11,6 +11,7 @@ set(TEST_SOURCES
     FrameTests.cpp
     FrameStreamTests.cpp
     SessionLifecycleTests.cpp
+    AuthTests.cpp
     # Add more test files here as you create them
 )
 

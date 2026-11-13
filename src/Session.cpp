@@ -12,13 +12,20 @@
 namespace MQTT {
 
 Session::Session(Broker *broker, const std::string &clientId, bool cleanStart)
-    : clientId(clientId), cleanStart(cleanStart), broker(broker) {}
+    : clientId(clientId), cleanStart(cleanStart), broker(broker) {
+    if (broker) {
+        auth = broker->getAuth();
+    }
+}
 
 Session::~Session() = default;
 
 void Session::connect(const std::shared_ptr<Session> &self, bool persistent) {
     this->persistent = persistent;
     connected = true;
+    if (broker) {
+        auth = broker->getAuth();
+    }
     // The broker keeps a strong reference so the session (and its in-flight
     // state) can outlive the TCP connection for a later reconnect
     broker->insertSession(clientId, self);
@@ -189,6 +196,13 @@ void Session::setDisconnectCallback(std::function<void()> callback) {
 void Session::deliver(const std::string &topic, const Message &message) {
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
 
+    // Enforce read access before anything else: an unauthorized client must not
+    // learn that a message exists on a topic it can read via subscription
+    if (auth && auth->isForbidden(username, topic, /*write=*/false)) {
+        logDebug("session %s: denied read on %s (acl)", clientId.c_str(), topic.c_str());
+        return;
+    }
+
     QoS qos = message.qos;
     auto it = subscriptions.find(topic);
     if (it != subscriptions.end() && it->second.maximumQos < qos) {
@@ -211,6 +225,11 @@ void Session::deliverRetained(const std::string &topicFilter, const Subscription
         return;
     }
 
+    // Enforce read access per retained topic below: an unauthorized client must
+    // not learn that a retained message exists on a topic it may not read. A
+    // filter can be broader than the rule that actually grants it, so the check
+    // uses each concrete topic, not the subscription filter.
+
     // Snapshot the retained messages under the broker lock (never while holding
     // the session lock, to keep Broker -> Session lock ordering)
     auto retained = broker->snapshotRetained();
@@ -222,6 +241,10 @@ void Session::deliverRetained(const std::string &topicFilter, const Subscription
     }
     for (const auto &[topic, message] : retained) {
         if (!Topic::match(topic, topicFilter)) {
+            continue;
+        }
+        if (auth && auth->isForbidden(username, topic, /*write=*/false)) {
+            logDebug("session %s: denied read on %s (acl, retained)", clientId.c_str(), topic.c_str());
             continue;
         }
         Message outgoing = message;
