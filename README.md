@@ -1,6 +1,6 @@
-# FlowMQ
+# UltimateMQ
 
-FlowMQ is an experimental MQTT broker written in C++ with cursor.
+UltimateMQ is an experimental MQTT broker written in C++ with cursor.
 
 ## Prerequisites
 
