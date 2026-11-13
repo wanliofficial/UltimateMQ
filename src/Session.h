@@ -12,6 +12,7 @@
 #include "Message.h"
 #include "MQTT.h"
 #include "Broker.h"
+#include "Store.h"
 
 namespace MQTT {
 
@@ -41,6 +42,9 @@ public:
 
 class Session : public std::enable_shared_from_this<Session> {
 public:
+    //! The durable part of a session, as written to the state file
+    using Snapshot = PersistedSession;
+
     Session(Broker* broker, const std::string& clientId, bool cleanStart = true);
     ~Session();
 
@@ -72,6 +76,18 @@ public:
     //! The username this session authenticated with (empty for anonymous / auth-disabled)
     void setUsername(std::string username) { this->username = std::move(username); }
     const std::string& getUsername() const { return username; }
+
+    //! Mark the session as persistent (it will be written to the state file)
+    void setPersistent(bool value) { persistent = value; }
+    //! Attach the access-control engine (used for read checks on delivery)
+    void setAuth(Auth* authHandle) { auth = authHandle; }
+    //! Callback invoked on every durable change; must not take other locks
+    void setMutateCallback(std::function<void()> callback);
+    //! Copy the durable state out, for the persistence store (thread safe)
+    Snapshot snapshot() const;
+    //! Restore durable state on startup; the caller inserts the session into the
+    //! broker afterwards. Does not touch the broker.
+    void restore(const Snapshot& snapshot);
 
     //! Queue a message for this session (thread safe)
     void deliver(const std::string& topic, const Message& message);
@@ -107,8 +123,12 @@ private:
     std::vector<Delivery> pendingDeliveries;
     std::shared_ptr<Client> client;
 
-    std::recursive_mutex deliveryMutex;
+    mutable std::recursive_mutex deliveryMutex;
     std::function<void()> onDisconnect;
+    //! Invoked whenever the durable state changes (dirty marker / persistence)
+    std::function<void()> mutateCallback;
+    //! Called with deliveryMutex held; never takes any other lock
+    void notifyMutation();
 
     void pushDelivery(const Message& message, QoS qos);
     void removeSubscriptions(const std::map<std::string, SubscriptionOptions>& filters);

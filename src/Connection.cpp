@@ -273,7 +273,10 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
 
     auto sessionToUse = resumed ? existing : std::make_shared<Session>(broker, connect->clientId,
                                                                         connect->cleanStart);
+    // The session belongs to the user it authenticated with, and a persistent
+    // connection keeps it across disconnects (unless cleanStart discarded it)
     sessionToUse->setUsername(username);
+    sessionToUse->setPersistent(!connect->cleanStart);
     session = sessionToUse;
 
     setDisconnectCallback([weak = weak_from_this()]() {

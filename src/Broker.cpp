@@ -9,11 +9,61 @@
 
 namespace MQTT {
 
-Broker::Broker(Auth* auth) : trie(std::make_unique<Trie>()), auth(auth) {}
+Broker::Broker(Auth* auth, Store* store) : trie(std::make_unique<Trie>()), auth(auth), store(store) {}
+
+PersistedState Broker::snapshotState() const {
+    PersistedState state;
+    // Collect the persistent sessions under the broker lock, then snapshot each
+    // one. The lock order is Broker -> Session, matching every other path.
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        state.retained = retainedMessages;
+        for (const auto &[clientId, session] : sessions) {
+            if (session && session->isPersistent()) {
+                state.sessions.push_back(session->snapshot());
+            }
+        }
+    }
+    return state;
+}
+
+void Broker::restoreState(const PersistedState &state) {
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        retainedMessages = state.retained;
+        for (const auto &persisted : state.sessions) {
+            auto session = std::make_shared<Session>(this, persisted.clientId, /*cleanStart=*/false);
+            session->restore(persisted);
+            session->setMutateCallback([this]() { notifyStateChanged(); });
+            session->setAuth(auth);
+            sessions[persisted.clientId] = session;
+            // Re-create the routing entries so live publishes reach the session
+            // while it is offline (they are buffered until it reconnects)
+            for (const auto &entry : persisted.subscriptions) {
+                const std::string &filter = entry.first;
+                if (Topic::isShared(filter)) {
+                    auto [group, realFilter] = Topic::splitShared(filter);
+                    sharedSubscriptions[realFilter].push_back(
+                        SharedSubscription(persisted.clientId, realFilter, group));
+                    trie->insert(filter);
+                } else {
+                    subscriptions[filter].insert(persisted.clientId);
+                    trie->insert(filter);
+                }
+            }
+        }
+    }
+    logInfo("restored %zu retained message(s) and %zu persistent session(s) from disk",
+            state.retained.size(), state.sessions.size());
+}
 
 void Broker::insertSession(const std::string &clientId, const std::shared_ptr<Session>& session) {
     std::lock_guard<std::recursive_mutex> lock(mutex);
     sessions[clientId] = session;
+    if (session) {
+        // Every durable mutation of this session marks the store dirty
+        session->setMutateCallback([this]() { notifyStateChanged(); });
+    }
 }
 
 std::shared_ptr<Session> Broker::findSession(const std::string &clientId) const {
@@ -175,6 +225,8 @@ void Broker::collectTargets(const Message &message, std::vector<std::shared_ptr<
         } else {
             retainedMessages[message.topic] = message;
         }
+        // The retained set is durable state
+        notifyStateChanged();
     }
 
     std::vector<std::string> topicFilters = trie->match(message.topic);

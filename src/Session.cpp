@@ -29,7 +29,58 @@ void Session::connect(const std::shared_ptr<Session> &self, bool persistent) {
     // The broker keeps a strong reference so the session (and its in-flight
     // state) can outlive the TCP connection for a later reconnect
     broker->insertSession(clientId, self);
+    // A persistent session is durable state from now on
+    if (persistent) {
+        broker->notifyStateChanged();
+    }
     logDebug("session connected: %s (persistent=%d)", clientId.c_str(), (int)persistent);
+}
+
+Session::Snapshot Session::snapshot() const {
+    std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
+    Snapshot snapshot;
+    snapshot.clientId = clientId;
+    snapshot.username = username;
+    snapshot.nextPacketId = packetId;
+    snapshot.subscriptions = subscriptions;
+    snapshot.inflight.reserve(inflightMessages.size());
+    for (const auto &entry : inflightMessages) {
+        if (entry.second) {
+            snapshot.inflight.emplace_back(entry.first, *entry.second);
+        }
+    }
+    snapshot.awaitingPubrel = awaitingPubrel;
+    return snapshot;
+}
+
+void Session::restore(const Snapshot &snapshot) {
+    {
+        std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
+        username = snapshot.username;
+        // A restored session was persistent by definition
+        persistent = true;
+        packetId = snapshot.nextPacketId == 0 ? 1 : snapshot.nextPacketId;
+        subscriptions = snapshot.subscriptions;
+        inflightMessages.clear();
+        for (const auto &entry : snapshot.inflight) {
+            inflightMessages[entry.first] = std::make_shared<Message>(entry.second);
+        }
+        awaitingPubrel = snapshot.awaitingPubrel;
+    }
+    connected = false;
+}
+
+void Session::setMutateCallback(std::function<void()> callback) {
+    std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
+    mutateCallback = std::move(callback);
+}
+
+void Session::notifyMutation() {
+    // Called with deliveryMutex held. The callback only flips an atomic flag, so
+    // it can never re-enter the session or block on another lock.
+    if (mutateCallback) {
+        mutateCallback();
+    }
 }
 
 void Session::close(const std::shared_ptr<Client> &client) {
@@ -60,6 +111,8 @@ void Session::close(const std::shared_ptr<Client> &client) {
         removeSubscriptions(filters);
         broker->forgetSession(this);
     }
+    // The durable state changed (session went offline, or was dropped entirely)
+    broker->notifyStateChanged();
     logDebug("session closed: %s (persistent=%d)", clientId.c_str(), (int)persistent);
     if (notify) {
         notify();
@@ -98,6 +151,8 @@ void Session::discard() {
     connected = false;
     removeSubscriptions(filters);
     broker->forgetSession(this);
+    // The session is gone: drop it from the durable state as well
+    broker->notifyStateChanged();
     if (notify) {
         notify();
     }
@@ -108,30 +163,39 @@ ReasonCode Session::publish(uint16_t packetId, const Message &message) {
     if (message.qos == QoS::QOS_2) {
         std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
         awaitingPubrel.insert(packetId);
+        notifyMutation();
     }
     return ReasonCode::SUCCESS;
 }
 
 void Session::puback(uint16_t packetId) {
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
-    inflightMessages.erase(packetId);
+    if (inflightMessages.erase(packetId) > 0) {
+        notifyMutation();
+    }
 }
 
 ReasonCode Session::pubrec(uint16_t packetId) {
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
-    inflightMessages.erase(packetId);
+    if (inflightMessages.erase(packetId) > 0) {
+        notifyMutation();
+    }
     return ReasonCode::SUCCESS;
 }
 
 ReasonCode Session::pubrel(uint16_t packetId) {
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
-    awaitingPubrel.erase(packetId);
+    if (awaitingPubrel.erase(packetId) > 0) {
+        notifyMutation();
+    }
     return ReasonCode::SUCCESS;
 }
 
 void Session::pubcomp(uint16_t packetId) {
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
-    inflightMessages.erase(packetId);
+    if (inflightMessages.erase(packetId) > 0) {
+        notifyMutation();
+    }
 }
 
 void Session::subscribe(const std::string &topicFilter, const SubscriptionOptions &options) {
@@ -139,6 +203,7 @@ void Session::subscribe(const std::string &topicFilter, const SubscriptionOption
         std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
         newSubscription = subscriptions.find(topicFilter) == subscriptions.end();
         subscriptions[topicFilter] = options;
+        notifyMutation();
     }
     if (Topic::isShared(topicFilter)) {
         auto [group, realTopicFilter] = Topic::splitShared(topicFilter);
@@ -151,7 +216,9 @@ void Session::subscribe(const std::string &topicFilter, const SubscriptionOption
 void Session::unsubscribe(const std::string &topicFilter) {
     {
         std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
-        subscriptions.erase(topicFilter);
+        if (subscriptions.erase(topicFilter) > 0) {
+            notifyMutation();
+        }
     }
     if (Topic::isShared(topicFilter)) {
         auto [group, realTopicFilter] = Topic::splitShared(topicFilter);
@@ -270,6 +337,7 @@ void Session::pushDelivery(const Message &message, QoS qos) {
     if (qos != QoS::QOS_0) {
         id = nextPacketId();
         inflightMessages[id] = std::make_shared<Message>(outgoing);
+        notifyMutation();
     }
     // Only queue while the broker lock is held (Broker::publish) or while this
     // session lock is held: flush() is then called outside of both.

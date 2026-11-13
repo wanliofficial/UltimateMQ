@@ -31,6 +31,7 @@ All configuration is read from environment variables at startup.
 | `FLOWMQ_DEBUG` | unset | Emit debug traces to stderr |
 | `FLOWMQ_PASSWORD_FILE` | unset | User database; enables authentication when present |
 | `FLOWMQ_ACL_FILE` | unset | Per-user topic access rules; enables ACL enforcement when present |
+| `FLOWMQ_STATE_FILE` | unset | Durable state file; retained messages and persistent sessions survive a restart when set |
 
 When neither file is set the broker stays fully open (every client may
 connect and use every topic), which keeps the historical behaviour.
@@ -71,6 +72,29 @@ bob,read,#
 * A session is bound to the user that created it: connecting with the same
   client id as a different user discards the old session instead of handing
   over its subscriptions and buffered messages.
+
+#### Durable state (`FLOWMQ_STATE_FILE`)
+
+Without this variable the broker keeps everything in memory, exactly as before.
+With it, the following survive a restart:
+
+* retained messages;
+* every session created with `cleanStart=false`, together with its
+  subscriptions, its next packet id and its unacknowledged QoS 1/2 messages.
+  An unacknowledged message is retransmitted with `DUP=1` on reconnect.
+
+The file is written by a background thread at most once per second and again on
+`SIGINT`/`SIGTERM`, always atomically (a temporary file is renamed into place),
+so a crash never leaves a half-written state file behind. A state file with an
+unrecognised header aborts startup instead of silently discarding sessions.
+
+```bash
+FLOWMQ_STATE_FILE=/var/lib/flowmq/state.dat ./flowmq
+```
+
+QoS 0 messages are at-most-once and are not persisted. The offline queue of a
+session is not stored separately: QoS>0 messages already live in its
+unacknowledged set and are re-queued on reconnect, which avoids duplicates.
 
 ## Contributing
 

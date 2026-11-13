@@ -1,0 +1,274 @@
+#include <gtest/gtest.h>
+#include "../src/Store.h"
+#include "../src/Broker.h"
+#include "../src/Session.h"
+#include "../src/Message.h"
+#include "TestClient.h"
+#include <cstdio>
+#include <fstream>
+#include <string>
+#include <unistd.h>
+
+namespace MQTT {
+
+namespace {
+
+std::string tempPath(const std::string &name) {
+    std::string path = "/tmp/flowmq_store_" + std::to_string(::getpid()) + "_" + name;
+    ::remove(path.c_str());
+    return path;
+}
+
+SubscriptionOptions optionsFor(QoS qos) {
+    return SubscriptionOptions{qos, false, false,
+                               RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES};
+}
+
+Message messageFor(const std::string &topic, const std::string &payload, QoS qos, bool retain = false) {
+    Message message;
+    message.topic = topic;
+    message.payload.assign(payload.begin(), payload.end());
+    message.qos = qos;
+    message.retain = retain;
+    return message;
+}
+
+//! One populated state, used by both the store and the broker tests
+PersistedState sampleState() {
+    PersistedState state;
+    state.retained["a/b"] = messageFor("a/b", "kept", QoS::QOS_0, /*retain=*/true);
+    state.retained["bin/\x01\x02"] = messageFor("bin/\x01\x02", std::string("\x00\xff", 2), QoS::QOS_1);
+
+    PersistedSession session;
+    session.clientId = "client-1";
+    session.username = "alice";
+    session.nextPacketId = 7;
+    session.subscriptions["a/#"] = optionsFor(QoS::QOS_2);
+    session.subscriptions["$/shared/g/x"] = SubscriptionOptions{QoS::QOS_1, true, true,
+                                                                RetainHandling::SEND_RETAINED_MESSAGES_AT_SUBSCRIBE_IF_NEW};
+    session.inflight.emplace_back(3, messageFor("a/b", std::string("\x00\x01\x02", 3), QoS::QOS_1));
+    session.awaitingPubrel.insert(3);
+    session.awaitingPubrel.insert(9);
+    state.sessions.push_back(session);
+    return state;
+}
+
+void writeRaw(const std::string &path, const std::string &content) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out << content;
+}
+
+} // namespace
+
+TEST(StoreTest, RoundTripsTheWholeState)
+{
+    const std::string path = tempPath("roundtrip.dat");
+    Store store(path, std::chrono::milliseconds(10));
+    ASSERT_TRUE(store.enabled());
+
+    const PersistedState expected = sampleState();
+    ASSERT_TRUE(store.flushNow([] { return sampleState(); }));
+
+    PersistedState actual;
+    std::string error;
+    ASSERT_TRUE(store.load(actual, &error)) << error;
+
+    ASSERT_EQ(actual.retained.size(), expected.retained.size());
+    for (const auto &entry : expected.retained) {
+        auto it = actual.retained.find(entry.first);
+        ASSERT_NE(it, actual.retained.end()) << entry.first;
+        EXPECT_EQ(it->second.payload, entry.second.payload);
+        EXPECT_EQ(it->second.qos, entry.second.qos);
+        EXPECT_EQ(it->second.retain, entry.second.retain);
+    }
+
+    ASSERT_EQ(actual.sessions.size(), 1U);
+    const PersistedSession &session = actual.sessions[0];
+    EXPECT_EQ(session.clientId, "client-1");
+    EXPECT_EQ(session.username, "alice");
+    EXPECT_EQ(session.nextPacketId, 7U);
+    ASSERT_EQ(session.subscriptions.size(), 2U);
+    EXPECT_EQ(session.subscriptions.at("a/#").maximumQos, QoS::QOS_2);
+    const SubscriptionOptions &shared = session.subscriptions.at("$/shared/g/x");
+    EXPECT_EQ(shared.maximumQos, QoS::QOS_1);
+    EXPECT_TRUE(shared.noLocal);
+    EXPECT_TRUE(shared.retainAsPublished);
+    EXPECT_EQ(shared.retainHandling, RetainHandling::SEND_RETAINED_MESSAGES_AT_SUBSCRIBE_IF_NEW);
+
+    ASSERT_EQ(session.inflight.size(), 1U);
+    EXPECT_EQ(session.inflight[0].first, 3U);
+    EXPECT_EQ(session.inflight[0].second.payload, (std::vector<uint8_t>{0x00, 0x01, 0x02}));
+    EXPECT_EQ(session.awaitingPubrel, (std::set<uint16_t>{3, 9}));
+
+    ::remove(path.c_str());
+}
+
+TEST(StoreTest, PreservesAnEmptyUsername)
+{
+    const std::string path = tempPath("anon.dat");
+    Store store(path, std::chrono::milliseconds(10));
+
+    PersistedState state;
+    PersistedSession session;
+    session.clientId = "anon";
+    session.username = ""; // anonymous client: the field must not shift
+    session.nextPacketId = 2;
+    session.subscriptions["t"] = optionsFor(QoS::QOS_0);
+    state.sessions.push_back(session);
+
+    ASSERT_TRUE(store.flushNow([&state] { return state; }));
+
+    PersistedState loaded;
+    std::string error;
+    ASSERT_TRUE(store.load(loaded, &error)) << error;
+    ASSERT_EQ(loaded.sessions.size(), 1U);
+    EXPECT_EQ(loaded.sessions[0].clientId, "anon");
+    EXPECT_TRUE(loaded.sessions[0].username.empty());
+    EXPECT_EQ(loaded.sessions[0].nextPacketId, 2U);
+    EXPECT_EQ(loaded.sessions[0].subscriptions.count("t"), 1U);
+
+    ::remove(path.c_str());
+}
+
+TEST(StoreTest, MissingFileLoadsAsEmptyState)
+{
+    const std::string path = tempPath("missing.dat");
+    Store store(path, std::chrono::milliseconds(10));
+
+    PersistedState state;
+    std::string error;
+    EXPECT_TRUE(store.load(state, &error)) << error;
+    EXPECT_TRUE(error.empty());
+    EXPECT_TRUE(state.retained.empty());
+    EXPECT_TRUE(state.sessions.empty());
+}
+
+TEST(StoreTest, EmptyFileLoadsAsEmptyState)
+{
+    const std::string path = tempPath("empty.dat");
+    writeRaw(path, "");
+    Store store(path, std::chrono::milliseconds(10));
+
+    PersistedState state;
+    std::string error;
+    EXPECT_TRUE(store.load(state, &error)) << error;
+    EXPECT_TRUE(state.sessions.empty());
+
+    ::remove(path.c_str());
+}
+
+TEST(StoreTest, RejectsACorruptHeader)
+{
+    const std::string path = tempPath("corrupt.dat");
+    writeRaw(path, "NOT-A-FLOWMQ-STATE\nsession 6162 2d 1\n");
+    Store store(path, std::chrono::milliseconds(10));
+
+    PersistedState state;
+    std::string error;
+    EXPECT_FALSE(store.load(state, &error));
+    EXPECT_FALSE(error.empty()) << "a corrupt file must report an error";
+
+    ::remove(path.c_str());
+}
+
+TEST(StoreTest, RejectsAnUnknownRecord)
+{
+    const std::string path = tempPath("unknown.dat");
+    writeRaw(path, "FLOWMQ-STATE-1\nbogus 1 2 3\n");
+    Store store(path, std::chrono::milliseconds(10));
+
+    PersistedState state;
+    std::string error;
+    EXPECT_FALSE(store.load(state, &error));
+    EXPECT_NE(error.find("bogus"), std::string::npos) << error;
+
+    ::remove(path.c_str());
+}
+
+TEST(StoreTest, DisabledStoreIsInert)
+{
+    Store store(std::string(), std::chrono::milliseconds(10));
+    EXPECT_FALSE(store.enabled());
+    // Flushing a disabled store succeeds without writing anything
+    EXPECT_TRUE(store.flushNow([] { return sampleState(); }));
+
+    PersistedState state;
+    EXPECT_TRUE(store.load(state));
+    EXPECT_TRUE(state.sessions.empty());
+}
+
+TEST(BrokerStoreTest, SnapshotAndRestoreRoundTrip)
+{
+    Broker source;
+    auto session = std::make_shared<Session>(&source, "durable", /*cleanStart=*/false);
+    // Build the durable state in one go: restore() replaces username and
+    // subscriptions, so it must run before the session is inserted
+    PersistedSession sourceSnapshot;
+    sourceSnapshot.clientId = "durable";
+    sourceSnapshot.username = "alice";
+    sourceSnapshot.nextPacketId = 5;
+    sourceSnapshot.subscriptions["a/#"] = optionsFor(QoS::QOS_1);
+    sourceSnapshot.inflight.emplace_back(4, messageFor("a/b", "pending", QoS::QOS_1));
+    session->restore(sourceSnapshot);
+    source.insertSession("durable", session);
+    // A retained message published into the broker must be part of the snapshot
+    source.publish(messageFor("a/b", "kept", QoS::QOS_0, /*retain=*/true));
+
+    const PersistedState snapshot = source.snapshotState();
+    ASSERT_EQ(snapshot.sessions.size(), 1U);
+    ASSERT_EQ(snapshot.retained.count("a/b"), 1U);
+
+    // Restore into a fresh broker, as a restart would
+    Broker restored;
+    restored.restoreState(snapshot);
+
+    EXPECT_EQ(restored.snapshotState().sessions.size(), 1U);
+    auto session2 = restored.findSession("durable");
+    ASSERT_NE(session2, nullptr);
+    EXPECT_TRUE(session2->isPersistent());
+    EXPECT_EQ(session2->getUsername(), "alice");
+
+    // The restored session still routes: a publish reaches it while offline
+    auto subscriber = test::attach(*session2);
+    restored.publish(messageFor("a/b", "live", QoS::QOS_0));
+    session2->flush();
+    ASSERT_EQ(subscriber->size(), 1U);
+    EXPECT_EQ(subscriber->snapshot()[0].topic, "a/b");
+    EXPECT_EQ(subscriber->snapshot()[0].payload, std::vector<uint8_t>({'l', 'i', 'v', 'e'}));
+}
+
+TEST(BrokerStoreTest, CleanSessionsAreNotPersisted)
+{
+    Broker broker;
+    auto session = std::make_shared<Session>(&broker, "ephemeral", /*cleanStart=*/true);
+    session->setPersistent(false);
+    broker.insertSession("ephemeral", session);
+
+    EXPECT_TRUE(broker.snapshotState().sessions.empty());
+}
+
+TEST(BrokerStoreTest, EveryMutationMarksTheStoreDirty)
+{
+    const std::string path = tempPath("dirty.dat");
+    Store store(path, std::chrono::milliseconds(10));
+    Broker broker(nullptr, &store);
+
+    auto session = std::make_shared<Session>(&broker, "c", /*cleanStart=*/false);
+    session->setPersistent(true);
+    broker.insertSession("c", session);
+
+    // Subscribe is a durable change: a snapshot taken afterwards must contain it
+    session->subscribe("x/y", optionsFor(QoS::QOS_0));
+    PersistedState state = broker.snapshotState();
+    ASSERT_EQ(state.sessions.size(), 1U);
+    EXPECT_EQ(state.sessions[0].subscriptions.count("x/y"), 1U);
+
+    session->unsubscribe("x/y");
+    state = broker.snapshotState();
+    ASSERT_EQ(state.sessions.size(), 1U);
+    EXPECT_EQ(state.sessions[0].subscriptions.count("x/y"), 0U);
+
+    ::remove(path.c_str());
+}
+
+} // namespace MQTT

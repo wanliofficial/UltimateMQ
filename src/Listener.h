@@ -16,6 +16,8 @@ public:
 
     void start();
     int acceptConnection();
+    //! The listening descriptor (for poll()), or -1 before start()
+    int fd() const { return sockfd; }
     void stop();
 };
 

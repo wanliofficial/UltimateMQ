@@ -18,6 +18,7 @@ add_library(flowmq_lib STATIC
     src/Connection.cpp
     src/Session.cpp
     src/Auth.cpp
+    src/Store.cpp
 )
 
 # Set include directories for the library

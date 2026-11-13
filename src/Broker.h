@@ -8,10 +8,12 @@
 #include <map>
 #include <unordered_map>
 #include <memory>
+#include <atomic>
 #include "Trie.h"
 #include "Message.h"
 #include "Subscription.h"
 #include "Auth.h"
+#include "Store.h"
 
 namespace MQTT {
 class Session;
@@ -38,17 +40,36 @@ class Broker {
     //! load, so queries need no locking here.
     Auth* auth = nullptr;
 
+    //! Durable state. Not owned by the broker (the Server owns it); may be null.
+    Store* store = nullptr;
+
     //! Resolve the target sessions; called with the broker lock held
     void collectTargets(const Message &message, std::vector<std::shared_ptr<Session>> &targets);
 
 public:
-    explicit Broker(Auth* auth = nullptr);
+    explicit Broker(Auth* auth = nullptr, Store* store = nullptr);
     ~Broker() = default;
 
     //! Attach the authentication/access-control engine (must be done before
     //! any client connects; the Auth object must outlive the broker)
     void setAuth(Auth* authHandle) { auth = authHandle; }
     Auth* getAuth() const { return auth; }
+
+    //! Attach the persistence store (must be done before restore()). Not owned.
+    void setStore(Store* storeHandle) { store = storeHandle; }
+    Store* getStore() const { return store; }
+    //! Flag the durable state as changed (cheap: a single atomic store)
+    void notifyStateChanged() {
+        if (store) {
+            store->markDirty();
+        }
+    }
+    //! Write a snapshot of the entire durable state (retained messages and
+    //! persistent sessions). Safe to call from the persistence thread.
+    PersistedState snapshotState() const;
+    //! Re-create the retained messages and persistent sessions from a snapshot.
+    //! Called once at startup, before any client is accepted.
+    void restoreState(const PersistedState& state);
 
     void insertSession(const std::string &clientId, const std::shared_ptr<Session>& session);
     std::shared_ptr<Session> findSession(const std::string &clientId) const;

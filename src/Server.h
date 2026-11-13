@@ -8,6 +8,7 @@
 #include "Listener.h"
 #include "Broker.h"
 #include "Auth.h"
+#include "Store.h"
 
 namespace MQTT {
 
@@ -26,13 +27,20 @@ public:
 
     size_t getActiveConnections() const;
 
+    //! Install handlers so SIGINT/SIGTERM stop the server gracefully (which
+    //! flushes the state file). Call before start().
+    static void installSignalHandlers();
+
 private:
     void run();
     void registerConnection(int clientSocket, const std::shared_ptr<Connection>& connection);
     void unregisterConnection(int clientSocket);
+    //! Flush the durable state and shut the store down
+    void shutdownPersistence();
 
     Broker* broker;
     std::unique_ptr<Auth> auth;
+    std::unique_ptr<Store> store;
     std::unique_ptr<Listener> listener;
     std::atomic<bool> running{false};
     std::atomic<size_t> maxConnections;
