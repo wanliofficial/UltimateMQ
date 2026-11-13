@@ -8,7 +8,8 @@ namespace MQTT {
 class FrameTest : public ::testing::Test 
 {
 protected:
-    Frame *frame = new Frame();
+    Frame instance;
+    Frame *frame = &instance;
 };
 
 TEST_F(FrameTest, ParseConnectPacket) 

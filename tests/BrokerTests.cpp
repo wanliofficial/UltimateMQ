@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 #include "Broker.h"
 #include "Session.h"
+#include "TestClient.h"
 
 class BrokerTest : public ::testing::Test
 {
 protected:
-    MQTT::Broker *broker = new MQTT::Broker();
+    MQTT::Broker instance;
+    MQTT::Broker *broker = &instance;
 };
 
 TEST_F(BrokerTest, InitializationTest)
@@ -15,16 +17,16 @@ TEST_F(BrokerTest, InitializationTest)
 
 TEST_F(BrokerTest, ConnectClientTest)
 {
-    MQTT::Session session(broker, "client1");
-    session.connect();
+    auto session = std::make_shared<MQTT::Session>(broker, "client1");
+    session->connect(session);
     EXPECT_EQ(broker->getConnectedClients(), 1);
 }
 
 TEST_F(BrokerTest, DisconnectClientTest)
 {
-    MQTT::Session session(broker, "client1");
-    session.connect();
-    session.disconnect();
+    auto session = std::make_shared<MQTT::Session>(broker, "client1");
+    session->connect(session);
+    session->disconnect();
     EXPECT_EQ(broker->getConnectedClients(), 0);
 }
 
@@ -55,21 +57,19 @@ TEST_F(BrokerTest, RetainedMessageIsStoredAndDeliveredOnSubscribe)
     broker->publish(retained);
     EXPECT_EQ(broker->getRetainedCount(), 1u);
 
-    MQTT::Session session(broker, "late-subscriber");
+    auto session = std::make_shared<MQTT::Session>(broker, "late-subscriber");
     MQTT::SubscriptionOptions options{MQTT::QoS::QOS_0, false, false,
                                       MQTT::RetainHandling::SEND_RETAINED_MESSAGES_AT_SUBSCRIBE};
 
-    std::vector<MQTT::Message> delivered;
-    session.setDeliverCallback([&delivered](const MQTT::Message &message, uint16_t, MQTT::QoS) {
-        delivered.push_back(message);
-    });
+    auto client = MQTT::test::attach(*session);
 
-    session.subscribe("sensors/+", options);
-    session.deliverRetained("sensors/+", options);
+    session->subscribe("sensors/+", options);
+    session->deliverRetained("sensors/+", options);
+    session->flush();
 
-    ASSERT_EQ(delivered.size(), 1u);
-    EXPECT_EQ(delivered[0].topic, "sensors/temp");
-    EXPECT_TRUE(delivered[0].retain);
+    ASSERT_EQ(client->size(), 1u);
+    EXPECT_EQ(client->delivered[0].topic, "sensors/temp");
+    EXPECT_TRUE(client->delivered[0].retain);
 }
 
 TEST_F(BrokerTest, EmptyRetainedPayloadRemovesMessage)
@@ -83,36 +83,32 @@ TEST_F(BrokerTest, EmptyRetainedPayloadRemovesMessage)
 
 TEST_F(BrokerTest, LiveForwardedMessageHasRetainFlagCleared)
 {
-    MQTT::Session session(broker, "sub");
+    auto session = std::make_shared<MQTT::Session>(broker, "sub");
     MQTT::SubscriptionOptions options{MQTT::QoS::QOS_0, false, false,
                                       MQTT::RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES};
-    std::vector<MQTT::Message> delivered;
-    session.setDeliverCallback([&delivered](const MQTT::Message &message, uint16_t, MQTT::QoS) {
-        delivered.push_back(message);
-    });
-    session.connect();
-    session.subscribe("live/#", options);
+    auto client = MQTT::test::attach(*session);
+    session->connect(session);
+    session->subscribe("live/#", options);
 
+    // Broker::publish flushes the delivery to the bound client itself
     broker->publish(MQTT::Message("live/x", "hi", MQTT::QoS::QOS_0, true));
 
-    ASSERT_EQ(delivered.size(), 1u);
-    EXPECT_FALSE(delivered[0].retain);
+    ASSERT_EQ(client->size(), 1u);
+    EXPECT_FALSE(client->delivered[0].retain);
 }
 
 TEST_F(BrokerTest, RetainHandlingDoNotSendRetained)
 {
     broker->publish(MQTT::Message("r/t", "v", MQTT::QoS::QOS_0, true));
 
-    MQTT::Session session(broker, "sub2");
+    auto session = std::make_shared<MQTT::Session>(broker, "sub2");
     MQTT::SubscriptionOptions options{MQTT::QoS::QOS_0, false, false,
                                       MQTT::RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES};
-    std::vector<MQTT::Message> delivered;
-    session.setDeliverCallback([&delivered](const MQTT::Message &message, uint16_t, MQTT::QoS) {
-        delivered.push_back(message);
-    });
+    auto client = MQTT::test::attach(*session);
 
-    session.subscribe("r/t", options);
-    session.deliverRetained("r/t", options);
+    session->subscribe("r/t", options);
+    session->deliverRetained("r/t", options);
+    session->flush();
 
-    EXPECT_TRUE(delivered.empty());
+    EXPECT_EQ(client->size(), 0u);
 }

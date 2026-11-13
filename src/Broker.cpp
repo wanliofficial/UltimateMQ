@@ -1,6 +1,8 @@
 #include "Broker.h"
 #include "Topic.h"
 #include "Session.h"
+#include "Log.h"
+#include <algorithm>
 #include <iostream>
 #include <thread>
 #include <random>
@@ -9,31 +11,70 @@ namespace MQTT {
 
 Broker::Broker() : trie(std::make_unique<Trie>()) {}
 
-void Broker::insertSession(const std::string &clientId, Session* session) {
+void Broker::insertSession(const std::string &clientId, const std::shared_ptr<Session>& session) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     sessions[clientId] = session;
 }
 
-Session* Broker::findSession(const std::string &clientId) const {
+bool Broker::insertSessionIfAbsent(const std::string &clientId, const std::shared_ptr<Session>& session) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     auto it = sessions.find(clientId);
     if (it != sessions.end()) {
-        return it->second;
+        if (auto existing = it->second.lock()) {
+            if (existing != session) {
+                return false;
+            }
+        }
+    }
+    sessions[clientId] = session;
+    return true;
+}
+
+std::shared_ptr<Session> Broker::findSession(const std::string &clientId) const {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    auto it = sessions.find(clientId);
+    if (it != sessions.end()) {
+        return it->second.lock();
     }
     return nullptr;
 }
 
+void Broker::forgetSession(Session* session) {
+    if (session == nullptr) {
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    auto it = sessions.find(session->getClientId());
+    if (it != sessions.end()) {
+        auto existing = it->second.lock();
+        if (!existing || existing.get() == session) {
+            sessions.erase(it);
+        }
+    }
+}
+
 void Broker::removeSession(const std::string &clientId) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     sessions.erase(clientId);
 }
 
 void Broker::removeSession(Session* session) {
-    sessions.erase(session->getClientId());
-}   
+    forgetSession(session);
+}
 
 int Broker::getConnectedClients() const {
-    return sessions.size();
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    int connected = 0;
+    for (const auto &[clientId, weakSession] : sessions) {
+        if (!weakSession.expired()) {
+            connected++;
+        }
+    }
+    return connected;
 }
 
 bool Broker::isSubscribed(const std::string &clientId, const std::string &topicFilter) const {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     auto it = subscriptions.find(topicFilter);
     if (it != subscriptions.end()) {
         return it->second.find(clientId) != it->second.end();
@@ -42,74 +83,88 @@ bool Broker::isSubscribed(const std::string &clientId, const std::string &topicF
 }
 
 std::set<std::string> Broker::getSubscriptions(const std::string &topicFilter) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     std::set<std::string> clientIds;
-    if (subscriptions.find(topicFilter) != subscriptions.end()) {
-        clientIds = subscriptions[topicFilter];
+    auto it = subscriptions.find(topicFilter);
+    if (it != subscriptions.end()) {
+        clientIds = it->second;
     }
     return clientIds;
 }
 
 void Broker::subscribe(const std::string &clientId, const std::string &topicFilter) {
-    std::set<std::string> clientIds;
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     if (subscriptions.find(topicFilter) == subscriptions.end()) {
         trie->insert(topicFilter);
-    } else {
-        clientIds = subscriptions[topicFilter];
     }
-    clientIds.insert(clientId);
-    subscriptions[topicFilter] = clientIds;
+    subscriptions[topicFilter].insert(clientId);
 }
 
 void Broker::unsubscribe(const std::string &clientId, const std::string &topicFilter) {
-    std::set<std::string> clientIds;
-    if (subscriptions.find(topicFilter) == subscriptions.end()) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    auto it = subscriptions.find(topicFilter);
+    if (it == subscriptions.end()) {
         return;
     }
 
-    clientIds = subscriptions[topicFilter];
-    clientIds.erase(clientId);
+    it->second.erase(clientId);
 
-    if (clientIds.empty()) {
+    if (it->second.empty()) {
         trie->remove(topicFilter);
-        subscriptions.erase(topicFilter);
-    } else {
-        subscriptions[topicFilter] = clientIds;
+        subscriptions.erase(it);
     }
 }
 
 void Broker::sharedSubscribe(const std::string &clientId, const std::string &topicFilter, const std::string &group) {
-    printf("Broker::sharedSubscribe: %s %s %s\n", clientId.c_str(), topicFilter.c_str(), group.c_str());
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     SharedSubscription sharedSubscription(clientId, topicFilter, group);
-    if (sharedSubscriptions.find(topicFilter) == sharedSubscriptions.end()) {
-        sharedSubscriptions[topicFilter] = std::vector<SharedSubscription>();
-    }   
-    sharedSubscriptions[topicFilter].push_back(sharedSubscription);
+    auto &sharedSubs = sharedSubscriptions[topicFilter];
+    if (std::find(sharedSubs.begin(), sharedSubs.end(), sharedSubscription) == sharedSubs.end()) {
+        sharedSubs.push_back(sharedSubscription);
+    }
     trie->insert(topicFilter);
 }
 
-void Broker::sharedUnsubscribe(const std::string &clientId, const std::string &topicFilter, const std::string &group) {   
+void Broker::sharedUnsubscribe(const std::string &clientId, const std::string &topicFilter, const std::string &group) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
     SharedSubscription sharedSubscription(clientId, topicFilter, group);
-    if (sharedSubscriptions.find(topicFilter) == sharedSubscriptions.end()) {
+    auto it = sharedSubscriptions.find(topicFilter);
+    if (it == sharedSubscriptions.end()) {
         return;
     }
-    auto& sharedSubs = sharedSubscriptions[topicFilter];
-    auto it = std::find(sharedSubs.begin(), sharedSubs.end(), sharedSubscription);
-    if (it != sharedSubs.end()) {
-        sharedSubs.erase(it);
+    auto &sharedSubs = it->second;
+    auto position = std::find(sharedSubs.begin(), sharedSubs.end(), sharedSubscription);
+    if (position != sharedSubs.end()) {
+        sharedSubs.erase(position);
     }
     if (sharedSubs.empty()) {
-        sharedSubscriptions.erase(topicFilter);
+        sharedSubscriptions.erase(it);
     }
 }
 
 static int randIdx(int size) {
-    static std::random_device rd;
-    static std::mt19937 gen(rd());
+    static thread_local std::mt19937 gen(std::random_device{}());
     std::uniform_int_distribution<> dis(0, size - 1);
     return dis(gen);
 }
 
 void Broker::publish(const Message &message) {
+    std::vector<std::shared_ptr<Session>> targets;
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        collectTargets(message, targets);
+    }
+    // Deliveries are queued on the sessions here; the sockets are only written
+    // by Session::flush() so that no client write is done while a lock is held
+    for (const auto &session : targets) {
+        session->deliver(session->matchingFilter(message.topic), message);
+    }
+    for (const auto &session : targets) {
+        session->flush();
+    }
+}
+
+void Broker::collectTargets(const Message &message, std::vector<std::shared_ptr<Session>> &targets) {
     if (message.retain) {
         if (message.payload.empty()) {
             // An empty retained payload removes the retained message for that topic
@@ -121,21 +176,25 @@ void Broker::publish(const Message &message) {
 
     std::vector<std::string> topicFilters = trie->match(message.topic);
     for (const auto &topicFilter : topicFilters) {
-        std::set<std::string> clientIds = getSubscriptions(topicFilter);
-        for (const auto &clientId : clientIds) {
-            Session* session = findSession(clientId);
-            if (session) {   
-                session->deliver(topicFilter, message);
+        auto it = subscriptions.find(topicFilter);
+        if (it != subscriptions.end()) {
+            for (const auto &clientId : it->second) {
+                auto sessionIt = sessions.find(clientId);
+                if (sessionIt != sessions.end()) {
+                    if (auto session = sessionIt->second.lock()) {
+                        targets.push_back(std::move(session));
+                    }
+                }
             }
         }
-        if (!sharedSubscriptions.empty()) {
-            auto it = sharedSubscriptions.find(topicFilter);
-            if (it != sharedSubscriptions.end()) {
-                auto idx = randIdx(it->second.size());
-                SharedSubscription sharedSubscription = it->second.at(idx);
-                Session* session = findSession(sharedSubscription.clientId);
-                if (session) {
-                    session->deliver(topicFilter, message);
+        auto sharedIt = sharedSubscriptions.find(topicFilter);
+        if (sharedIt != sharedSubscriptions.end() && !sharedIt->second.empty()) {
+            auto idx = randIdx(static_cast<int>(sharedIt->second.size()));
+            const SharedSubscription &sharedSubscription = sharedIt->second.at(idx);
+            auto sessionIt = sessions.find(sharedSubscription.clientId);
+            if (sessionIt != sessions.end()) {
+                if (auto session = sessionIt->second.lock()) {
+                    targets.push_back(std::move(session));
                 }
             }
         }

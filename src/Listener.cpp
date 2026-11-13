@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <iostream>
 #include "Listener.h"
+#include "Log.h"
 
 namespace MQTT {
 
@@ -29,7 +30,7 @@ void Listener::start() {
     if (listen(sockfd, 10) < 0) {
         throw std::runtime_error("Failed to listen on socket");
     }
-    std::cout << "MQTT listener on port " << port << std::endl;
+    logInfo("MQTT listener on port %d", port);
 }
 
 int Listener::acceptConnection() {

@@ -7,55 +7,112 @@
 #include <arpa/inet.h>
 #include <iostream>
 #include <thread>
+#include "Log.h"
 
 namespace MQTT {
-Server::Server(int port) {
+Server::Server(int port, size_t maxConnections)
+    : maxConnections(maxConnections == 0 ? 1024 : maxConnections) {
     listener = std::make_unique<Listener>(port);
     broker = new Broker();
 }
 
 Server::~Server() {
+    stop();
     delete broker;
 }
 
-void Server::start() {   
+void Server::start() {
     listener->start();
-    std::cout << "MQTT Server is started" << std::endl;
+    running = true;
+    logInfo("MQTT server started");
     run();
 }
 
 void Server::run() {
-    while (true) {
+    while (running) {
         int clientSocket = listener->acceptConnection();
         if (clientSocket < 0) {
-            std::cerr << "Failed to accept connection" << std::endl;
+            if (!running) {
+                break;
+            }
+            logError("failed to accept connection");
             continue;
         }
 
-        std::thread clientThread(&Server::handleClient, this, clientSocket);
+        if (getActiveConnections() >= maxConnections) {
+            logError("too many connections, rejecting client");
+            close(clientSocket);
+            continue;
+        }
+
+        // The shared_ptr keeps the connection alive for the lifetime of the
+        // session callbacks, even if the thread itself has already finished
+        auto connection = std::make_shared<Connection>(clientSocket, broker);
+        registerConnection(clientSocket, connection);
+
+        std::thread clientThread([this, clientSocket, connection]() {
+            handleClient(clientSocket);
+            unregisterConnection(clientSocket);
+        });
         clientThread.detach();
     }
 }
 
 void Server::handleClient(int clientSocket) {
-    Connection connection(clientSocket, broker);
-    connection.run();
-    closeClient(clientSocket);
+    std::shared_ptr<Connection> connection;
+    {
+        std::lock_guard<std::mutex> lock(connectionsMutex);
+        auto it = connections.find(clientSocket);
+        if (it == connections.end()) {
+            return;
+        }
+        connection = it->second;
+    }
+    // Connection::run() owns the socket and closes it when it is done
+    connection->run();
+}
+
+void Server::registerConnection(int clientSocket, const std::shared_ptr<Connection>& connection) {
+    std::lock_guard<std::mutex> lock(connectionsMutex);
+    connections[clientSocket] = connection;
+}
+
+void Server::unregisterConnection(int clientSocket) {
+    std::lock_guard<std::mutex> lock(connectionsMutex);
+    connections.erase(clientSocket);
+}
+
+size_t Server::getActiveConnections() const {
+    std::lock_guard<std::mutex> lock(connectionsMutex);
+    return connections.size();
 }
 
 void Server::closeClient(int clientSocket) {
-    close(clientSocket);
+    // Kept for API compatibility: shutting the socket down lets the owning
+    // Connection leave its read loop and close the descriptor itself
+    if (clientSocket >= 0) {
+        ::shutdown(clientSocket, SHUT_RDWR);
+    }
 }
 
 void Server::stop() {
+    running = false;
     if (listener) {
         listener->stop();
     }
 
-    // Signal all client threads to stop
-    // This is a placeholder and should be implemented based on how you manage client threads
+    std::map<int, std::shared_ptr<Connection>> open;
+    {
+        std::lock_guard<std::mutex> lock(connectionsMutex);
+        open = connections;
+    }
+    // Shutting the sockets down makes the client threads leave their read loop;
+    // each Connection closes its own descriptor exactly once
+    for (auto& [socket, connection] : open) {
+        closeClient(socket);
+    }
 
-    std::cout << "Server stopped" << std::endl;
+    logInfo("MQTT server stopped");
 }
 
 }

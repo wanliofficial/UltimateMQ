@@ -9,6 +9,8 @@ set(TEST_SOURCES
     TopicTests.cpp
     BrokerTests.cpp
     FrameTests.cpp
+    FrameStreamTests.cpp
+    SessionLifecycleTests.cpp
     # Add more test files here as you create them
 )
 

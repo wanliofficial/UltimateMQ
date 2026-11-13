@@ -9,6 +9,14 @@ namespace MQTT {
 class Frame {
     Version version = Version::MQTT5;
     Properties doParseProperties(const uint8_t *buffer, size_t length);
+
+    // Streaming parser state: a TCP segment may contain a partial packet, more
+    // than one packet, or a packet split across several segments
+    std::vector<uint8_t> partial;
+    bool headerComplete = false;
+    size_t remainingLengthBytes = 0;
+    size_t remainingLength = 0;
+
 public:
     static constexpr size_t MAX_MULTIPLIER = 128 * 128 * 128;
     static constexpr size_t MAX_LENGTH = 268435455; 
@@ -16,9 +24,21 @@ public:
     Frame(Version version) : version(version) {}
 
     void setVersion(Version version) { this->version = version; }
+    Version getVersion() const { return version; }
 
     // Parse MQTT packets
     std::shared_ptr<Packet> parse(const uint8_t *buffer, size_t length);
+
+    //! Feed bytes from the socket; returns the number of bytes consumed
+    size_t feed(const uint8_t *buffer, size_t length);
+    //! True when a complete packet has been buffered and parse() can be called
+    bool isComplete() const;
+    //! Parse the buffered packet and clear the streaming state
+    std::shared_ptr<Packet> parse();
+    //! Drop any partially buffered packet
+    void reset();
+    //! Maximum size of the remaining length field (4 bytes, MQTT-1.5.5)
+    static constexpr size_t MAX_REMAINING_LENGTH_BYTES = 4;
 
     // Parse the remaining length field of an MQTT packet
     std::pair<size_t, size_t> decodeRemainingLength(const uint8_t *buffer, size_t length);

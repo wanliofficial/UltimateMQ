@@ -2,8 +2,71 @@
 #include "Frame.h"
 #include <memory>
 #include <iostream>
+#include "Log.h"
+#include <algorithm>
 
 namespace MQTT {
+
+size_t Frame::feed(const uint8_t *buffer, size_t length) {
+    size_t used = 0;
+    while (used < length) {
+        if (isComplete()) {
+            // The caller has to parse() the buffered packet before feeding more
+            break;
+        }
+        if (partial.empty()) {
+            // Fixed header byte
+            partial.push_back(buffer[used++]);
+            headerComplete = false;
+            remainingLength = 0;
+            remainingLengthBytes = 0;
+            continue;
+        }
+        if (headerComplete) {
+            size_t bufferedBody = partial.size() - 1 - remainingLengthBytes;
+            size_t needed = remainingLength - bufferedBody;
+            size_t take = std::min(needed, length - used);
+            partial.insert(partial.end(), buffer + used, buffer + used + take);
+            used += take;
+            continue;
+        }
+        // Remaining length bytes
+        uint8_t encoded = buffer[used++];
+        remainingLengthBytes++;
+        partial.push_back(encoded);
+        remainingLength += static_cast<size_t>(encoded & 0x7f) << (7 * (remainingLengthBytes - 1));
+        if (remainingLengthBytes > MAX_REMAINING_LENGTH_BYTES) {
+            throw std::runtime_error("Malformed Remaining Length");
+        }
+        if ((encoded & 0x80) == 0) {
+            headerComplete = true;
+        }
+    }
+    return used;
+}
+
+bool Frame::isComplete() const {
+    if (!headerComplete) {
+        return false;
+    }
+    return partial.size() - 1 - remainingLengthBytes >= remainingLength;
+}
+
+void Frame::reset() {
+    partial.clear();
+    headerComplete = false;
+    remainingLength = 0;
+    remainingLengthBytes = 0;
+}
+
+std::shared_ptr<Packet> Frame::parse() {
+    if (!isComplete()) {
+        throw std::runtime_error("No complete packet buffered");
+    }
+    auto packet = parse(partial.data(), partial.size());
+    reset();
+    return packet;
+}
 
 std::shared_ptr<Packet> Frame::parse(const uint8_t *buffer, size_t length) {
     if (length < 2) {
@@ -105,11 +168,9 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
     size_t subscriptionIdentifierBytes;
 
     size_t offset = 0;
-    printf("length: %ld\n", length);
     while (offset < length) {
         auto [id, idBytes] = decodeVariableByteInteger(buffer+offset, length-offset);
-        printf("id: %ld, idBytes: %ld\n", id, idBytes);
-        offset += idBytes;
+            offset += idBytes;
         PropertyID propertyId = static_cast<PropertyID>(id);
         switch (propertyId) {
             case PropertyID::PAYLOAD_FORMAT_INDICATOR:
@@ -272,7 +333,6 @@ std::pair<Properties, size_t> Frame::parseProperties(const uint8_t *buffer, size
         return std::make_pair(Properties(), 1);
     }
     auto [propertyLength, propertyBytes] = decodeVariableByteInteger(buffer, length);
-    printf("propertyLength: %ld, propertyBytes: %ld\n", propertyLength, propertyBytes);
     if(propertyBytes + propertyLength > length) {
         throw std::runtime_error("Not enough data for properperties");
     }     
@@ -285,16 +345,14 @@ std::pair<Properties, size_t> Frame::parseProperties(const uint8_t *buffer, size
 ConnectPacket Frame::parseConnect(const uint8_t *buffer, size_t length) {  
     auto connect = ConnectPacket();
     size_t offset = 0;
-    std::cout << "length: " << length << std::endl;
     // Parse protocol name
     std::string protoName = parseString(buffer, length);
     offset += protoName.length() + 2;
 
-    std::cout << "protoname: " << protoName << std::endl;
-
     Version protoVersion = static_cast<Version>(buffer[offset]);
     connect.protocolName = protoName;
     connect.protocolVersion = protoVersion;
+    logDebug("CONNECT protocol name=%s version=%d", protoName.c_str(), (int)protoVersion);
     offset += 1;
     if (!connect.isValidProtocol()) {
         throw std::runtime_error("Invalid protocol name or version");
@@ -311,7 +369,7 @@ ConnectPacket Frame::parseConnect(const uint8_t *buffer, size_t length) {
     // Parse keep alive
     connect.keepAlive = (buffer[offset] << 8) | buffer[offset + 1];
     offset += 2;    
-    std::cout << "keepAlive: " << connect.keepAlive << std::endl;
+    logDebug("CONNECT keepAlive=%u cleanStart=%d", connect.keepAlive, (int)connect.cleanStart);
 
     // Parse properties (MQTT 5 only - for MQTT 3.1.1 the payload starts right after the keep alive)
     if (protoVersion == Version::MQTT5) {
@@ -319,13 +377,12 @@ ConnectPacket Frame::parseConnect(const uint8_t *buffer, size_t length) {
         connect.properties = properties;
         offset += propLength;
     }
-    std::cout << "Properties: " << connect.properties.size() << std::endl;
 
     // Parse client ID
     std::string clientId = parseString(buffer+offset, length-offset);
     connect.clientId = clientId;
     offset += clientId.length() + 2;
-    std::cout << "clientId: " << clientId << std::endl;
+    logDebug("CONNECT clientId=%s", clientId.c_str());
 
     // Parse will properties and message if present
     if (connect.willFlag) {
@@ -652,10 +709,11 @@ std::vector<uint8_t> Frame::serializeConnect(const ConnectPacket &packet) {
     buffer.push_back(packet.keepAlive >> 8);
     buffer.push_back(packet.keepAlive & 0xFF);
 
-    // TODO:: Properties
-    auto propertiesBuffer = serializeProperties(packet.properties);
-    std::cout << "propertiesBuffer: " << propertiesBuffer.size() << std::endl;
-    buffer.insert(buffer.end(), propertiesBuffer.begin(), propertiesBuffer.end());
+    // Properties (MQTT 5 only)
+    if (packet.protocolVersion == Version::MQTT5) {
+        auto propertiesBuffer = serializeProperties(packet.properties);
+        buffer.insert(buffer.end(), propertiesBuffer.begin(), propertiesBuffer.end());
+    }
 
     // Payload
     // Client Identifier
