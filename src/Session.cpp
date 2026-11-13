@@ -32,7 +32,9 @@ void Session::discard() {
 void Session::disconnect() {
     broker->removeSession(this);
     connected = false;
-    onDisconnect();
+    if (onDisconnect) {
+        onDisconnect();
+    }
 }
 
 ReasonCode Session::publish(uint16_t packetId, const Message &message) {

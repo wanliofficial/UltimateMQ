@@ -77,22 +77,30 @@ bool Topic::match(const std::string &topic, const std::string &topicFilter) {
 }
 
 bool Topic::isShared(const std::string& topic) {
-    // Check if the topic starts with "$share/"
-    if (topic.length() < 7) {
+    // Check if the topic starts with "$share/" followed by a group name and a topic filter
+    const std::string prefix = "$share/";
+    if (topic.compare(0, prefix.size(), prefix) != 0) {
         return false;
     }
-    return (topic.substr(0, 7) == "$share/");
+    // There must be a second '/' separating the group name from the actual topic filter
+    size_t secondSlash = topic.find('/', prefix.size());
+    if (secondSlash == std::string::npos) {
+        return false;
+    }
+    // Group name must not be empty
+    return secondSlash > prefix.size();
 }
 
 std::pair<std::string, std::string> Topic::splitShared(const std::string& topic) {
-    // Check if the topic is a shared subscription
-    if (!isShared(topic)) {
+    // Check if the topic has the shared subscription prefix at all
+    const std::string prefix = "$share/";
+    if (topic.compare(0, prefix.size(), prefix) != 0) {
         return {"", topic};
     }
 
     // Find the second '/' which separates the group name from the actual topic
-    size_t secondSlash = topic.find('/', 7);
-    if (secondSlash == std::string::npos) {
+    size_t secondSlash = topic.find('/', prefix.size());
+    if (secondSlash == std::string::npos || secondSlash == prefix.size()) {
         // Invalid shared subscription format
         return {"", ""};
     }

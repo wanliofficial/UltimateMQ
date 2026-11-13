@@ -7,6 +7,10 @@
 #include <vector>
 #include <map>
 #include <sstream>
+#include <variant>
+#include <optional>
+#include <memory>
+#include <set>
 
 namespace MQTT {
 
@@ -301,7 +305,8 @@ struct PubackPacket : Packet {
         : Packet(PacketType::PUBACK), packetId(id), reasonCode(code) {}
     ~PubackPacket() = default;
     std::string toString() const override {
-        return "Puback{packetId=" + std::to_string(packetId) + "}";
+        return "Puback{packetId=" + std::to_string(packetId) +
+               ", reasonCode=" + std::to_string(static_cast<int>(reasonCode)) + "}";
     }
 };
 
@@ -316,7 +321,8 @@ struct PubrecPacket : Packet {
         : Packet(PacketType::PUBREC), packetId(id), reasonCode(code) {}
     ~PubrecPacket() = default;
     std::string toString() const override {
-        return "Pubrec{packetId=" + std::to_string(packetId) + "}";
+        return "Pubrec{packetId=" + std::to_string(packetId) +
+               ", reasonCode=" + std::to_string(static_cast<int>(reasonCode)) + "}";
     }
 };
 
@@ -331,7 +337,8 @@ struct PubrelPacket : Packet {
         : Packet(PacketType::PUBREL), packetId(id), reasonCode(code) {}
     ~PubrelPacket() = default;
     std::string toString() const override {
-        return "Pubrel{packetId=" + std::to_string(packetId) + "}";
+        return "Pubrel{packetId=" + std::to_string(packetId) +
+               ", reasonCode=" + std::to_string(static_cast<int>(reasonCode)) + "}";
     }
 };
 
@@ -346,7 +353,8 @@ struct PubcompPacket : Packet {
         : Packet(PacketType::PUBCOMP), packetId(id), reasonCode(code) {}
     ~PubcompPacket() = default;
     std::string toString() const override {
-        return "Pubcomp{packetId=" + std::to_string(packetId) + "}";
+        return "Pubcomp{packetId=" + std::to_string(packetId) +
+               ", reasonCode=" + std::to_string(static_cast<int>(reasonCode)) + "}";
     }
 };
 
