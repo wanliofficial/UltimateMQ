@@ -45,11 +45,17 @@ void Connection::run() {
         publishWill();
     }
 
-    // Detach from the session: from now on the broker may deliver to the
-    // session and the stale callbacks become no-ops
+    // Detach from the session: if this connection still owns it, tear it down.
+    // A session that was taken over by a newer connection is left untouched so
+    // that it can be resumed there.
     if (session) {
-        std::lock_guard<std::recursive_mutex> lock(writeMutex);
-        session.reset();
+        std::shared_ptr<Session> owned;
+        {
+            std::lock_guard<std::recursive_mutex> lock(writeMutex);
+            owned = session;
+            session.reset();
+        }
+        owned->close(shared_from_this());
     }
     closeSocket();
 }
@@ -134,6 +140,21 @@ void Connection::closeSocket() {
     }
 }
 
+void Connection::setDisconnectCallback(std::function<void()> callback) {
+    disconnectCallback = std::move(callback);
+}
+
+void Connection::onSuperseded() {
+    // Another connection now owns the session: stop touching it and shut down.
+    // The session itself is left intact so it can be resumed by the new client.
+    {
+        std::lock_guard<std::recursive_mutex> lock(writeMutex);
+        session.reset();
+        connected = false;
+    }
+    state = State::DISCONNECTED;
+}
+
 void Connection::publishWill() {
     willPending = false;
     Message will = willMessage;
@@ -196,27 +217,21 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
         willMessage = Message(*connect->willTopic, *connect->willMsg, connect->willQos, connect->willRetain);
     }
 
-    // Take over any session bound to this client id: the previous connection is
-    // told to stop using it. This is race free: the takeover flag is set under
-    // the session lock, and the next delivery on the old session either sees it
-    // here (and is dropped) or has already been queued before the flag was set.
-    auto oldSession = broker->findSession(connect->clientId);
-    if (oldSession) {
-        oldSession->setTakeoverCallback([weak = weak_from_this()]() {
-            if (auto connection = weak.lock()) {
-                connection->state = State::DISCONNECTED;
-                connection->connected = false;
-                // The session is about to be reassigned, so stop using this one
-                connection->session.reset();
-            }
-        });
+    // Resolve the session for this client id. A clean start discards any session
+    // left behind by an earlier connection; otherwise the existing session is
+    // reused so that its subscriptions and unacknowledged messages survive.
+    auto existing = broker->findSession(connect->clientId);
+    if (existing && connect->cleanStart) {
+        existing->discard();
+        existing.reset();
     }
+    bool resumed = (existing != nullptr) && !connect->cleanStart;
 
-    auto newSession = std::make_shared<Session>(broker, connect->clientId,
-                                                connect->cleanStart);
-    bool resumed = (oldSession != nullptr) && !connect->cleanStart;
+    auto sessionToUse = resumed ? existing : std::make_shared<Session>(broker, connect->clientId,
+                                                                        connect->cleanStart);
+    session = sessionToUse;
 
-    newSession->setDisconnectCallback([weak = weak_from_this()]() {
+    setDisconnectCallback([weak = weak_from_this()]() {
         if (auto connection = weak.lock()) {
             if (connection->connected) {
                 connection->state = State::DISCONNECTED;
@@ -224,22 +239,29 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
         }
     });
 
-    // Publish the CONNACK before connecting so that no delivery can race ahead of it
+    // Publish the CONNACK before driving the session so that no delivery can
+    // race ahead of it. sessionPresent is set only when an existing session is
+    // actually being resumed.
     ConnackPacket connack{false, ReasonCode::SUCCESS};
     connack.sessionPresent = resumed;
     sendPacket(connack);
 
     {
         std::lock_guard<std::recursive_mutex> lock(writeMutex);
-        session = newSession;
         connected = true;
         state = State::CONNECTED;
     }
     // The session only knows the Client interface; it keeps this connection
-    // alive through the shared_ptr it receives here
-    newSession->bindClient(shared_from_this());
-    newSession->connect(newSession);
-    logInfo("client connected: %s", connect->clientId.c_str());
+    // alive through the shared_ptr it receives here. resume() also retransmits
+    // the unacknowledged QoS>0 messages of a resumed session.
+    if (resumed) {
+        sessionToUse->resume(shared_from_this());
+        sessionToUse->flush();
+    } else {
+        sessionToUse->bindClient(shared_from_this());
+        sessionToUse->connect(sessionToUse, /*persistent=*/!connect->cleanStart);
+    }
+    logInfo("client connected: %s (resumed=%d)", connect->clientId.c_str(), (int)resumed);
 }
 
 void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
@@ -333,7 +355,8 @@ void Connection::handlePingreq(std::shared_ptr<PingreqPacket> pingreq) {
 }
 
 void Connection::handleDisconnect(std::shared_ptr<DisconnectPacket> disconnect) {
-    // A normal DISCONNECT discards the Will message (MQTT-3.14.4-3)
+    // A normal DISCONNECT discards the Will message (MQTT-3.14.4-3); the read
+    // loop then exits and run() tears the session down
     willPending = false;
     state = State::DISCONNECTED;
 }
@@ -354,7 +377,9 @@ void Connection::handleDeliver(const Message &message, uint16_t packetId, QoS qo
     }
     PublishPacket publish{message.topic, message.payload, qos, message.retain};
     publish.packetId = packetId;
-    logDebug("deliver %s qos=%d packetId=%u", message.topic.c_str(), (int)qos, packetId);
+    publish.dup = message.dup;
+    logDebug("deliver %s qos=%d packetId=%u dup=%d", message.topic.c_str(), (int)qos, packetId,
+             (int)message.dup);
     sendPacket(publish);
 }
 

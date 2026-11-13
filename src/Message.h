@@ -13,6 +13,9 @@ struct Message {
     std::vector<uint8_t> payload;
     QoS qos = QoS::QOS_0;
     bool retain = false;
+    // Retransmission flag (MQTT-3.3.1-8): set when a broker resends an
+    // unacknowledged QoS>0 message after a reconnect
+    bool dup = false;
 
     Message() = default;
 

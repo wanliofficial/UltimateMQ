@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include "Broker.h"
 #include "Session.h"
+#include <atomic>
 #include <mutex>
 
 namespace MQTT {
@@ -15,13 +16,23 @@ public:
         packetIds.push_back(packetId);
         qosValues.push_back(qos);
     }
+
+    void onSuperseded() override { superseded++; }
+
     size_t size() {
         std::lock_guard<std::mutex> lock(mutex);
         return delivered.size();
     }
+
+    std::vector<Message> snapshot() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return delivered;
+    }
+
     std::vector<Message> delivered;
     std::vector<uint16_t> packetIds;
     std::vector<QoS> qosValues;
+    std::atomic<int> superseded{0};
 
 private:
     std::mutex mutex;

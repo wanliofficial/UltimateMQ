@@ -10,9 +10,9 @@
 namespace MQTT {
 
 namespace {
-SubscriptionOptions defaultOptions() {
-    return SubscriptionOptions{QoS::QOS_0, false, false,
-                               RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES};
+SubscriptionOptions optionsFor(QoS qos = QoS::QOS_0, RetainHandling handling =
+                                    RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES) {
+    return SubscriptionOptions{qos, false, false, handling};
 }
 }
 
@@ -21,43 +21,112 @@ protected:
     Broker broker;
 };
 
-TEST_F(SessionLifecycleTest, SessionRegistersAndUnregistersOnDestruction)
+TEST_F(SessionLifecycleTest, NonPersistentSessionIsForgottenAfterClose)
 {
-    {
-        auto session = std::make_shared<Session>(&broker, "lifecycle");
-        session->connect(session);
-        EXPECT_EQ(broker.getConnectedClients(), 1);
-        EXPECT_EQ(broker.findSession("lifecycle"), session);
-    }
-    // Dropping the last reference must not leave a dangling entry behind
+    auto session = std::make_shared<Session>(&broker, "np");
+    session->connect(session, /*persistent=*/false);
+    EXPECT_EQ(broker.findSession("np"), session);
+    EXPECT_EQ(broker.getConnectedClients(), 1);
+
+    auto client = test::attach(*session);
+    session->close(client);
+
+    EXPECT_EQ(broker.findSession("np"), nullptr);
     EXPECT_EQ(broker.getConnectedClients(), 0);
-    EXPECT_EQ(broker.findSession("lifecycle"), nullptr);
 }
 
-TEST_F(SessionLifecycleTest, TakeoverNotifiesOldConnectionOnlyOnce)
+TEST_F(SessionLifecycleTest, PersistentSessionSurvivesClose)
 {
-    auto oldSession = std::make_shared<Session>(&broker, "dup");
-    oldSession->connect(oldSession);
+    auto session = std::make_shared<Session>(&broker, "persist");
+    session->connect(session, /*persistent=*/true);
+    auto client = test::attach(*session);
+    session->subscribe("p/t", optionsFor());
 
-    std::atomic<int> takeovers{0};
-    oldSession->setTakeoverCallback([&takeovers]() { takeovers++; });
+    session->close(client);
 
-    // The second delivery takes the session over and must not reach the subscriber
-    broker.subscribe("dup", "t/x");
-    broker.publish(Message("t/x", "data"));
+    // The session is still registered (so it can be resumed) but no longer counted
+    EXPECT_EQ(broker.findSession("persist"), session);
+    EXPECT_EQ(broker.getConnectedClients(), 0);
+}
 
-    EXPECT_EQ(takeovers.load(), 1);
+TEST_F(SessionLifecycleTest, DiscardDropsPersistentSession)
+{
+    auto session = std::make_shared<Session>(&broker, "drop");
+    session->connect(session, /*persistent=*/true);
+    session->subscribe("d/t", optionsFor());
+
+    session->discard();
+
+    EXPECT_EQ(broker.findSession("drop"), nullptr);
+}
+
+TEST_F(SessionLifecycleTest, ResumeRetransmitsUnackedMessagesWithDup)
+{
+    auto session = std::make_shared<Session>(&broker, "q1");
+    session->connect(session, /*persistent=*/true);
+    auto first = test::attach(*session);
+    session->subscribe("q/t", optionsFor(QoS::QOS_1));
+
+    broker.publish(Message("q/t", "hi", QoS::QOS_1));
+    ASSERT_EQ(first->size(), 1u);
+    EXPECT_FALSE(first->delivered[0].dup);
+    uint16_t packetId = first->packetIds[0];
+
+    // The connection drops before acknowledging the message
+    session->close(first);
+    EXPECT_EQ(broker.findSession("q1"), session);
+
+    // Reconnect: the message is retransmitted with the same packet id, DUP=1
+    auto second = std::make_shared<RecordingClient>();
+    session->resume(second);
+    session->flush();
+
+    ASSERT_EQ(second->size(), 1u);
+    EXPECT_TRUE(second->delivered[0].dup);
+    EXPECT_EQ(second->packetIds[0], packetId);
+
+    // Once acknowledged it is not retransmitted again
+    session->puback(packetId);
+    auto third = std::make_shared<RecordingClient>();
+    session->resume(third);
+    session->flush();
+    EXPECT_EQ(third->size(), 0u);
+}
+
+TEST_F(SessionLifecycleTest, ResumeStopsThePreviousClient)
+{
+    auto session = std::make_shared<Session>(&broker, "handover");
+    session->connect(session, /*persistent=*/true);
+    auto first = test::attach(*session);
+
+    auto second = std::make_shared<RecordingClient>();
+    session->resume(second);
+
+    EXPECT_EQ(first->superseded.load(), 1);
+}
+
+TEST_F(SessionLifecycleTest, StaleCloseDoesNotTearDownResumedSession)
+{
+    auto session = std::make_shared<Session>(&broker, "race");
+    session->connect(session, /*persistent=*/true);
+    auto first = test::attach(*session);
+
+    auto second = std::make_shared<RecordingClient>();
+    session->resume(second);
+
+    // The old connection finishing late must not unregister the live session
+    session->close(first);
+    EXPECT_EQ(broker.findSession("race"), session);
 }
 
 TEST_F(SessionLifecycleTest, RetainedMessageIsQueuedThenDeliveredByFlush)
 {
     broker.publish(MQTT::Message("ret/t", "old", MQTT::QoS::QOS_0, true));
     auto session = std::make_shared<Session>(&broker, "retained-sub");
-    session->connect(session);
+    session->connect(session, /*persistent=*/false);
     auto client = test::attach(*session);
 
-    MQTT::SubscriptionOptions options{MQTT::QoS::QOS_0, false, false,
-                                      MQTT::RetainHandling::SEND_RETAINED_MESSAGES_AT_SUBSCRIBE};
+    auto options = optionsFor(QoS::QOS_0, RetainHandling::SEND_RETAINED_MESSAGES_AT_SUBSCRIBE);
     session->subscribe("ret/t", options);
     session->deliverRetained("ret/t", options);
     session->flush();
@@ -67,46 +136,70 @@ TEST_F(SessionLifecycleTest, RetainedMessageIsQueuedThenDeliveredByFlush)
     EXPECT_TRUE(client->delivered[0].retain);
 }
 
-TEST_F(SessionLifecycleTest, DeliveryAfterTakeoverIsSilent)
-{
-    auto session = std::make_shared<Session>(&broker, "gone");
-    session->connect(session);
-
-    auto client = test::attach(*session);
-    session->setTakeoverCallback([]() {});  // connection already replaced
-    session->subscribe("t/y", defaultOptions());
-
-    broker.publish(Message("t/y", "data"));
-    session->flush();
-    EXPECT_EQ(client->size(), 0u);
-}
-
-TEST_F(SessionLifecycleTest, DisconnectCallbackIsInvokedExactlyOnce)
+TEST_F(SessionLifecycleTest, CloseNotifiesExactlyOnce)
 {
     auto session = std::make_shared<Session>(&broker, "disc");
-    session->connect(session);
+    session->connect(session, /*persistent=*/false);
+    auto client = test::attach(*session);
+
     std::atomic<int> disconnects{0};
     session->setDisconnectCallback([&disconnects]() { disconnects++; });
-    session->disconnect();
-    // A repeated disconnect must not notify the (possibly destroyed) connection again
-    session->disconnect();
+
+    session->close(client);
+    // A repeated close from a stale connection must be a no-op
+    session->close(client);
+
     EXPECT_EQ(disconnects.load(), 1);
     EXPECT_EQ(broker.getConnectedClients(), 0);
 }
 
-TEST_F(SessionLifecycleTest, BrokerForgetsOnlyTheMatchingSession)
+TEST_F(SessionLifecycleTest, PersistentSessionBuffersMessagesWhileOffline)
+{
+    auto session = std::make_shared<Session>(&broker, "offline");
+    session->connect(session, /*persistent=*/true);
+    auto first = test::attach(*session);
+    session->subscribe("o/t", optionsFor());
+    session->close(first);  // goes offline, but the session survives
+
+    // A message published while the client is away is buffered
+    broker.publish(Message("o/t", "buffered"));
+
+    auto second = std::make_shared<RecordingClient>();
+    session->resume(second);
+    session->flush();
+
+    ASSERT_EQ(second->size(), 1u);
+    EXPECT_EQ(std::string(second->delivered[0].payload.begin(), second->delivered[0].payload.end()),
+              "buffered");
+}
+
+TEST_F(SessionLifecycleTest, NonPersistentCloseRemovesBrokerSubscriptions)
+{
+    auto session = std::make_shared<Session>(&broker, "npsub");
+    session->connect(session, /*persistent=*/false);
+    auto client = test::attach(*session);
+    session->subscribe("np/t", optionsFor());
+    EXPECT_TRUE(broker.isSubscribed("npsub", "np/t"));
+
+    session->close(client);
+
+    // A gone session must not leave a routing entry behind
+    EXPECT_FALSE(broker.isSubscribed("npsub", "np/t"));
+}
+
+TEST_F(SessionLifecycleTest, DiscardingAStaleSessionKeepsTheLiveOne)
 {
     auto first = std::make_shared<Session>(&broker, "same-id");
     auto client = test::attach(*first);
-    first->subscribe("f/x", defaultOptions());
+    first->subscribe("f/x", optionsFor());
 
-    // A reconnect installs a new session under the same client id
+    // A clean start installs a fresh session under the same client id
     auto second = std::make_shared<Session>(&broker, "same-id");
-    second->connect(second);
+    second->connect(second, /*persistent=*/false);
     EXPECT_EQ(broker.findSession("same-id"), second);
 
-    // Disconnecting the stale session must not remove the live one
-    first->disconnect();
+    // Discarding the stale session must not remove the live one
+    first->discard();
     EXPECT_EQ(broker.findSession("same-id"), second);
 }
 
@@ -116,14 +209,14 @@ TEST_F(SessionLifecycleTest, ConcurrentPublishAndReconnectDoesNotCrash)
     std::atomic<int> published{0};
     std::vector<std::thread> threads;
     std::vector<std::shared_ptr<Session>> subscribers;
+    std::vector<std::shared_ptr<RecordingClient>> clients;
 
     for (int i = 0; i < 4; ++i) {
         auto session = std::make_shared<Session>(&broker, "load-" + std::to_string(i));
         subscribers.push_back(session);
-        auto client = test::attach(*session);
-        session->setTakeoverCallback([]() {});
-        session->subscribe("load/#", defaultOptions());
-        session->connect(session);
+        clients.push_back(test::attach(*session));
+        session->subscribe("load/#", optionsFor());
+        session->connect(session, /*persistent=*/false);
     }
 
     for (int i = 0; i < 2; ++i) {
@@ -135,16 +228,18 @@ TEST_F(SessionLifecycleTest, ConcurrentPublishAndReconnectDoesNotCrash)
             }
         });
     }
-    // Churn: connect and disconnect sessions with colliding client ids while
-    // messages are being published
+    // Churn: connect and drop sessions with colliding client ids while messages
+    // are being published
     threads.emplace_back([this, &stop]() {
         int round = 0;
-        std::vector<std::shared_ptr<Session>> alive;
+        std::vector<std::shared_ptr<RecordingClient>> alive;
         while (!stop) {
             auto session = std::make_shared<Session>(&broker, "churn-" + std::to_string(round++ % 3));
-            session->subscribe("load/#", defaultOptions());
-            session->connect(session);
-            alive.push_back(session);
+            session->subscribe("load/#", optionsFor());
+            session->connect(session, /*persistent=*/false);
+            auto client = test::attach(*session);
+            alive.push_back(client);
+            session->close(client);
             if (alive.size() > 8) {
                 alive.erase(alive.begin());
             }

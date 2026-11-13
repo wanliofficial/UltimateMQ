@@ -22,10 +22,10 @@ class Session;
  */
 class Broker {
     std::unique_ptr<Trie> trie;
-    // The broker does not own sessions: they die with the connection that
-    // drives them. findSession()/collectTargets() hand out shared references so
-    // a session cannot be destroyed while a publisher is still using it.
-    std::unordered_map<std::string, std::weak_ptr<Session>> sessions;
+    // The broker keeps a strong reference to every session so that a session
+    // (and its subscriptions and unacknowledged in-flight messages) can outlive
+    // the TCP connection that drives it and be resumed by a later connect.
+    std::unordered_map<std::string, std::shared_ptr<Session>> sessions;
     std::unordered_map<std::string, std::set<std::string>> subscriptions;
     std::map<std::string, std::vector<SharedSubscription>> sharedSubscriptions;
     // Retained messages, keyed by their exact topic name
@@ -39,10 +39,8 @@ public:
     explicit Broker();
     ~Broker() = default;
     void insertSession(const std::string &clientId, const std::shared_ptr<Session>& session);
-    //! Register \p session unless another live session already uses \p clientId
-    bool insertSessionIfAbsent(const std::string &clientId, const std::shared_ptr<Session>& session);
     std::shared_ptr<Session> findSession(const std::string &clientId) const;
-    //! Remove the session from the map if (and only if) it is mapped to `session`
+    //! Remove the session from the map if it is the one mapped to `session`
     void forgetSession(Session* session);
     void removeSession(const std::string &clientId);
     void removeSession(Session* session);
@@ -55,9 +53,9 @@ public:
     //! the clients happen after the broker lock has been released.
     void publish(const Message &message);
 
-    //! All retained messages, keyed by topic name
-    const std::map<std::string, Message> &getRetainedMessages() const { return retainedMessages; }
-    size_t getRetainedCount() const { return retainedMessages.size(); }
+    //! All retained messages, keyed by topic name (returns a snapshot; thread safe)
+    std::map<std::string, Message> snapshotRetained() const;
+    size_t getRetainedCount() const;
 
     int getConnectedClients() const;
     bool isSubscribed(const std::string& clientId, const std::string& topicFilter) const;

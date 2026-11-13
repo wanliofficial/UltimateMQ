@@ -14,41 +14,83 @@ namespace MQTT {
 Session::Session(Broker *broker, const std::string &clientId, bool cleanStart)
     : clientId(clientId), cleanStart(cleanStart), broker(broker) {}
 
-Session::~Session() {
-    // The broker only holds weak references, but drop the map entry defensively
-    if (registered.load()) {
+Session::~Session() = default;
+
+void Session::connect(const std::shared_ptr<Session> &self, bool persistent) {
+    this->persistent = persistent;
+    connected = true;
+    // The broker keeps a strong reference so the session (and its in-flight
+    // state) can outlive the TCP connection for a later reconnect
+    broker->insertSession(clientId, self);
+    logDebug("session connected: %s (persistent=%d)", clientId.c_str(), (int)persistent);
+}
+
+void Session::close(const std::shared_ptr<Client> &client) {
+    bool wasBound;
+    std::function<void()> notify;
+    std::map<std::string, SubscriptionOptions> filters;
+    {
+        std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
+        wasBound = (this->client == client);
+        if (!wasBound) {
+            // A newer connection has already taken this session over: nothing to do
+            return;
+        }
+        this->client.reset();
+        if (!persistent) {
+            // A non-persistent session holds nothing worth keeping
+            pendingDeliveries.clear();
+            filters.swap(subscriptions);
+        }
+        // A persistent session keeps its subscriptions, its offline message
+        // buffer (pendingDeliveries) and its unacknowledged inflight messages
+        // so that they can be retransmitted on the next connect
+        notify = std::move(onDisconnect);
+        onDisconnect = nullptr;
+    }
+    connected = false;
+    if (!persistent) {
+        removeSubscriptions(filters);
         broker->forgetSession(this);
+    }
+    logDebug("session closed: %s (persistent=%d)", clientId.c_str(), (int)persistent);
+    if (notify) {
+        notify();
     }
 }
 
-void Session::connect(const std::shared_ptr<Session> &self) {
-    selfRef = self;
-    connected = true;
-    // The broker holds a weak reference: if another connection registered the
-    // same client id first, this session stays unregistered and must be dropped
-    if (broker->insertSessionIfAbsent(clientId, self)) {
-        registered = true;
+void Session::removeSubscriptions(const std::map<std::string, SubscriptionOptions> &filters) {
+    // Drop this client from the broker routing tables. Called without any
+    // session lock so that the Broker -> Session lock order is preserved.
+    for (const auto &entry : filters) {
+        const std::string &filter = entry.first;
+        if (Topic::isShared(filter)) {
+            auto [group, realTopicFilter] = Topic::splitShared(filter);
+            broker->sharedUnsubscribe(clientId, realTopicFilter, group);
+        } else {
+            broker->unsubscribe(clientId, filter);
+        }
     }
-    logDebug("session connected: %s (registered=%d)", clientId.c_str(), (int)registered.load());
 }
 
 void Session::discard() {
     logDebug("session discarded: %s", clientId.c_str());
-    disconnect();
-}
-
-void Session::disconnect() {
-    if (registered.exchange(false)) {
-        broker->forgetSession(this);
-    }
-    connected = false;
     std::function<void()> notify;
+    std::map<std::string, SubscriptionOptions> filters;
     {
         std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
+        // Throw away everything: subscriptions, offline buffer and inflight
+        filters.swap(subscriptions);
         pendingDeliveries.clear();
+        inflightMessages.clear();
+        awaitingPubrel.clear();
+        client.reset();
         notify = std::move(onDisconnect);
         onDisconnect = nullptr;
     }
+    connected = false;
+    removeSubscriptions(filters);
+    broker->forgetSession(this);
     if (notify) {
         notify();
     }
@@ -118,22 +160,25 @@ void Session::bindClient(const std::shared_ptr<Client>& client) {
     pendingDeliveries.clear();
 }
 
-void Session::setTakeoverCallback(std::function<void()> callback) {
-    std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
-    onTakeover = std::move(callback);
-}
-
-void Session::dropOnDelivery() {
-    if (!onTakeover) {
-        return;
+void Session::resume(const std::shared_ptr<Client>& client) {
+    std::shared_ptr<Client> previous;
+    {
+        std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
+        previous = std::move(this->client);
+        this->client = client;
+        // Retransmit every QoS>0 message that was delivered but never
+        // acknowledged, keeping the original packet id and setting DUP=1
+        // (MQTT-3.3.1-8 / MQTT-4.4.0-1)
+        for (const auto& [id, stored] : inflightMessages) {
+            Message outgoing = *stored;
+            outgoing.dup = true;
+            pendingDeliveries.emplace_back(std::move(outgoing), id, stored->qos);
+        }
     }
-    auto takeover = std::move(onTakeover);
-    onTakeover = nullptr;
-    pendingDeliveries.clear();
-    takeover();
-    // The session has been handed over to a newer connection: no outdated
-    // message may reach the client that took it over
-    pendingDeliveries.clear();
+    if (previous) {
+        // Tell the connection that lost the session to release it
+        previous->onSuperseded();
+    }
 }
 
 void Session::setDisconnectCallback(std::function<void()> callback) {
@@ -143,12 +188,6 @@ void Session::setDisconnectCallback(std::function<void()> callback) {
 
 void Session::deliver(const std::string &topic, const Message &message) {
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
-    if (onTakeover) {
-        // The session has been taken over: tell the old connection to release
-        // it before anything else is delivered
-        dropOnDelivery();
-        return;
-    }
 
     QoS qos = message.qos;
     auto it = subscriptions.find(topic);
@@ -158,6 +197,7 @@ void Session::deliver(const std::string &topic, const Message &message) {
     }
 
     Message outgoing = message;
+    outgoing.dup = false;
     if (it != subscriptions.end() && !it->second.retainAsPublished) {
         // MQTT-3.3.1-8: when forwarding a live message the retain flag is cleared
         // unless the subscription asked for retain-as-published
@@ -171,12 +211,16 @@ void Session::deliverRetained(const std::string &topicFilter, const Subscription
         return;
     }
 
+    // Snapshot the retained messages under the broker lock (never while holding
+    // the session lock, to keep Broker -> Session lock ordering)
+    auto retained = broker->snapshotRetained();
+
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
     if (options.retainHandling == RetainHandling::SEND_RETAINED_MESSAGES_AT_SUBSCRIBE_IF_NEW &&
         !newSubscription) {
         return;
     }
-    for (const auto &[topic, message] : broker->getRetainedMessages()) {
+    for (const auto &[topic, message] : retained) {
         if (!Topic::match(topic, topicFilter)) {
             continue;
         }
@@ -189,6 +233,14 @@ void Session::deliverRetained(const std::string &topicFilter, const Subscription
 }
 
 void Session::pushDelivery(const Message &message, QoS qos) {
+    // Bound the per-session queue: a persistent session that stays offline
+    // would otherwise grow without limit. Once the cap is reached new messages
+    // are dropped rather than buffered forever.
+    if (pendingDeliveries.size() >= MAX_QUEUED_MESSAGES) {
+        logDebug("session %s: queue full (%zu), dropping message on %s", clientId.c_str(),
+                 pendingDeliveries.size(), message.topic.c_str());
+        return;
+    }
     Message outgoing = message;
     outgoing.qos = qos;
     uint16_t id = 0;
@@ -218,14 +270,13 @@ void Session::flush() {
     std::shared_ptr<Client> target;
     {
         std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
-        if (pendingDeliveries.empty()) {
+        target = client;
+        if (!target || pendingDeliveries.empty()) {
+            // No client bound (offline persistent session): keep the queue so
+            // it can be delivered when the client reconnects
             return;
         }
         deliveries.swap(pendingDeliveries);
-        target = client;
-    }
-    if (!target) {
-        return;
     }
     for (const auto &delivery : deliveries) {
         target->deliver(delivery.message, delivery.packetId, delivery.qos);

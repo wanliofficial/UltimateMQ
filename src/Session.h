@@ -34,6 +34,9 @@ class Client {
 public:
     virtual ~Client() = default;
     virtual void deliver(const Message& message, uint16_t packetId, QoS qos) = 0;
+    //! Called when a newer connection takes over this session; the receiver must
+    //! stop using the session and release it
+    virtual void onSuperseded() = 0;
 };
 
 class Session : public std::enable_shared_from_this<Session> {
@@ -46,8 +49,10 @@ public:
     bool cleanStartRequested() const { return cleanStart; }
 
     //! Register with the broker (keeps a shared reference to this session)
-    void connect(const std::shared_ptr<Session>& self);
-    void disconnect();
+    void connect(const std::shared_ptr<Session>& self, bool persistent = false);
+    //! Called when the driving connection is gone; tears the session down unless
+    //! it is persistent (and therefore kept alive for a later reconnect)
+    void close(const std::shared_ptr<Client>& client);
     void discard();
     ReasonCode publish(uint16_t packetId, const Message& message);
     void subscribe(const std::string& topic, const SubscriptionOptions& options);
@@ -59,9 +64,10 @@ public:
 
     //! Bind the session to the connection that drives it (may be nullptr to detach)
     void bindClient(const std::shared_ptr<Client>& client);
+    //! Rebind a persistent session to a new connection and retransmit the
+    //! unacknowledged QoS>0 messages it still holds
+    void resume(const std::shared_ptr<Client>& client);
     void setDisconnectCallback(std::function<void()> callback);
-    //! Called when the client id reconnects elsewhere; the old connection must stop using the session
-    void setTakeoverCallback(std::function<void()> callback);
 
     //! Queue a message for this session (thread safe)
     void deliver(const std::string& topic, const Message& message);
@@ -71,6 +77,7 @@ public:
     void flush();
     //! The subscription filter of this session that matches \p topic (or the topic itself)
     std::string matchingFilter(const std::string &topic);
+    bool isPersistent() const { return persistent; }
 
 private:
     struct Delivery {
@@ -83,8 +90,11 @@ private:
     };
 
     std::string clientId;
-    bool connected = false;
+    std::atomic<bool> connected{false};
     bool cleanStart = true;
+    bool persistent = false;
+    //! Upper bound of the per-session delivery queue
+    static constexpr size_t MAX_QUEUED_MESSAGES = 1000;
     uint16_t packetId = 1;
     std::set<uint16_t> awaitingPubrel;
     std::map<std::string, SubscriptionOptions> subscriptions;
@@ -94,17 +104,12 @@ private:
 
     std::recursive_mutex deliveryMutex;
     std::function<void()> onDisconnect;
-    std::function<void()> onTakeover;
 
     void pushDelivery(const Message& message, QoS qos);
-    void dropOnDelivery();
+    void removeSubscriptions(const std::map<std::string, SubscriptionOptions>& filters);
     uint16_t nextPacketId();
 
     Broker* broker;
-    // Guarded by the broker mutex: prevents a second connect() from replacing
-    // the session that is currently registered under the same client id
-    std::atomic<bool> registered{false};
-    std::weak_ptr<Session> selfRef;
     bool newSubscription = true;
 };
 

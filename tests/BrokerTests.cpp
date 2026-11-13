@@ -26,7 +26,8 @@ TEST_F(BrokerTest, DisconnectClientTest)
 {
     auto session = std::make_shared<MQTT::Session>(broker, "client1");
     session->connect(session);
-    session->disconnect();
+    auto client = MQTT::test::attach(*session);
+    session->close(client);
     EXPECT_EQ(broker->getConnectedClients(), 0);
 }
 
@@ -111,4 +112,20 @@ TEST_F(BrokerTest, RetainHandlingDoNotSendRetained)
     session->flush();
 
     EXPECT_EQ(client->size(), 0u);
+}
+
+TEST_F(BrokerTest, OverlappingSubscriptionsDeliverOnce)
+{
+    auto session = std::make_shared<MQTT::Session>(broker, "overlap");
+    session->connect(session, /*persistent=*/false);
+    MQTT::SubscriptionOptions options{MQTT::QoS::QOS_0, false, false,
+                                      MQTT::RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES};
+    auto client = MQTT::test::attach(*session);
+    session->subscribe("a/#", options);
+    session->subscribe("a/b", options);
+
+    broker->publish(MQTT::Message("a/b", "x"));
+
+    // Both filters match, but the client must receive a single copy
+    EXPECT_EQ(client->size(), 1u);
 }

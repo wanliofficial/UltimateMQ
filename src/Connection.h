@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <atomic>
+#include <functional>
 #include "MQTT.h"
 #include "Message.h"
 #include "Frame.h"
@@ -57,6 +58,8 @@ public:
 
     //! Client interface: write a delivery to the socket (called without any broker/session lock)
     void deliver(const Message& message, uint16_t packetId, QoS qos) override;
+    //! Client interface: a newer connection has taken over this session; stop using it
+    void onSuperseded() override;
     void handleDeliver(const Message& message, uint16_t packetId, QoS qos);
     void sendPacket(Packet &packet);
 
@@ -66,6 +69,7 @@ private:
     void publishWill();
     void armKeepAliveTimer();
     void scheduleReadTimeout();
+    void setDisconnectCallback(std::function<void()> callback);
 
     int sockfd;
     std::atomic<State> state;
@@ -79,6 +83,7 @@ private:
     std::chrono::milliseconds readTimeout{0};
     bool willPending = false;
     Message willMessage;
+    std::function<void()> disconnectCallback;
     static const int BUFFER_SIZE = 4096;
     uint8_t buffer[BUFFER_SIZE];
 };
