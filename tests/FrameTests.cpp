@@ -196,4 +196,68 @@ TEST_F(FrameTest, EncodeRemainingLength)
     EXPECT_EQ(encoded, std::vector<uint8_t>({0xFF, 0xFF, 0xFF, 0x7F}));
 }
 
+} // namespace MQTT
+
+namespace MQTT {
+
+TEST_F(FrameTest, ParseConnectPacketMqtt311HasNoProperties)
+{
+    std::vector<uint8_t> payload = {
+        0x00, 0x04, 'M', 'Q', 'T', 'T',  // Protocol name
+        0x04,                            // Protocol version 3.1.1
+        0b00000010,                      // Connect flags: clean start, no will/user/pass
+        0x00, 0x3C,                      // Keep alive
+        0x00, 0x03, 'a', 'b', 'c'        // Client ID (no property length in v3.1.1)
+    };
+
+    auto packet = frame->parseConnect(payload.data(), payload.size());
+
+    EXPECT_EQ(packet.protocolName, "MQTT");
+    EXPECT_EQ(packet.protocolVersion, Version::MQTT311);
+    EXPECT_EQ(packet.clientId, "abc");
+    EXPECT_TRUE(packet.properties.empty());
 }
+
+TEST_F(FrameTest, SerializeConnackForMqtt311HasNoProperties)
+{
+    Frame v4(Version::MQTT311);
+    ConnackPacket connack(false, ReasonCode::SUCCESS);
+    auto data = v4.serialize(connack);
+    std::vector<uint8_t> expected = {0x20, 0x02, 0x00, 0x00};
+    EXPECT_EQ(data, expected);
+}
+
+TEST_F(FrameTest, SerializePublishForMqtt311HasNoProperties)
+{
+    Frame v4(Version::MQTT311);
+    PublishPacket publish("t", std::vector<uint8_t>{'h', 'i'}, QoS::QOS_0, false);
+    auto data = v4.serialize(publish);
+    // 0x30, remaining length 5, topic length 2 + "t", payload "hi"
+    std::vector<uint8_t> expected = {0x30, 0x05, 0x00, 0x01, 't', 'h', 'i'};
+    EXPECT_EQ(data, expected);
+}
+
+TEST_F(FrameTest, SerializePublishForMqtt5CarriesPropertyLength)
+{
+    Frame v5(Version::MQTT5);
+    PublishPacket publish("t", std::vector<uint8_t>{'h', 'i'}, QoS::QOS_0, false);
+    auto data = v5.serialize(publish);
+    std::vector<uint8_t> expected = {0x30, 0x06, 0x00, 0x01, 't', 0x00, 'h', 'i'};
+    EXPECT_EQ(data, expected);
+}
+
+TEST_F(FrameTest, ParsePubackWithOnlyPacketIdDoesNotThrow)
+{
+    std::vector<uint8_t> payload = {0x00, 0x05};
+    auto packet = frame->parsePuback(payload.data(), payload.size());
+    EXPECT_EQ(packet.packetId, 5);
+    EXPECT_EQ(packet.reasonCode, ReasonCode::SUCCESS);
+}
+
+TEST_F(FrameTest, ParseStringThrowsOnTruncatedLength)
+{
+    std::vector<uint8_t> payload = {0x00};
+    EXPECT_THROW(frame->parseString(payload.data(), payload.size()), std::runtime_error);
+}
+
+} // namespace MQTT

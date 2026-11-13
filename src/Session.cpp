@@ -63,13 +63,16 @@ void Session::pubcomp(uint16_t packetId) {
     // broker->pubcomp(packet);
 }
 
-void Session::subscribe(const std::string &topicFilter, SubscriptionOptions &options) {
+void Session::subscribe(const std::string &topicFilter, const SubscriptionOptions &options) {
     if (Topic::isShared(topicFilter)) {
         auto [group, realTopicFilter] = Topic::splitShared(topicFilter);
         broker->sharedSubscribe(clientId, realTopicFilter, group);
+        newSubscription = subscriptions.find(realTopicFilter) == subscriptions.end();
         subscriptions[realTopicFilter] = options;
+        // Shared subscriptions never receive retained messages
     }
     else {
+        newSubscription = subscriptions.find(topicFilter) == subscriptions.end();
         broker->subscribe(clientId, topicFilter);
         subscriptions[topicFilter] = options;
     }
@@ -91,17 +94,51 @@ void Session::setDeliverCallback(std::function<void(const Message &, uint16_t, Q
 }
 
 void Session::deliver(const std::string &topic, const Message &message) {
-    printf("session deliver to %s\n", topic.c_str());
     QoS qos = message.qos;
-    if (subscriptions.find(topic) != subscriptions.end()) {
-        SubscriptionOptions options = subscriptions[topic];
-        qos = options.maximumQos;
+    auto it = subscriptions.find(topic);
+    if (it != subscriptions.end() && it->second.maximumQos < qos) {
+        // The delivered QoS is the minimum of the published QoS and the granted QoS
+        qos = it->second.maximumQos;
     }
-    if (qos > QoS::QOS_0) {
-        packetId = nextPacketId();
-        inflightMessages[packetId] = std::make_shared<Message>(message);
+    Message outgoing = message;
+    if (it != subscriptions.end() && !it->second.retainAsPublished) {
+        // MQTT-3.3.1-8: when forwarding a live message the retain flag is cleared
+        // unless the subscription asked for retain-as-published
+        outgoing.retain = false;
     }
-    onDeliver(message, packetId, qos);
+    deliverWithQos(outgoing, qos);
+}
+
+void Session::deliverRetained(const std::string &topicFilter, const SubscriptionOptions &options) {
+    if (options.retainHandling == RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES) {
+        return;
+    }
+    if (options.retainHandling == RetainHandling::SEND_RETAINED_MESSAGES_AT_SUBSCRIBE_IF_NEW &&
+        !newSubscription) {
+        return;
+    }
+    for (const auto &[topic, message] : broker->getRetainedMessages()) {
+        if (!Topic::match(topic, topicFilter)) {
+            continue;
+        }
+        Message outgoing = message;
+        // MQTT-3.3.1-8: messages sent because of a subscription keep the retain flag
+        outgoing.retain = true;
+        QoS qos = message.qos < options.maximumQos ? message.qos : options.maximumQos;
+        deliverWithQos(outgoing, qos);
+    }
+}
+
+void Session::deliverWithQos(const Message &message, QoS qos) {
+    Message outgoing = message;
+    outgoing.qos = qos;
+    if (qos == QoS::QOS_0) {
+        onDeliver(outgoing, 0, qos);
+        return;
+    }
+    packetId = nextPacketId();
+    inflightMessages[packetId] = std::make_shared<Message>(outgoing);
+    onDeliver(outgoing, packetId, qos);
 }
 
 void Session::setDisconnectCallback(std::function<void()> callback) {

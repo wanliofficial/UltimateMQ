@@ -62,6 +62,9 @@ std::pair<size_t, size_t> Frame::decodeVariableByteInteger(const uint8_t *buffer
     int8_t encodedByte = 0;
     size_t offset = 0;
     do {
+        if (offset >= length) {
+            throw std::runtime_error("Malformed Variable Byte Integer: truncated");
+        }
         encodedByte = buffer[offset++];
         value += (encodedByte & 127) * multiplier;
         if (multiplier > Frame::MAX_MULTIPLIER) {
@@ -73,7 +76,10 @@ std::pair<size_t, size_t> Frame::decodeVariableByteInteger(const uint8_t *buffer
 }
 
 std::string Frame::parseString(const uint8_t* buffer, size_t length) {
-    uint16_t strLen = buffer[0] << 8 | buffer[1];
+    if (length < 2) {
+        throw std::runtime_error("String length field is truncated");
+    }
+    uint16_t strLen = (buffer[0] << 8) | buffer[1];
     if (strLen + 2 > length) {
         throw std::runtime_error("String length is greater than the remaining data");
     }
@@ -259,6 +265,9 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
 }
 
 std::pair<Properties, size_t> Frame::parseProperties(const uint8_t *buffer, size_t length) {
+    if (length == 0) {
+        throw std::runtime_error("Properties: no property length present");
+    }
     if(buffer[0] == 0) {
         return std::make_pair(Properties(), 1);
     }
@@ -304,8 +313,8 @@ ConnectPacket Frame::parseConnect(const uint8_t *buffer, size_t length) {
     offset += 2;    
     std::cout << "keepAlive: " << connect.keepAlive << std::endl;
 
-    // Parse properties
-    if(version == Version::MQTT5) {
+    // Parse properties (MQTT 5 only - for MQTT 3.1.1 the payload starts right after the keep alive)
+    if (protoVersion == Version::MQTT5) {
         auto [properties, propLength] = parseProperties(buffer+offset, length-offset);
         connect.properties = properties;
         offset += propLength;
@@ -391,6 +400,11 @@ PubackPacket Frame::parsePuback(const uint8_t *buffer, size_t length) {
     puback.packetId = parsePacketId(buffer, length);
     offset += 2;
 
+    // A packet with only a packet identifier carries neither properties nor a reason code
+    if (offset >= length) {
+        return puback;
+    }
+
     // Parse properties
     if(version == Version::MQTT5) {
         auto [properties, propLength] = parseProperties(buffer+offset, length - offset);
@@ -398,8 +412,10 @@ PubackPacket Frame::parsePuback(const uint8_t *buffer, size_t length) {
         offset += propLength;
     }
         
-    // Parse reason code
-    puback.reasonCode = static_cast<ReasonCode>(buffer[offset]);  
+    // Parse reason code (only present when there is data left after the properties)
+    if (offset < length) {
+        puback.reasonCode = static_cast<ReasonCode>(buffer[offset]);
+    }  
 
     return puback;
 }
@@ -410,14 +426,21 @@ PubrecPacket Frame::parsePubrec(const uint8_t *buffer, size_t length) {
     // Parse packet identifier      
     pubrec.packetId = parsePacketId(buffer, length);
     offset += 2;
+
+    // A packet with only a packet identifier carries neither properties nor a reason code
+    if (offset >= length) {
+        return pubrec;
+    }
     // Parse properties
     if(version == Version::MQTT5) {
         auto [properties, propLength] = parseProperties(buffer+offset, length - offset);
         pubrec.properties = properties;
         offset += propLength;
     }
-    // Parse reason code
-    pubrec.reasonCode = static_cast<ReasonCode>(buffer[offset]);
+    // Parse reason code (only present when there is data left after the properties)
+    if (offset < length) {
+        pubrec.reasonCode = static_cast<ReasonCode>(buffer[offset]);
+    }
     return pubrec;
 }
 
@@ -427,14 +450,21 @@ PubrelPacket Frame::parsePubrel(const uint8_t *buffer, size_t length) {
     // Parse packet identifier
     pubrel.packetId = parsePacketId(buffer, length);
     offset += 2;
+
+    // A packet with only a packet identifier carries neither properties nor a reason code
+    if (offset >= length) {
+        return pubrel;
+    }
     // Parse properties
     if(version == Version::MQTT5) {
         auto [properties, propLength] = parseProperties(buffer+offset, length - offset);
         pubrel.properties = properties;
         offset += propLength;
     }
-    // Parse reason code
-    pubrel.reasonCode = static_cast<ReasonCode>(buffer[offset]);   
+    // Parse reason code (only present when there is data left after the properties)
+    if (offset < length) {
+        pubrel.reasonCode = static_cast<ReasonCode>(buffer[offset]);
+    }   
     return pubrel;
 }
 
@@ -443,7 +473,12 @@ PubcompPacket Frame::parsePubcomp(const uint8_t *buffer, size_t length) {
     size_t offset = 0;
     // Parse packet identifier  
     pubcomp.packetId = parsePacketId(buffer, length);
-    offset += 2;  
+    offset += 2;
+
+    // A packet with only a packet identifier carries neither properties nor a reason code
+    if (offset >= length) {
+        return pubcomp;
+    }  
     
     // Parse properties
     if(version == Version::MQTT5) {
@@ -452,8 +487,10 @@ PubcompPacket Frame::parsePubcomp(const uint8_t *buffer, size_t length) {
         offset += propLength;
     }
 
-    // Parse reason code
-    pubcomp.reasonCode = static_cast<ReasonCode>(buffer[offset]);
+    // Parse reason code (only present when there is data left after the properties)
+    if (offset < length) {
+        pubcomp.reasonCode = static_cast<ReasonCode>(buffer[offset]);
+    }
 
     return pubcomp;
 }
@@ -546,6 +583,10 @@ AuthPacket Frame::parseAuth(const uint8_t *payload, size_t length) {
 }
 
 std::vector<uint8_t> Frame::serialize(const Packet &packet) {
+    if (packet.type == PacketType::CONNECT) {
+        // The CONNECT packet determines the protocol version for the whole connection
+        version = static_cast<const ConnectPacket&>(packet).protocolVersion;
+    }
     switch (packet.type) {
         case PacketType::CONNECT:
             return serializeConnect(static_cast<const ConnectPacket&>(packet));
@@ -671,12 +712,14 @@ std::vector<uint8_t> Frame::serializeConnack(const ConnackPacket &packet) {
     // Serialize variable header
     // Byte 1: Connect Acknowledge Flags
     uint8_t connAckFlags = 0;
-    if (packet.sessionPresent) {
+    if (version != Version::MQTT311 && packet.sessionPresent) {
         connAckFlags |= 0x01;
     }
     buffer.push_back(connAckFlags);
 
-    // Byte 2: Connect Return Code
+    // Byte 2: Connect Return Code / Reason Code
+    // For MQTT 3.1.1 the reason code has to be a v3 return code, which is
+    // identical to the v5 codes for the values that matter here.
     buffer.push_back(static_cast<uint8_t>(packet.reasonCode));
     return buffer;
 }
@@ -697,10 +740,8 @@ std::vector<uint8_t> Frame::serializePublish(const PublishPacket &packet) {
     if (packet.qos > QoS::QOS_0) {
         remainingLength += 2; // Packet Identifier (2 bytes)
     }
-    if(propertiesBuffer.size() > 0) {
-        remainingLength += propertiesBuffer.size(); // Properties
-    } else {
-        remainingLength += 1; // Property Length
+    if (version == Version::MQTT5) {
+        remainingLength += 1; // Property Length (no properties are emitted)
     }
     remainingLength += packet.payload.size(); // Payload
 
@@ -716,9 +757,10 @@ std::vector<uint8_t> Frame::serializePublish(const PublishPacket &packet) {
         buffer.push_back((packet.packetId >> 8) & 0xFF);
         buffer.push_back(packet.packetId & 0xFF);
     }
-    // Serialize properties
-    buffer.push_back(0);
-    //buffer.insert(buffer.end(), propertiesBuffer.begin(), propertiesBuffer.end());
+    // Serialize properties (MQTT 5 only)
+    if (version == Version::MQTT5) {
+        buffer.push_back(0);
+    }
     // Serialize Payload
     buffer.insert(buffer.end(), packet.payload.begin(), packet.payload.end());
     return buffer;
@@ -729,6 +771,9 @@ std::vector<uint8_t> Frame::serializeSubscribe(const SubscribePacket &packet) {
     buffer.push_back((static_cast<uint8_t>(PacketType::SUBSCRIBE) << 4) | 0x02);
     // Serialize remaining length
     uint32_t remainingLength = 2; // Packet Identifier (2 bytes)
+    if (version == Version::MQTT5) {
+        remainingLength += 1; // Property Length
+    }
     for (const auto &subscription : packet.subscriptions) {
         remainingLength += 2 + subscription.first.length(); // Topic length (2 bytes) + topic string
         remainingLength += 1;                               // Subscription Options (1 byte)
@@ -740,6 +785,11 @@ std::vector<uint8_t> Frame::serializeSubscribe(const SubscribePacket &packet) {
     // Serialize Packet Identifier
     buffer.push_back((packet.packetId >> 8) & 0xFF);
     buffer.push_back(packet.packetId & 0xFF);
+
+    // Serialize properties (MQTT 5 only)
+    if (version == Version::MQTT5) {
+        buffer.push_back(0); // Property Length
+    }
 
     // Serialize subscriptions
     for (const auto &subscription : packet.subscriptions) {
@@ -766,6 +816,9 @@ std::vector<uint8_t> Frame::serializeSuback(const SubackPacket &packet) {
     buffer.push_back(static_cast<uint8_t>(PacketType::SUBACK) << 4);
     // Calculate remaining length
     uint32_t remainingLength = 2;                 // Packet Identifier (2 bytes)
+    if (version == Version::MQTT5) {
+        remainingLength += 1;                     // Property Length
+    }
     remainingLength += packet.reasonCodes.size(); // One byte for each reason code
 
     // Serialize remaining length
@@ -775,6 +828,11 @@ std::vector<uint8_t> Frame::serializeSuback(const SubackPacket &packet) {
     // Serialize Packet Identifier
     buffer.push_back((packet.packetId >> 8) & 0xFF);
     buffer.push_back(packet.packetId & 0xFF);
+
+    // Serialize properties (MQTT 5 only)
+    if (version == Version::MQTT5) {
+        buffer.push_back(0); // Property Length
+    }
 
     // Serialize reason codes
     for (const auto &reasonCode : packet.reasonCodes) {
@@ -816,6 +874,9 @@ std::vector<uint8_t> Frame::serializeUnsuback(const UnsubackPacket &packet) {
     buffer.push_back(static_cast<uint8_t>(PacketType::UNSUBACK) << 4);
     // Calculate remaining length
     uint32_t remainingLength = 2;                 // Packet Identifier (2 bytes)
+    if (version == Version::MQTT5) {
+        remainingLength += 1;                     // Property Length
+    }
     remainingLength += packet.reasonCodes.size(); // One byte for each reason code
 
     // Serialize remaining length
@@ -825,6 +886,11 @@ std::vector<uint8_t> Frame::serializeUnsuback(const UnsubackPacket &packet) {
     // Serialize Packet Identifier
     buffer.push_back((packet.packetId >> 8) & 0xFF);
     buffer.push_back(packet.packetId & 0xFF);
+
+    // Serialize properties (MQTT 5 only)
+    if (version == Version::MQTT5) {
+        buffer.push_back(0); // Property Length
+    }
 
     // Serialize reason codes
     for (const auto &reasonCode : packet.reasonCodes) {
@@ -841,6 +907,9 @@ std::vector<uint8_t> Frame::serializePuback(const PubackPacket &packet) {
     if (packet.reasonCode != ReasonCode::SUCCESS) {
         remainingLength += 1; // Reason Code (1 byte)
     }
+    if (version == Version::MQTT5) {
+        remainingLength += 1; // Property Length
+    }
 
     // Serialize remaining length
     std::vector<uint8_t> remainingLengthBytes = encodeRemainingLength(remainingLength);
@@ -853,6 +922,10 @@ std::vector<uint8_t> Frame::serializePuback(const PubackPacket &packet) {
     // Serialize Reason Code if not SUCCESS
     if (packet.reasonCode != ReasonCode::SUCCESS) {
         buffer.push_back(static_cast<uint8_t>(packet.reasonCode));
+    }
+    // Serialize properties (MQTT 5 only, no properties are emitted)
+    if (version == Version::MQTT5) {
+        buffer.push_back(0); // Property Length
     }
     return buffer;
 }
@@ -865,6 +938,9 @@ std::vector<uint8_t> Frame::serializePubrec(const PubrecPacket &packet) {
     if (packet.reasonCode != ReasonCode::SUCCESS) {
         remainingLength += 1; // Reason Code (1 byte)
     }
+    if (version == Version::MQTT5) {
+        remainingLength += 1; // Property Length
+    }
 
     // Serialize remaining length
     std::vector<uint8_t> remainingLengthBytes = encodeRemainingLength(remainingLength);
@@ -877,6 +953,10 @@ std::vector<uint8_t> Frame::serializePubrec(const PubrecPacket &packet) {
     // Serialize Reason Code if not SUCCESS
     if (packet.reasonCode != ReasonCode::SUCCESS) {
         buffer.push_back(static_cast<uint8_t>(packet.reasonCode));
+    }
+    // Serialize properties (MQTT 5 only, no properties are emitted)
+    if (version == Version::MQTT5) {
+        buffer.push_back(0); // Property Length
     }
     return buffer;
 }
@@ -889,6 +969,9 @@ std::vector<uint8_t> Frame::serializePubrel(const PubrelPacket &packet) {
     if (packet.reasonCode != ReasonCode::SUCCESS) {
         remainingLength += 1; // Reason Code (1 byte)
     }
+    if (version == Version::MQTT5) {
+        remainingLength += 1; // Property Length
+    }
 
     // Serialize remaining length
     std::vector<uint8_t> remainingLengthBytes = encodeRemainingLength(remainingLength);
@@ -901,6 +984,10 @@ std::vector<uint8_t> Frame::serializePubrel(const PubrelPacket &packet) {
     // Serialize Reason Code if not SUCCESS
     if (packet.reasonCode != ReasonCode::SUCCESS) {
         buffer.push_back(static_cast<uint8_t>(packet.reasonCode));
+    }
+    // Serialize properties (MQTT 5 only, no properties are emitted)
+    if (version == Version::MQTT5) {
+        buffer.push_back(0); // Property Length
     }
     return buffer;
 }
@@ -913,6 +1000,9 @@ std::vector<uint8_t> Frame::serializePubcomp(const PubcompPacket &packet) {
     if (packet.reasonCode != ReasonCode::SUCCESS) {
         remainingLength += 1; // Reason Code (1 byte)
     }
+    if (version == Version::MQTT5) {
+        remainingLength += 1; // Property Length
+    }
 
     // Serialize remaining length
     std::vector<uint8_t> remainingLengthBytes = encodeRemainingLength(remainingLength);
@@ -925,6 +1015,10 @@ std::vector<uint8_t> Frame::serializePubcomp(const PubcompPacket &packet) {
     // Serialize Reason Code if not SUCCESS
     if (packet.reasonCode != ReasonCode::SUCCESS) {
         buffer.push_back(static_cast<uint8_t>(packet.reasonCode));
+    }
+    // Serialize properties (MQTT 5 only, no properties are emitted)
+    if (version == Version::MQTT5) {
+        buffer.push_back(0); // Property Length
     }
     return buffer;
 }

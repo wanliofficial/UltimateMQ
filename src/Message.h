@@ -14,6 +14,8 @@ struct Message {
     QoS qos = QoS::QOS_0;
     bool retain = false;
 
+    Message() = default;
+
     Message(const std::string &t, const std::vector<uint8_t> &p, QoS q = QoS::QOS_0, bool r = false)
         : topic(t), payload(std::move(p)), qos(q), retain(r) {}
 

@@ -17,7 +17,8 @@ class Broker {
     std::unordered_map<std::string, Session*> sessions;
     std::unordered_map<std::string, std::set<std::string>> subscriptions;
     std::map<std::string, std::vector<SharedSubscription>> sharedSubscriptions;
-
+    // Retained messages, keyed by their exact topic name
+    std::map<std::string, Message> retainedMessages;
 public:
     explicit Broker();
     ~Broker() = default;
@@ -31,6 +32,10 @@ public:
     void sharedSubscribe(const std::string &clientId, const std::string &topicFilter, const std::string &group);
     void sharedUnsubscribe(const std::string &clientId, const std::string &topicFilter, const std::string &group);
     void publish(const Message &message);
+
+    //! All retained messages, keyed by topic name
+    const std::map<std::string, Message> &getRetainedMessages() const { return retainedMessages; }
+    size_t getRetainedCount() const { return retainedMessages.size(); }
 
     int getConnectedClients() const;
     bool isSubscribed(const std::string& clientId, const std::string& topicFilter) const;

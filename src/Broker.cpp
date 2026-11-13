@@ -110,6 +110,15 @@ static int randIdx(int size) {
 }
 
 void Broker::publish(const Message &message) {
+    if (message.retain) {
+        if (message.payload.empty()) {
+            // An empty retained payload removes the retained message for that topic
+            retainedMessages.erase(message.topic);
+        } else {
+            retainedMessages[message.topic] = message;
+        }
+    }
+
     std::vector<std::string> topicFilters = trie->match(message.topic);
     for (const auto &topicFilter : topicFilters) {
         std::set<std::string> clientIds = getSubscriptions(topicFilter);

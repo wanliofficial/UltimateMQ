@@ -1,5 +1,6 @@
 #include "Frame.h"
 #include "Connection.h"
+#include "Topic.h"
 #include "Session.h"
 #include "Broker.h"
 #include <unistd.h>
@@ -155,17 +156,22 @@ void Connection::handleSubscribe(std::shared_ptr<SubscribePacket> subscribe) {
     // Add subscriptions to the session
     for (const auto& subscription : subscribe->subscriptions) {
         printf("Subscription: %s\n", subscription.first.c_str());
-        session->subscribe(subscription.first, const_cast<MQTT::SubscriptionOptions&>(subscription.second));
+        session->subscribe(subscription.first, subscription.second);
     }
     SubackPacket suback{subscribe->packetId};    
-    printf("Suback packet: %d\n", subscribe->packetId);
 
-    // Accept all subscriptions with QoS 0
-    for (size_t i = 0; i < subscribe->subscriptions.size(); ++i) {   
-        suback.reasonCodes.push_back(ReasonCode::GRANTED_QOS_0);
+    // Grant the requested QoS, but never more than QoS 2
+    for (const auto& subscription : subscribe->subscriptions) {
+        suback.reasonCodes.push_back(static_cast<ReasonCode>(static_cast<uint8_t>(subscription.second.maximumQos)));
     }
     sendPacket(suback);
 
+    // Retained messages are delivered after the SUBACK (MQTT-3.3.1-9)
+    for (const auto& subscription : subscribe->subscriptions) {
+        if (!Topic::isShared(subscription.first)) {
+            session->deliverRetained(subscription.first, subscription.second);
+        }
+    }
 }
 
 void Connection::handleUnsubscribe(std::shared_ptr<UnsubscribePacket> unsubscribe) {

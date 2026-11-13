@@ -26,7 +26,7 @@ public:
     void discard();
     //void resume();
     ReasonCode publish(uint16_t packetId,const Message& message);
-    void subscribe(const std::string& topic, SubscriptionOptions& options);
+    void subscribe(const std::string& topic, const SubscriptionOptions& options);
     void unsubscribe(const std::string& topic);
     void puback(uint16_t packetId);
     ReasonCode pubrec(uint16_t packetId);
@@ -35,6 +35,8 @@ public:
     void setDeliverCallback(std::function<void(const Message&, uint16_t, QoS)> callback);
     void setDisconnectCallback(std::function<void()> callback);
     void deliver(const std::string& topic, const Message& message);
+    //! Deliver the retained messages matching a topic filter (honours the retain handling option)
+    void deliverRetained(const std::string& topicFilter, const SubscriptionOptions& options);
 
 private:
     std::string clientId;
@@ -47,7 +49,9 @@ private:
     std::queue<Message*> outgoingMessages;
     std::function<void(const Message&, uint16_t, QoS)> onDeliver;
     std::function<void()> onDisconnect;
+    void deliverWithQos(const Message& message, QoS qos);
     Broker* broker;
+    bool newSubscription = true;
     uint16_t nextPacketId();
 };
 

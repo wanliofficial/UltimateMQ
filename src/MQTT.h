@@ -267,9 +267,9 @@ struct ConnectPacket : Packet {
 struct ConnackPacket : Packet {
     bool sessionPresent;
     ReasonCode reasonCode;
-    ConnackPacket() = default;
+    ConnackPacket() : Packet(PacketType::CONNACK), sessionPresent(false), reasonCode(ReasonCode::SUCCESS) {}
     ConnackPacket(bool sessionPresent, ReasonCode reasonCode)
-        : sessionPresent(sessionPresent), reasonCode(reasonCode) {}
+        : Packet(PacketType::CONNACK), sessionPresent(sessionPresent), reasonCode(reasonCode) {}
     ConnackPacket(PacketType type, bool sessionPresent, ReasonCode reasonCode)
         : Packet(type), sessionPresent(sessionPresent), reasonCode(reasonCode) {}
     ~ConnackPacket() = default; 

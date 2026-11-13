@@ -9,4 +9,4 @@ std::string Message::toString() const {
     return ss.str();
 }
 
-}
+} // namespace MQTT
