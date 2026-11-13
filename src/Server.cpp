@@ -51,6 +51,24 @@ Server::Server(int port, size_t maxConnections)
         logError("acl is enabled without authentication: clients can claim any username");
     }
 
+    // Transport security (opt-in). Without a certificate the listener speaks
+    // plaintext, exactly as before; with one it speaks TLS and every credential
+    // and payload is encrypted on the wire.
+    const char* tlsCert = getenv("FLOWMQ_TLS_CERT");
+    const char* tlsKey = getenv("FLOWMQ_TLS_KEY");
+    bool tlsVerifyClients = getenv("FLOWMQ_TLS_VERIFY_CLIENTS") != nullptr;
+    const char* tlsCa = getenv("FLOWMQ_TLS_CA");
+    std::string tlsError;
+    tls = TlsContext::load(tlsCert ? tlsCert : "", tlsKey ? tlsKey : "",
+                           tlsVerifyClients, tlsCa ? tlsCa : "", &tlsError);
+    if (!tlsError.empty()) {
+        throw std::runtime_error("failed to configure TLS: " + tlsError);
+    }
+    logInfo("transport %s", tls && tls->enabled() ? "TLS" : "plaintext");
+    if (tls && tls->enabled() && !auth->authRequired()) {
+        logError("TLS is enabled without authentication: the connection is encrypted but the client is anonymous");
+    }
+
     // Durable state (opt-in). The store is created before the broker so that a
     // corrupted state file aborts startup instead of silently losing sessions.
     const char* stateFile = getenv("FLOWMQ_STATE_FILE");
@@ -165,7 +183,7 @@ void Server::run() {
 
         // The shared_ptr keeps the connection alive for the lifetime of the
         // session callbacks, even if the thread itself has already finished
-        auto connection = std::make_shared<Connection>(clientSocket, broker);
+        auto connection = std::make_shared<Connection>(clientSocket, broker, tls);
         registerConnection(clientSocket, connection);
 
         std::thread clientThread([this, clientSocket, connection]() {

@@ -4,6 +4,7 @@
 #include "Session.h"
 #include "Broker.h"
 #include "Auth.h"
+#include "Tls.h"
 #include <unistd.h>
 #include <sys/socket.h>
 #include <poll.h>
@@ -24,9 +25,10 @@ constexpr int CONNECT_TIMEOUT_SECONDS = 10;
 constexpr int POLL_SLICE_MS = 250;
 }
 
-Connection::Connection(int sockfd, Broker* broker)
+Connection::Connection(int sockfd, Broker* broker, std::shared_ptr<TlsContext> tls)
     : sockfd(sockfd), state(State::IDLE), broker(broker),
       auth(broker ? broker->getAuth() : nullptr),
+      transport(std::make_unique<SecureTransport>(sockfd, std::move(tls))),
       lastActivity(std::chrono::steady_clock::now()) { }
 
 Connection::~Connection() {
@@ -35,6 +37,16 @@ Connection::~Connection() {
 
 void Connection::run() {
     try {
+        // Complete the TLS handshake before any MQTT bytes are read. A failed
+        // handshake (wrong protocol, untrusted client certificate, ...) ends
+        // the connection here, before a CONNECT can be forged.
+        if (transport->tlsEnabled()) {
+            std::string handshakeError;
+            if (!transport->handshake(&handshakeError)) {
+                logInfo("dropping connection: %s", handshakeError.c_str());
+                return;
+            }
+        }
         scheduleReadTimeout();
         runReadLoop();
     } catch (const std::exception &e) {
@@ -91,20 +103,16 @@ void Connection::runReadLoop() {
             int timeout = static_cast<int>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
             timeout = std::min(timeout, POLL_SLICE_MS);
-            struct pollfd pfd{sockfd, POLLIN, 0};
-            int ready = poll(&pfd, 1, timeout);
+            int ready = transport->readable(timeout);
             if (ready < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                return;
+                continue;
             }
             if (ready == 0) {
                 continue;
             }
         }
 
-        ssize_t bytesRead = read(sockfd, buffer, BUFFER_SIZE);
+        ssize_t bytesRead = transport->readSome(buffer, BUFFER_SIZE);
         if (bytesRead <= 0) {
             return;
         }
@@ -135,6 +143,10 @@ bool Connection::isConnected() const {
 }
 
 void Connection::closeSocket() {
+    // Flush the TLS close_notify before the descriptor goes away
+    if (transport) {
+        transport->teardown();
+    }
     if (sockfd >= 0) {
         shutdown(sockfd, SHUT_RDWR);
         close(sockfd);
@@ -478,18 +490,9 @@ void Connection::sendPacket(Packet &packet) {
         return;
     }
     auto data = frame.serialize(packet);
-    size_t sent = 0;
-    while (sent < data.size()) {
-        ssize_t written = send(sockfd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
-        if (written < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            // The peer is gone; stop the connection on the next loop iteration
-            state = State::DISCONNECTED;
-            return;
-        }
-        sent += static_cast<size_t>(written);
+    if (!transport->writeAll(data.data(), data.size())) {
+        // The peer is gone; stop the connection on the next loop iteration
+        state = State::DISCONNECTED;
     }
 }
 

@@ -19,10 +19,15 @@ add_library(flowmq_lib STATIC
     src/Session.cpp
     src/Auth.cpp
     src/Store.cpp
+    src/Tls.cpp
 )
 
 # Set include directories for the library
 target_include_directories(flowmq_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# TLS is required: the broker speaks plaintext when no certificate is configured
+find_package(OpenSSL REQUIRED)
+target_link_libraries(flowmq_lib PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 
 # Create executable
 add_executable(flowmq 

@@ -14,6 +14,7 @@
 #include "Frame.h"
 #include "Session.h"
 #include "Auth.h"
+#include "Tls.h"
 
 namespace MQTT {
 class Broker;
@@ -32,7 +33,8 @@ class Connection : public Client, public std::enable_shared_from_this<Connection
     };
 
 public:
-    explicit Connection(int sockfd, Broker* broker);
+    explicit Connection(int sockfd, Broker* broker,
+                        std::shared_ptr<TlsContext> tls = nullptr);
     ~Connection();
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
@@ -86,6 +88,7 @@ private:
     bool willPending = false;
     Message willMessage;
     std::function<void()> disconnectCallback;
+    std::unique_ptr<SecureTransport> transport;
     static const int BUFFER_SIZE = 4096;
     uint8_t buffer[BUFFER_SIZE];
 };

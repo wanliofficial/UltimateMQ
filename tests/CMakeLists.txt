@@ -13,6 +13,7 @@ set(TEST_SOURCES
     SessionLifecycleTests.cpp
     AuthTests.cpp
     StoreTests.cpp
+    TlsTests.cpp
     # Add more test files here as you create them
 )
 

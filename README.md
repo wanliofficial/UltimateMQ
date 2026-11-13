@@ -5,7 +5,9 @@ UltimateMQ is an experimental MQTT broker written in C++ with cursor.
 ## Prerequisites
 
 - C++ compiler with C++17 support
-- CMake 3.10 or higher
+- CMake 3.12 or higher
+- OpenSSL development headers (`libssl-dev`); the broker still runs in
+  plaintext when no certificate is configured
 
 ## Building
 
@@ -32,11 +34,13 @@ All configuration is read from environment variables at startup.
 | `FLOWMQ_PASSWORD_FILE` | unset | User database; enables authentication when present |
 | `FLOWMQ_ACL_FILE` | unset | Per-user topic access rules; enables ACL enforcement when present |
 | `FLOWMQ_STATE_FILE` | unset | Durable state file; retained messages and persistent sessions survive a restart when set |
+| `FLOWMQ_TLS_CERT` | unset | Server certificate (PEM); enables TLS when set together with `FLOWMQ_TLS_KEY` |
+| `FLOWMQ_TLS_KEY` | unset | Private key (PEM) matching `FLOWMQ_TLS_CERT` |
+| `FLOWMQ_TLS_CA` | unset | CA bundle used to verify client certificates |
+| `FLOWMQ_TLS_VERIFY_CLIENTS` | unset | When set, a client certificate signed by `FLOWMQ_TLS_CA` is required |
 
 When neither file is set the broker stays fully open (every client may
-connect and use every topic), which keeps the historical behaviour.
-
-#### Users (`FLOWMQ_PASSWORD_FILE`)
+connect and use every topic), which keeps the historical behaviour.#### Users (`FLOWMQ_PASSWORD_FILE`)
 
 One entry per line, `#` starts a comment:
 
@@ -95,6 +99,30 @@ FLOWMQ_STATE_FILE=/var/lib/flowmq/state.dat ./flowmq
 QoS 0 messages are at-most-once and are not persisted. The offline queue of a
 session is not stored separately: QoS>0 messages already live in its
 unacknowledged set and are re-queued on reconnect, which avoids duplicates.
+
+#### Transport security (`FLOWMQ_TLS_CERT` / `FLOWMQ_TLS_KEY`)
+
+By default the listener speaks plaintext, so with authentication enabled the
+username and password cross the network in the clear. Supplying a certificate
+turns the listener into a TLS endpoint (TLS 1.2 or newer) and every byte,
+credentials included, is then encrypted:
+
+```bash
+FLOWMQ_TLS_CERT=/etc/flowmq/server.crt \
+FLOWMQ_TLS_KEY=/etc/flowmq/server.key \
+FLOWMQ_PASSWORD_FILE=/etc/flowmq/users.txt \
+./flowmq
+```
+
+* `FLOWMQ_TLS_CERT` and `FLOWMQ_TLS_KEY` (PEM) must be given together; setting
+  only one aborts startup with an error naming the missing variable.
+* The cipher is chosen by OpenSSL; TLS 1.3 is negotiated when the client
+  supports it.
+* A plaintext client connecting to a TLS listener fails during the handshake
+  and never reaches the MQTT layer.
+* Set `FLOWMQ_TLS_VERIFY_CLIENTS` together with `FLOWMQ_TLS_CA` to also require
+  a client certificate signed by that CA (mutual TLS). A client without a valid
+  certificate is dropped at the handshake.
 
 ## Contributing
 
