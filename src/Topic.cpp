@@ -29,7 +29,7 @@ std::string Topic::join(const std::vector<std::string> &topicLevels) {
 
 // Validate if a topic is well-formed
 bool Topic::isValid(const std::string &topic) {
-    // Check if the topic is empty
+    // MQTT-3.3.2-1: a topic (or filter) must not be empty
     if (topic.empty()) {
         return false;
     }
@@ -37,16 +37,32 @@ bool Topic::isValid(const std::string &topic) {
     // Split the topic into levels
     std::vector<std::string> levels = split(topic);
 
-    // Check each level
+    // A wildcard character must occupy an entire level
     for (const auto& level : levels) {
-        // Check for invalid characters
-        for (char c : level) {
-            if (c == '#' || c == '+') {
+        if (level.find('#') != std::string::npos || level.find('+') != std::string::npos) {
+            // The only whole-level wildcards are a bare '+' or a bare '#'
+            if (level != "+" && level != "#") {
                 return false;
             }
         }
     }
+
+    // A '#' must be the last level (MQTT-3.8.4-1)
+    for (size_t i = 0; i < levels.size(); ++i) {
+        if (levels[i] == "#" && i != levels.size() - 1) {
+            return false;
+        }
+    }
     return true;
+}
+
+//! Whether a string is a legal topic *name* (a PUBLISH topic, or a retained
+//! topic): wildcards are not allowed at all (MQTT-3.3.2-1).
+bool Topic::isValidTopicName(const std::string &topic) {
+    if (topic.empty()) {
+        return false;
+    }
+    return topic.find('#') == std::string::npos && topic.find('+') == std::string::npos;
 }
 
 // Check if a topic matches a topic filter (supporting wildcards + and #)

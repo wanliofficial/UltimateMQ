@@ -336,6 +336,17 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     keepAliveSeconds = connect->keepAlive;
     armKeepAliveTimer();
 
+    // The Will topic is a topic name, so a wildcard in it is a protocol error
+    // (MQTT-3.1.2-12): refusing the whole CONNECT is safer than accepting it and
+    // later failing to publish a Will it cannot route.
+    if (connect->willFlag && connect->willTopic && !Topic::isValidTopicName(*connect->willTopic)) {
+        logInfo("rejecting client %s: will topic %s contains a wildcard",
+                connect->clientId.c_str(), connect->willTopic->c_str());
+        ConnackPacket connack{false, ReasonCode::TOPIC_NAME_INVALID};
+        sendPacket(connack);
+        state = State::DISCONNECTED;
+        return;
+    }
     if (connect->willFlag && connect->willTopic && connect->willMsg) {
         willPending = true;
         willMessage = Message(*connect->willTopic, *connect->willMsg, connect->willQos, connect->willRetain);
@@ -526,6 +537,25 @@ void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
     if (!resolveTopicAlias(publish)) {
         return;
     }
+    // A PUBLISH topic must be a legal topic name: wildcards are never allowed
+    // (MQTT-3.3.2-1). QoS 1/2 get the reason code in the ack; MQTT 5 QoS 0 is
+    // reported with a DISCONNECT (MQTT-5.4.1-1), 3.1.1 is simply dropped.
+    if (!Topic::isValidTopicName(publish->topicName)) {
+        logDebug("client %s: invalid topic name %s", session->getClientId().c_str(),
+                 publish->topicName.c_str());
+        if (publish->qos == QoS::QOS_1) {
+            PubackPacket puback{publish->packetId, ReasonCode::TOPIC_NAME_INVALID};
+            sendPacket(puback);
+        } else if (publish->qos == QoS::QOS_2) {
+            PubrecPacket pubrec{publish->packetId, ReasonCode::TOPIC_NAME_INVALID};
+            sendPacket(pubrec);
+        } else if (frame.getVersion() == Version::MQTT5) {
+            DisconnectPacket disconnect{ReasonCode::TOPIC_NAME_INVALID};
+            sendPacket(disconnect);
+            state = State::DISCONNECTED;
+        }
+        return;
+    }
     // Access control: a client may only publish to topics it is allowed to write
     if (auth && auth->isForbidden(session->getUsername(), publish->topicName, /*write=*/true)) {
         logDebug("client %s: denied write on %s (acl)", session->getClientId().c_str(),
@@ -624,6 +654,14 @@ void Connection::handleSubscribe(std::shared_ptr<SubscribePacket> subscribe) {
     std::vector<int> rejected(subscribe->subscriptions.size(), acceptMarker);
     for (size_t i = 0; i < subscribe->subscriptions.size(); ++i) {
         const auto& subscription = subscribe->subscriptions[i];
+        // An empty filter is rejected before anything else (MQTT-3.8.3-1);
+        // a filter that carries a misplaced wildcard is a protocol error.
+        if (!Topic::isValid(subscription.first)) {
+            logDebug("client %s: invalid topic filter %s", session->getClientId().c_str(),
+                     subscription.first.c_str());
+            rejected[i] = isV5 ? static_cast<int>(ReasonCode::TOPIC_FILTER_INVALID) : 0x80;
+            continue;
+        }
         if (auth && auth->isForbidden(session->getUsername(), subscription.first,
                                       /*write=*/false)) {
             logDebug("client %s: denied subscribe to %s (acl)", session->getClientId().c_str(),

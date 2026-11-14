@@ -420,6 +420,22 @@ and are matched according to MQTT-4.7.2-1:
 A `$` anywhere other than the first character is an ordinary character, so
 `a/$x` still matches `a/+`.
 
+#### Topic name and filter validation
+
+A PUBLISH topic, a Will topic and a SUBSCRIBE filter are all validated before
+they touch the routing path:
+
+* a **topic name** (PUBLISH or Will) must contain no wildcard character —
+  `a/+` and `a/#` are illegal. A QoS 1/2 PUBLISH gets the reason code in its
+  ack (`TOPIC_NAME_INVALID`); MQTT 5 QoS 0 is answered with a `DISCONNECT`
+  (`TOPIC_NAME_INVALID`, `0x90`); MQTT 3.1.1 is dropped silently, and a bad Will
+  topic is refused at CONNECT;
+* a **topic filter** (SUBSCRIBE) must be well-formed — `#` only as the final
+  level and never sharing a level with other characters (`a/#` and `+/b/#` are
+  fine, `a/b/c#` and `#/a` are not). A bad filter is reported per-filter in the
+  SUBACK as `TOPIC_FILTER_INVALID` (MQTT 5, `0x8f`) or `0x80` (MQTT 3.1.1), and
+  the remaining filters in the same SUBSCRIBE are still processed.
+
 #### Session takeover
 
 A `CONNECT` with `cleanStart=false` for a client id whose session is still held

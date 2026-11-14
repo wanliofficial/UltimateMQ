@@ -23,6 +23,28 @@ TEST(TopicTest, IsValid)
 {
     EXPECT_TRUE(Topic::isValid("a/b/c"));
     EXPECT_TRUE(Topic::isValid("a//c"));
+    EXPECT_TRUE(Topic::isValid("#"));
+    EXPECT_TRUE(Topic::isValid("+"));
+    EXPECT_TRUE(Topic::isValid("a/#"));
+    EXPECT_TRUE(Topic::isValid("a/+"));
+
+    EXPECT_FALSE(Topic::isValid(""));            // empty
+    EXPECT_FALSE(Topic::isValid("a/b/c#"));      // '#' inside a level
+    EXPECT_FALSE(Topic::isValid("a/b#c"));       // '+'/'#' inside a level
+    EXPECT_FALSE(Topic::isValid("#/a"));         // '#' not last
+    EXPECT_FALSE(Topic::isValid("a/#/b"));       // '#' not last
+}
+
+TEST(TopicTest, IsValidTopicNameForbidsWildcards)
+{
+    // A PUBLISH topic (or Will topic) must carry no wildcards at all
+    // (MQTT-3.3.2-1).
+    EXPECT_TRUE(Topic::isValidTopicName("a/b/c"));
+    EXPECT_TRUE(Topic::isValidTopicName("a//c"));
+    EXPECT_FALSE(Topic::isValidTopicName("a/+"));
+    EXPECT_FALSE(Topic::isValidTopicName("a/#"));
+    EXPECT_FALSE(Topic::isValidTopicName("a/b#"));
+    EXPECT_FALSE(Topic::isValidTopicName(""));
 }
 
 TEST(TopicTest, Match)

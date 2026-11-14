@@ -16,6 +16,9 @@ std::string join(const std::vector<std::string>& topicLevels);
 
 // Validate if a topic is well-formed
 bool isValid(const std::string& topic);
+//! Whether \p topic is a legal topic *name*: no wildcard characters at all.
+//! Filters may carry '+'/'#'; a PUBLISH topic or a retained topic may not.
+bool isValidTopicName(const std::string& topic);
 
 // Check if a topic matches a topic filter (supporting wildcards + and #)
 bool match(const std::string& topic, const std::string& filter);
