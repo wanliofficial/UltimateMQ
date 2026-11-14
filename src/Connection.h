@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <chrono>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <atomic>
@@ -95,6 +96,19 @@ private:
     //! MQTT 5 session expiry interval from a graceful DISCONNECT; 0 (the default
     //! when absent or on MQTT 3.1.1) means the session is discarded on disconnect.
     uint32_t sessionExpirySeconds = 0;
+    //! MQTT 5 Topic Alias support (MQTT-3.3.2-7..11). The broker advertises
+    //! TopicAliasMaximum in CONNACK and a client may then send a PUBLISH whose
+    //! topic name is replaced by an alias after mapping it once. The mapping is
+    //! scoped to this network connection (not the session), so it lives here and
+    //! is reset for every CONNECT. An alias is valid in 1..TOPIC_ALIAS_MAXIMUM;
+    //! one with a topic name registers/updates the mapping, one without a topic
+    //! resolves through it.
+    static constexpr uint16_t TOPIC_ALIAS_MAXIMUM = 16;
+    std::map<uint16_t, std::string> topicAliases;
+    //! Expand an inbound PUBLISH's Topic Alias into its topic name. Returns false
+    //! (after signalling the error to the client) when the alias is invalid, as
+    //! MQTT-3.3.2-9 requires the connection to be closed in that case.
+    bool resolveTopicAlias(const std::shared_ptr<PublishPacket>& publish);
     bool willPending = false;
     Message willMessage;
     std::function<void()> disconnectCallback;

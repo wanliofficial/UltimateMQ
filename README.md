@@ -170,6 +170,25 @@ violation (the broker answers with a `PROTOCOL_ERROR` CONNACK and closes the
 connection). The parked backlog is part of the durable session, so it survives a
 restart and is delivered once the client reconnects and the window allows again.
 
+#### Topic aliases (MQTT 5)
+
+A client that publishes many messages to the same topic can send the full topic
+name once and then refer to it by a two-byte **Topic Alias**, which saves
+bandwidth on the wire. The broker advertises the number of aliases it will accept
+through the `Topic Alias Maximum` CONNACK property (currently `16`):
+
+* a `PUBLISH` that carries both a topic name and an alias **registers or updates**
+  that alias (MQTT-3.3.2-9);
+* a `PUBLISH` with an **empty topic name** and an alias is routed to whatever
+  topic that alias last mapped to (MQTT-3.3.2-11);
+* an alias of `0`, an alias above the advertised maximum, or an alias that was
+  never mapped is a protocol error: the broker replies with a `DISCONNECT`
+  (`TOPIC_ALIAS_INVALID`, `0x94`) and closes the connection.
+
+Alias mappings are scoped to a single **network connection**, not to the session:
+a reconnect with the same client id starts with an empty table, as MQTT requires.
+MQTT 3.1.1 has no property section, so aliases are simply never present there.
+
 #### Transport security (`FLOWMQ_TLS_CERT` / `FLOWMQ_TLS_KEY`)
 
 By default the listener speaks plaintext, so with authentication enabled the

@@ -248,6 +248,9 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
         throw std::runtime_error("Bad connect packet");
     }
     frame.setVersion(connect->protocolVersion);
+    // Topic Alias mappings are scoped to a single network connection, so a fresh
+    // CONNECT starts with an empty table (MQTT-3.3.2-7).
+    topicAliases.clear();
 
     // Authenticate before any session state is touched (and before the Will is
     // armed): a rejected client must not be able to take over an existing
@@ -330,6 +333,10 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
         const size_t limit = broker ? broker->getMaxPacketSize() : Frame::DEFAULT_MAX_PACKET_SIZE;
         // MAXIMUM_PACKET_SIZE is a 4-byte field; the limit fits comfortably.
         connack.properties[PropertyID::MAXIMUM_PACKET_SIZE] = static_cast<uint32_t>(limit);
+        // Tell the client how many Topic Aliases it may use on this connection
+        // (MQTT-3.1.2-26). Advertising it is what makes alias-only PUBLISHes
+        // legal; the mapping itself is tracked per connection below.
+        connack.properties[PropertyID::TOPIC_ALIAS_MAXIMUM] = TOPIC_ALIAS_MAXIMUM;
         // Apply the client's Receive Maximum (MQTT-3.1.2-10 / 4.9): it caps how
         // many QoS 1/2 messages the broker keeps outstanding to this client. A
         // value of 0 is a protocol violation and the broker must close the
@@ -368,9 +375,61 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     logInfo("client connected: %s (resumed=%d)", connect->clientId.c_str(), (int)resumed);
 }
 
+bool Connection::resolveTopicAlias(const std::shared_ptr<PublishPacket> &publish) {
+    // MQTT 3.1.1 has no properties, so no alias can be present.
+    if (frame.getVersion() != Version::MQTT5) {
+        return true;
+    }
+    auto it = publish->properties.find(PropertyID::TOPIC_ALIAS);
+    if (it == publish->properties.end()) {
+        // No alias: the topic name must be present and is routed as-is.
+        return true;
+    }
+    if (!std::holds_alternative<uint16_t>(it->second)) {
+        return true;
+    }
+    const uint16_t alias = std::get<uint16_t>(it->second);
+
+    // MQTT-3.3.2-8: an alias of 0, or one above what we advertised in CONNACK,
+    // is a protocol error.
+    if (alias == 0 || alias > TOPIC_ALIAS_MAXIMUM) {
+        logDebug("client %s: invalid topic alias %u (max %u)", session->getClientId().c_str(),
+                 alias, TOPIC_ALIAS_MAXIMUM);
+        DisconnectPacket disconnect{ReasonCode::TOPIC_ALIAS_INVALID};
+        sendPacket(disconnect);
+        state = State::DISCONNECTED;
+        return false;
+    }
+
+    if (!publish->topicName.empty()) {
+        // The topic name registers (or updates) the mapping for this alias
+        // (MQTT-3.3.2-9) and the message is routed with it.
+        topicAliases[alias] = publish->topicName;
+        return true;
+    }
+
+    // Empty topic name: the alias must already be mapped (MQTT-3.3.2-11).
+    auto mapping = topicAliases.find(alias);
+    if (mapping == topicAliases.end()) {
+        logDebug("client %s: unknown topic alias %u", session->getClientId().c_str(), alias);
+        DisconnectPacket disconnect{ReasonCode::TOPIC_ALIAS_INVALID};
+        sendPacket(disconnect);
+        state = State::DISCONNECTED;
+        return false;
+    }
+    publish->topicName = mapping->second;
+    return true;
+}
+
 void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
     if (!session) {
         throw std::runtime_error("PUBLISH before CONNECT");
+    }
+    // MQTT 5 Topic Alias: expand an alias into its topic name (or register it)
+    // before the message is routed, so the rest of the path only sees real
+    // topics. An invalid alias closes the connection.
+    if (!resolveTopicAlias(publish)) {
+        return;
     }
     // Access control: a client may only publish to topics it is allowed to write
     if (auth && auth->isForbidden(session->getUsername(), publish->topicName, /*write=*/true)) {

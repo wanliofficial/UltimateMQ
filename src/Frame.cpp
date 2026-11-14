@@ -1235,13 +1235,18 @@ std::vector<uint8_t> Frame::serializeProperties(const Properties &properties) {
         std::visit([&buffer](auto &&arg) {
             using T = std::decay_t<decltype(arg)>;
             if constexpr (std::is_same_v<T, bool>) {
+                // Boolean / byte properties carry no length prefix.
                 buffer.push_back(arg ? 1 : 0);
             } else if constexpr (std::is_same_v<T, uint8_t>) {
                 buffer.push_back(arg);
             } else if constexpr (std::is_same_v<T, uint16_t>) {
+                // MQTT 5 two-byte integer: a length byte (0x02) then the value.
+                buffer.push_back(0x02);
                 buffer.push_back((arg >> 8) & 0xFF);
                 buffer.push_back(arg & 0xFF);
             } else if constexpr (std::is_same_v<T, uint32_t>) {
+                // MQTT 5 four-byte integer: a length byte (0x04) then the value.
+                buffer.push_back(0x04);
                 buffer.push_back((arg >> 24) & 0xFF);
                 buffer.push_back((arg >> 16) & 0xFF);
                 buffer.push_back((arg >> 8) & 0xFF);

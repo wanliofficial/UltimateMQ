@@ -295,15 +295,26 @@ TEST_F(FrameTest, SerializeConnackForMqtt5AdvertisesMaximumPacketSize)
     Frame v5(Version::MQTT5);
     ConnackPacket connack(false, ReasonCode::SUCCESS);
     connack.properties[PropertyID::MAXIMUM_PACKET_SIZE] = static_cast<uint32_t>(1024 * 1024);
-    // 0x20, remaining length 8, flags 0, reason 0, property length 5,
-    // property id 0x27, then the 4-byte big-endian value 0x00100000.
+    // 0x20, remaining length 9, flags 0, reason 0, property length 6,
+    // property id 0x27, length byte 4, then the 4-byte big-endian value
+    // 0x00100000.
     EXPECT_EQ(v5.serialize(connack),
-              (std::vector<uint8_t>{0x20, 0x08, 0x00, 0x00, 0x05, 0x27,
+              (std::vector<uint8_t>{0x20, 0x09, 0x00, 0x00, 0x06, 0x27, 0x04,
                                     0x00, 0x10, 0x00, 0x00}));
 }
 
-TEST_F(FrameTest, SerializeConnackForMqtt311IgnoresProperties)
+TEST_F(FrameTest, SerializeConnackAdvertisesTopicAliasMaximumWithLengthByte)
 {
+    Frame v5(Version::MQTT5);
+    ConnackPacket connack(false, ReasonCode::SUCCESS);
+    connack.properties[PropertyID::TOPIC_ALIAS_MAXIMUM] = static_cast<uint16_t>(16);
+    // 0x20, remaining length 7, flags 0, reason 0, property length 4,
+    // property id 0x22, length byte 2, then the 2-byte value 0x0010.
+    EXPECT_EQ(v5.serialize(connack),
+              (std::vector<uint8_t>{0x20, 0x07, 0x00, 0x00, 0x04, 0x22, 0x02, 0x00, 0x10}));
+}
+
+TEST_F(FrameTest, SerializeConnackForMqtt311IgnoresProperties){
     Frame v4(Version::MQTT311);
     ConnackPacket connack(false, ReasonCode::SUCCESS);
     connack.properties[PropertyID::MAXIMUM_PACKET_SIZE] = static_cast<uint32_t>(1024 * 1024);
@@ -342,6 +353,45 @@ TEST_F(FrameTest, ParseStringThrowsOnTruncatedLength)
 {
     std::vector<uint8_t> payload = {0x00};
     EXPECT_THROW(frame->parseString(payload.data(), payload.size()), std::runtime_error);
+}
+
+TEST_F(FrameTest, ParsePublishTopicAliasPropertyIsTwoByteInteger)
+{
+    // A PUBLISH carrying Topic Alias 7 must expose it as a uint16_t property;
+    // the connection layer then expands it into a topic name.
+    Frame v5;
+    v5.setVersion(Version::MQTT5);
+    std::vector<uint8_t> payload = {
+        0x00, 0x01, 'a',              // Topic name "a"
+        0x04,                         // Properties length
+        0x23, 0x02, 0x00, 0x07,       // TOPIC_ALIAS, len 2, value 7
+        'h', 'i'                      // Payload
+    };
+    FixedHeader header(0x30);
+    auto packet = v5.parsePublish(header, payload.data(), payload.size());
+    ASSERT_EQ(packet.topicName, "a");
+    auto it = packet.properties.find(PropertyID::TOPIC_ALIAS);
+    ASSERT_NE(it, packet.properties.end());
+    ASSERT_TRUE(std::holds_alternative<uint16_t>(it->second));
+    EXPECT_EQ(std::get<uint16_t>(it->second), 7);
+}
+
+TEST_F(FrameTest, ParsePublishWithEmptyTopicNameIsAccepted)
+{
+    // An alias-only PUBLISH (empty topic name) is legal once the alias has been
+    // mapped; the parser must not reject the empty name.
+    Frame v5;
+    v5.setVersion(Version::MQTT5);
+    std::vector<uint8_t> payload = {
+        0x00, 0x00,                   // Empty topic name
+        0x04,                         // Properties length
+        0x23, 0x02, 0x00, 0x07,       // TOPIC_ALIAS = 7
+        'h', 'i'                      // Payload
+    };
+    FixedHeader header(0x30);
+    auto packet = v5.parsePublish(header, payload.data(), payload.size());
+    EXPECT_TRUE(packet.topicName.empty());
+    ASSERT_NE(packet.properties.find(PropertyID::TOPIC_ALIAS), packet.properties.end());
 }
 
 } // namespace MQTT
