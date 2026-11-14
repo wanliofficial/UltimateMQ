@@ -262,6 +262,34 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     // Authenticate before any session state is touched (and before the Will is
     // armed): a rejected client must not be able to take over an existing
     // session, learn about its messages, or publish a Will message.
+    //
+    // Enhanced authentication is not implemented, so a CONNECT that asks for an
+    // authentication method must be refused up front (MQTT-4.12.1-2) rather
+    // than silently falling back to username/password. A method name plus data
+    // without a method is also a protocol error (MQTT-3.1.2-17).
+    if (frame.getVersion() == Version::MQTT5) {
+        if (connect->properties.find(PropertyID::AUTHENTICATION_DATA) !=
+                connect->properties.end() &&
+            connect->properties.find(PropertyID::AUTHENTICATION_METHOD) ==
+                connect->properties.end()) {
+            logInfo("rejecting client %s: authentication data without a method",
+                    connect->clientId.c_str());
+            ConnackPacket connack{false, ReasonCode::PROTOCOL_ERROR};
+            sendPacket(connack);
+            state = State::DISCONNECTED;
+            return;
+        }
+        auto method = connect->properties.find(PropertyID::AUTHENTICATION_METHOD);
+        if (method != connect->properties.end()) {
+            logInfo("rejecting client %s: unsupported authentication method",
+                    connect->clientId.c_str());
+            ConnackPacket connack{false, ReasonCode::BAD_AUTHENTICATION_METHOD};
+            sendPacket(connack);
+            state = State::DISCONNECTED;
+            return;
+        }
+    }
+
     std::string username;
     if (auth && auth->authRequired()) {
         if (!connect->username) {
@@ -677,9 +705,16 @@ void Connection::handleDisconnect(std::shared_ptr<DisconnectPacket> disconnect) 
 }
 
 void Connection::handleAuth(std::shared_ptr<AuthPacket> auth) {
-    // TODO: implement enhanced authentication
-    AuthPacket authResp;
+    // The broker implements only username/password authentication, so it
+    // supports no enhanced authentication method. Replying SUCCESS to an AUTH
+    // would tell the client a method it never agreed to had completed; the
+    // correct answer is BAD_AUTHENTICATION_METHOD (MQTT-4.12.1-2), after which
+    // the connection is closed (MQTT-4.12.1-1).
+    logDebug("client %s: refusing AUTH (no enhanced authentication)", 
+             session ? session->getClientId().c_str() : "?");
+    AuthPacket authResp{ReasonCode::BAD_AUTHENTICATION_METHOD};
     sendPacket(authResp);
+    state = State::DISCONNECTED;
 }
 
 void Connection::deliver(const Message &message, uint16_t packetId, QoS qos) {

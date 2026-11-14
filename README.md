@@ -84,6 +84,20 @@ bob,read,#
   client id as a different user discards the old session instead of handing
   over its subscriptions and buffered messages.
 
+#### Authentication methods (enhanced authentication)
+
+The broker implements username/password authentication only and supports no
+enhanced authentication method, and it says so instead of pretending otherwise:
+
+* a `CONNECT` carrying an **Authentication Method** property is refused with
+  CONNACK `BAD_AUTHENTICATION_METHOD` (`0x8C`);
+* **Authentication Data** without a Method is a protocol error
+  (`PROTOCOL_ERROR`, `0x82`), since MQTT-3.1.2-17 requires the pair to travel
+  together;
+* an `AUTH` packet is answered with `AUTH` `0x8C`
+  (`BAD_AUTHENTICATION_METHOD`) and the connection is closed, as MQTT-4.12.1-1
+  requires once no method has been agreed.
+
 #### Durable state (`FLOWMQ_STATE_FILE`)
 
 Without this variable the broker keeps everything in memory, exactly as before.
