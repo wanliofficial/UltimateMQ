@@ -132,7 +132,23 @@ MQTT 3.1.1 has no such property, so a graceful `DISCONNECT` ends the session.
 > big-endian wire order, so a value such as `3600` seconds is honoured exactly.
 
 The sweep runs from the accept loop about once a second; an idle server therefore
-wakes periodically just to expire sessions, at negligible cost.
+wakes periodically just to expire sessions, at negligible cost. The same sweep
+also drops any retained message that has passed its expiry.
+
+#### Message expiry (MQTT 5)
+
+A `PUBLISH` may carry a **Message Expiry Interval**; the broker records the
+absolute time at which the message goes stale (MQTT-3.3.2-9) and drops it rather
+than delivering it once that time has passed:
+
+* to a **live subscriber** whose fan-out happens after the deadline;
+* from an **offline subscriber's** buffered queue, when it is finally drained on
+  reconnect;
+* from the **retained set**, where it is additionally purged by the background
+  sweep so it is never re-delivered to a future subscriber.
+
+The interval is in-memory only: it is never written to the durable state file, so
+a message restored after a restart is treated as having no expiry.
 
 #### Transport security (`FLOWMQ_TLS_CERT` / `FLOWMQ_TLS_KEY`)
 

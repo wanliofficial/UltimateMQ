@@ -101,6 +101,16 @@ void Broker::sweepExpiredSessions() {
     std::vector<std::shared_ptr<Session>> victims;
     {
         std::lock_guard<std::recursive_mutex> lock(mutex);
+        // Drop retained messages past their MQTT 5 expiry so they are not
+        // re-delivered to future subscribers and do not linger in the store.
+        for (auto it = retainedMessages.begin(); it != retainedMessages.end();) {
+            if (it->second.isExpired(now)) {
+                it = retainedMessages.erase(it);
+                notifyStateChanged();
+            } else {
+                ++it;
+            }
+        }
         for (auto it = sessions.begin(); it != sessions.end();) {
             auto &session = it->second;
             if (session && !session->isConnected() && session->isExpired(now)) {

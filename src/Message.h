@@ -4,6 +4,7 @@
 
 #include <string>
 #include <vector>
+#include <chrono>
 #include "MQTT.h"
 
 namespace MQTT {
@@ -16,6 +17,12 @@ struct Message {
     // Retransmission flag (MQTT-3.3.1-8): set when a broker resends an
     // unacknowledged QoS>0 message after a reconnect
     bool dup = false;
+    //! MQTT 5 Message Expiry Interval, as an absolute deadline. When hasExpiry
+    //! is set and now reaches expiryDeadline the message is stale and must not
+    //! be delivered (it is dropped instead). In-memory only: it is never written
+    //! to the durable state, so a restored message never expires.
+    bool hasExpiry = false;
+    std::chrono::steady_clock::time_point expiryDeadline;
 
     Message() = default;
 
@@ -25,6 +32,11 @@ struct Message {
     // Convenience constructor for string payloads
     Message(const std::string &t, const std::string &p, QoS q = QoS::AT_MOST_ONCE, bool r = false)
         : topic(t), payload(std::vector<uint8_t>(p.begin(), p.end())), qos(q), retain(r) {}
+
+    //! Whether this message is stale at \p now (thread safe: reads only)
+    bool isExpired(std::chrono::steady_clock::time_point now) const {
+        return hasExpiry && now >= expiryDeadline;
+    }
 
     std::string toString() const;
 };

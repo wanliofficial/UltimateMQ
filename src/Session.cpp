@@ -316,6 +316,14 @@ void Session::deliver(const std::string &topic, const Message &message) {
         return;
     }
 
+    // MQTT-3.3.2-9: a message past its expiry must not be delivered to a new
+    // subscriber (the fan-out queue is full of live subscribers, so this drops
+    // only this one stale copy).
+    if (message.isExpired(std::chrono::steady_clock::now())) {
+        logDebug("session %s: dropping expired message on %s", clientId.c_str(), topic.c_str());
+        return;
+    }
+
     QoS qos = message.qos;
     auto it = subscriptions.find(topic);
     if (it != subscriptions.end() && it->second.maximumQos < qos) {
@@ -358,6 +366,12 @@ void Session::deliverRetained(const std::string &topicFilter, const Subscription
         }
         if (auth && auth->isForbidden(username, topic, /*write=*/false)) {
             logDebug("session %s: denied read on %s (acl, retained)", clientId.c_str(), topic.c_str());
+            continue;
+        }
+        // MQTT-3.3.2-9: a retained message past its expiry is stale; do not
+        // deliver it (and the broker purges it from the retained set on sweep).
+        if (message.isExpired(std::chrono::steady_clock::now())) {
+            logDebug("session %s: skipping expired retained message on %s", clientId.c_str(), topic.c_str());
             continue;
         }
         Message outgoing = message;
@@ -416,6 +430,12 @@ void Session::flush() {
         deliveries.swap(pendingDeliveries);
     }
     for (const auto &delivery : deliveries) {
+        // Skip messages that expired while queued offline: delivering a stale
+        // message to a reconnecting client would violate MQTT-3.3.2-9.
+        if (delivery.message.isExpired(std::chrono::steady_clock::now())) {
+            logDebug("session %s: dropping expired queued message", clientId.c_str());
+            continue;
+        }
         target->deliver(delivery.message, delivery.packetId, delivery.qos);
     }
 }

@@ -132,6 +132,68 @@ TEST_F(SessionLifecycleTest, SweepDropsAnExpiredSession)
     EXPECT_EQ(broker.findSession("sweep"), nullptr);
 }
 
+TEST_F(SessionLifecycleTest, ExpiredMessageIsNotDelivered)
+{
+    auto session = std::make_shared<Session>(&broker, "mx");
+    session->connect(session, /*persistent=*/false);
+    auto client = test::attach(*session);
+    session->subscribe("m/#", optionsFor());
+
+    // A message whose expiry deadline is already past must be dropped...
+    Message stale{"m/t", std::string("old"), QoS::QOS_0};
+    stale.hasExpiry = true;
+    stale.expiryDeadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    session->deliver("m/t", stale);
+
+    // ...while a still-live message to the same topic is delivered normally.
+    session->deliver("m/t", Message{"m/t", std::string("new"), QoS::QOS_0});
+
+    session->flush();
+
+    ASSERT_EQ(client->size(), 1u);
+    EXPECT_EQ(std::string(client->delivered[0].payload.begin(), client->delivered[0].payload.end()), "new");
+}
+
+TEST_F(SessionLifecycleTest, ExpiredQueuedMessageIsNotFlushed)
+{
+    // An offline persistent session buffers messages; an expired one must be
+    // dropped when the queue is finally drained on reconnect.
+    auto session = std::make_shared<Session>(&broker, "mq");
+    session->connect(session, /*persistent=*/true);
+    // Bind the offline client directly: bindClient (via test::attach) would
+    // clear the buffer we want to keep, and reconnect uses resume() anyway.
+    auto offline = std::make_shared<RecordingClient>();
+    session->bindClient(offline);
+    session->subscribe("q/#", optionsFor());
+
+    Message stale{"q/t", std::string("old"), QoS::QOS_0};
+    stale.hasExpiry = true;
+    stale.expiryDeadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    session->deliver("q/t", stale);
+    session->deliver("q/t", Message{"q/t", std::string("new"), QoS::QOS_0});
+    session->close(offline);  // persistent: the buffered queue is kept
+
+    // Reconnect with a new client and drain the queue
+    auto live = std::make_shared<RecordingClient>();
+    session->resume(live);
+    session->flush();
+
+    ASSERT_EQ(live->size(), 1u);
+    EXPECT_EQ(std::string(live->delivered[0].payload.begin(), live->delivered[0].payload.end()), "new");
+}
+
+TEST_F(SessionLifecycleTest, SweepPurgesExpiredRetainedMessage)
+{
+    Message retained{"rt", std::string("x"), QoS::QOS_0, /*retain=*/true};
+    retained.hasExpiry = true;
+    retained.expiryDeadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    broker.publish(retained);
+    EXPECT_EQ(broker.getRetainedCount(), 1u);
+
+    broker.sweepExpiredSessions();
+    EXPECT_EQ(broker.getRetainedCount(), 0u);
+}
+
 TEST_F(SessionLifecycleTest, ResumeRetransmitsUnackedMessagesWithDup)
 {
     auto session = std::make_shared<Session>(&broker, "q1");

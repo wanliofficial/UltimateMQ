@@ -375,6 +375,18 @@ void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
         return;
     }
     Message message{publish->topicName, publish->payload, publish->qos, publish->retain};
+    // MQTT 5 Message Expiry Interval (MQTT-3.3.2-9): record the absolute time at
+    // which the message goes stale, so a slow or offline subscriber does not
+    // receive it after it has expired.
+    if (frame.getVersion() == Version::MQTT5) {
+        auto it = publish->properties.find(PropertyID::MESSAGE_EXPIRY_INTERVAL);
+        if (it != publish->properties.end() &&
+            std::holds_alternative<uint32_t>(it->second)) {
+            uint32_t interval = std::get<uint32_t>(it->second);
+            message.hasExpiry = true;
+            message.expiryDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(interval);
+        }
+    }
     ReasonCode reason = session->publish(publish->packetId, message);
     if (publish->qos == QoS::QOS_1) {
         PubackPacket puback{publish->packetId, reason};
