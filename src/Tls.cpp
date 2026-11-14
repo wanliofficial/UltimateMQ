@@ -95,13 +95,24 @@ SSL *TlsContext::createSsl() const {
     return SSL_new(ctx_);
 }
 
-SecureTransport::SecureTransport(int fd, std::shared_ptr<TlsContext> tls)
-    : fd_(fd), tls_(std::move(tls)) {
+SecureTransport::SecureTransport(int fd, std::shared_ptr<TlsContext> tls,
+                                 int writeTimeoutMs)
+    : fd_(fd), tls_(std::move(tls)), writeTimeoutMs_(writeTimeoutMs) {
     if (tls_ && tls_->enabled()) {
         ssl_ = tls_->createSsl();
         if (ssl_) {
             SSL_set_fd(ssl_, fd_);
         }
+    } else {
+        // Plaintext socket: it stays blocking, but a blocking ::send would
+        // otherwise wait forever on a client that stops reading, pinning this
+        // connection's thread and its queued messages. Bound the wait so a
+        // stalled peer is dropped instead of held (a stalled send returns
+        // EAGAIN, which writeAll already treats as a dropped connection).
+        struct timeval tv;
+        tv.tv_sec = writeTimeoutMs_ / 1000;
+        tv.tv_usec = (writeTimeoutMs_ % 1000) * 1000;
+        ::setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
 }
 
@@ -163,7 +174,7 @@ ssize_t SecureTransport::readSome(uint8_t *buf, size_t max) {
             pfd.fd = fd_;
             pfd.events = (err == SSL_ERROR_WANT_READ) ? POLLIN : POLLOUT;
             pfd.revents = 0;
-            int ready = poll(&pfd, 1, 5000);
+            int ready = poll(&pfd, 1, writeTimeoutMs_);
             if (ready <= 0) {
                 return -1;
             }
@@ -202,7 +213,7 @@ bool SecureTransport::writeAll(const uint8_t *buf, size_t len) {
             pfd.fd = fd_;
             pfd.events = (err == SSL_ERROR_WANT_READ) ? POLLIN : POLLOUT;
             pfd.revents = 0;
-            int ready = poll(&pfd, 1, 5000);
+            int ready = poll(&pfd, 1, writeTimeoutMs_);
             if (ready <= 0) {
                 return false;
             }

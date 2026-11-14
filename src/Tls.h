@@ -4,6 +4,7 @@
 
 #include <memory>
 #include <string>
+#include <sys/time.h>
 
 struct ssl_ctx_st;
 struct ssl_st;
@@ -56,8 +57,16 @@ private:
  */
 class SecureTransport {
 public:
-    //! \p tls may be null for a plaintext connection.
-    SecureTransport(int fd, std::shared_ptr<TlsContext> tls);
+    //! How long a single write may make no progress before the connection is
+    //! treated as stalled and dropped. Bounds how long one slow or absent reader
+    //! can pin a connection thread on a blocking socket. Tunable via
+    //! FLOWMQ_WRITE_TIMEOUT_MS; this is the default.
+    static constexpr int WRITE_STALL_TIMEOUT_MS = 5000;
+
+    //! \p tls may be null for a plaintext connection. \p writeTimeoutMs bounds a
+    //! single stalled write before the connection is dropped.
+    SecureTransport(int fd, std::shared_ptr<TlsContext> tls,
+                    int writeTimeoutMs = WRITE_STALL_TIMEOUT_MS);
     ~SecureTransport();
     SecureTransport(const SecureTransport &) = delete;
     SecureTransport &operator=(const SecureTransport &) = delete;
@@ -86,6 +95,8 @@ private:
     int fd_;
     std::shared_ptr<TlsContext> tls_;
     SSL *ssl_ = nullptr;
+    //! Per-connection stalled-write bound (milliseconds)
+    int writeTimeoutMs_;
 };
 
 } // namespace MQTT

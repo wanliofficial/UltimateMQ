@@ -27,8 +27,10 @@ constexpr int POLL_SLICE_MS = 250;
 
 Connection::Connection(int sockfd, Broker* broker, std::shared_ptr<TlsContext> tls)
     : sockfd(sockfd), state(State::IDLE), broker(broker),
+      writeTimeoutMs(broker ? broker->getWriteTimeoutMs()
+                            : SecureTransport::WRITE_STALL_TIMEOUT_MS),
       auth(broker ? broker->getAuth() : nullptr),
-      transport(std::make_unique<SecureTransport>(sockfd, std::move(tls))),
+      transport(std::make_unique<SecureTransport>(sockfd, std::move(tls), writeTimeoutMs)),
       lastActivity(std::chrono::steady_clock::now()) {
     // Cap the packet size before any byte (including the first CONNECT) is read.
     // The version is fixed later, but the limit does not depend on it.

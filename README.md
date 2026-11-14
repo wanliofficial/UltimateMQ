@@ -35,6 +35,7 @@ All configuration is read from environment variables at startup.
 | `FLOWMQ_ACL_FILE` | unset | Per-user topic access rules; enables ACL enforcement when present |
 | `FLOWMQ_STATE_FILE` | unset | Durable state file; retained messages and persistent sessions survive a restart when set |
 | `FLOWMQ_MAX_PACKET_SIZE` | `1048576` (1 MiB) | Largest Remaining Length accepted from a single client, in bytes; also advertised to MQTT 5 clients |
+| `FLOWMQ_WRITE_TIMEOUT_MS` | `5000` (5 s) | How long a single write may make no progress before the connection is dropped (bounds a stalled reader) |
 | `FLOWMQ_TLS_CERT` | unset | Server certificate (PEM); enables TLS when set together with `FLOWMQ_TLS_KEY` |
 | `FLOWMQ_TLS_KEY` | unset | Private key (PEM) matching `FLOWMQ_TLS_CERT` |
 | `FLOWMQ_TLS_CA` | unset | CA bundle used to verify client certificates |
@@ -147,6 +148,28 @@ FLOWMQ_MAX_PACKET_SIZE=8388608 ./flowmq   # allow up to 8 MiB per packet
   property, so well-behaved clients keep their own packets within it. MQTT 3.1.1
   has no property section and is simply enforced on the wire.
 * A non-numeric or zero value aborts startup with an error naming the variable.
+
+#### Stalled-write timeout (`FLOWMQ_WRITE_TIMEOUT_MS`)
+
+Each connection is served by its own thread, and writes to a client are blocking:
+if a subscriber stops reading, its TCP receive window closes and the broker's
+`send` waits until the peer drains the data. Without a bound, one slow or hung
+reader can pin a connection thread (and everything queued behind it) forever.
+`FLOWMQ_WRITE_TIMEOUT_MS` bounds that wait: when a single write makes no progress
+for the timeout, the connection is treated as gone and dropped, freeing its
+thread. TLS connections already bounded the wait this way; this applies the same
+bound to plaintext sockets.
+
+```bash
+FLOWMQ_WRITE_TIMEOUT_MS=2000 ./flowmq   # drop a stalled reader after 2 s
+```
+
+* The timeout defaults to 5 s, long enough for a transiently slow reader to
+  catch up but short enough that a hung client cannot hold a thread indefinitely.
+* It only fires when a write makes **no** progress for the whole window; a client
+  that keeps draining data is never dropped, however large the transfer.
+* A non-numeric or non-positive value aborts startup with an error naming the
+  variable.
 
 ## Contributing
 

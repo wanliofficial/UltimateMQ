@@ -79,6 +79,7 @@ private:
     int sockfd;
     std::atomic<State> state;
     Frame frame;
+    int writeTimeoutMs;
     std::shared_ptr<Session> session;
     Broker* broker;
     Auth* auth = nullptr;

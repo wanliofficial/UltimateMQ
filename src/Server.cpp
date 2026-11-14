@@ -98,6 +98,23 @@ Server::Server(int port, size_t maxConnections)
         logInfo("max packet size: %zu bytes", broker->getMaxPacketSize());
     }
 
+    // Stalled-write timeout (opt-in). A client that stops reading would
+    // otherwise hold its connection thread forever on a blocking socket; bound
+    // how long a write may stall before the connection is dropped.
+    const char* writeTimeout = getenv("FLOWMQ_WRITE_TIMEOUT_MS");
+    if (writeTimeout && *writeTimeout) {
+        char* end = nullptr;
+        long parsed = std::strtol(writeTimeout, &end, 10);
+        if (end == writeTimeout || *end != '\0' || parsed <= 0) {
+            delete broker;
+            broker = nullptr;
+            throw std::runtime_error(std::string("invalid FLOWMQ_WRITE_TIMEOUT_MS: ") +
+                                     writeTimeout);
+        }
+        broker->setWriteTimeoutMs(static_cast<int>(parsed));
+        logInfo("write stall timeout: %d ms", broker->getWriteTimeoutMs());
+    }
+
     if (store->enabled()) {
         PersistedState persisted;
         std::string loadError;

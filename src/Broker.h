@@ -15,6 +15,7 @@
 #include "Auth.h"
 #include "Store.h"
 #include "Frame.h"
+#include "Tls.h"
 
 namespace MQTT {
 class Session;
@@ -48,6 +49,10 @@ class Broker {
     //! clients and enforced per connection. Defaults to Frame::DEFAULT_MAX_PACKET_SIZE.
     size_t maxPacketSize = Frame::DEFAULT_MAX_PACKET_SIZE;
 
+    //! How long a stalled write may block before the connection is dropped,
+    //! freeing its thread. Bounds a slow reader's hold on a connection thread.
+    int writeTimeoutMs = SecureTransport::WRITE_STALL_TIMEOUT_MS;
+
     //! Resolve the target sessions; called with the broker lock held
     void collectTargets(const Message &message, std::vector<std::shared_ptr<Session>> &targets);
 
@@ -68,6 +73,11 @@ public:
     //! to MQTT 5 clients via CONNACK). Must be set before any client connects.
     void setMaxPacketSize(size_t size) { maxPacketSize = size; }
     size_t getMaxPacketSize() const { return maxPacketSize; }
+
+    //! Configure how long a stalled write may block before the connection is
+    //! dropped. Must be set before any client connects.
+    void setWriteTimeoutMs(int ms) { writeTimeoutMs = ms; }
+    int getWriteTimeoutMs() const { return writeTimeoutMs; }
     //! Flag the durable state as changed (cheap: a single atomic store)
     void notifyStateChanged() {
         if (store) {
