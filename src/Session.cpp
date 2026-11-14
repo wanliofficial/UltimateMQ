@@ -260,6 +260,17 @@ size_t Session::getSubscriptionCount() {
     return subscriptions.size();
 }
 
+size_t Session::getSharedSubscriptionCount() {
+    std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
+    size_t count = 0;
+    for (const auto &[filter, options] : subscriptions) {
+        if (Topic::isShared(filter)) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 void Session::unsubscribe(const std::string &topicFilter) {
     {
         std::lock_guard<std::recursive_mutex> lock(deliveryMutex);

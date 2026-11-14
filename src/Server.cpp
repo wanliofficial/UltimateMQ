@@ -146,6 +146,25 @@ Server::Server(int port, size_t maxConnections)
         logInfo("max subscriptions per session: %zu", broker->getMaxSubscriptions());
     }
 
+    // Shared subscription limit (opt-in). Shared subscriptions are counted
+    // separately from ordinary filters because each one also registers a group
+    // member in the broker. Defaults to the subscription limit.
+    const char* maxSharedSubscriptions = getenv("FLOWMQ_MAX_SHARED_SUBSCRIPTIONS");
+    if (maxSharedSubscriptions && *maxSharedSubscriptions) {
+        char* end = nullptr;
+        unsigned long long parsed = std::strtoull(maxSharedSubscriptions, &end, 10);
+        if (end == maxSharedSubscriptions || *end != '\0' || *maxSharedSubscriptions == '-' ||
+            parsed == 0) {
+            delete broker;
+            broker = nullptr;
+            throw std::runtime_error(std::string("invalid FLOWMQ_MAX_SHARED_SUBSCRIPTIONS: ") +
+                                     maxSharedSubscriptions);
+        }
+        broker->setMaxSharedSubscriptions(static_cast<size_t>(parsed));
+        logInfo("max shared subscriptions per session: %zu",
+                broker->getMaxSharedSubscriptions());
+    }
+
     // Per-client inbound PUBLISH rate limit (opt-in). Bounds how many messages
     // one publisher may inject per second, so a single client cannot saturate
     // the broker's fan-out path with an unbounded burst.

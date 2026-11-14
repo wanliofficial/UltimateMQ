@@ -572,6 +572,10 @@ void Connection::handleSubscribe(std::shared_ptr<SubscribePacket> subscribe) {
     // are reported with QUOTA_EXCEEDED.
     const bool isV5 = frame.getVersion() == Version::MQTT5;
     const size_t maxSubscriptions = session->getMaxSubscriptions();
+    const size_t maxSharedSubscriptions = session->getMaxSharedSubscriptions();
+    // Shared subscriptions are counted separately: a single "$share/g/f" entry
+    // also registers a group member in the broker, so they have their own quota.
+    size_t sharedCount = session->getSharedSubscriptionCount();
     // Per-filter outcome: <0 means accepted (the granted QoS is recorded later),
     // otherwise the reason code reported for a rejected filter.
     std::vector<int> rejected(subscribe->subscriptions.size(), acceptMarker);
@@ -584,8 +588,17 @@ void Connection::handleSubscribe(std::shared_ptr<SubscribePacket> subscribe) {
             rejected[i] = isV5 ? static_cast<int>(ReasonCode::NOT_AUTHORIZED) : 0x80;
             continue;
         }
-        if (!session->hasSubscription(subscription.first) &&
-            session->getSubscriptionCount() >= maxSubscriptions) {
+        const bool isNew = !session->hasSubscription(subscription.first);
+        if (isNew && Topic::isShared(subscription.first)) {
+            if (sharedCount >= maxSharedSubscriptions) {
+                logDebug("client %s: shared subscription quota (%zu) reached, rejecting %s",
+                         session->getClientId().c_str(), maxSharedSubscriptions,
+                         subscription.first.c_str());
+                rejected[i] = isV5 ? static_cast<int>(ReasonCode::QUOTA_EXCEEDED) : 0x80;
+                continue;
+            }
+            ++sharedCount;
+        } else if (isNew && session->getSubscriptionCount() >= maxSubscriptions) {
             // New filter would push the session past its quota; a re-subscribe
             // of an existing filter is still allowed (it only updates options).
             logDebug("client %s: subscription quota (%zu) reached, rejecting %s",

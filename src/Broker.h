@@ -57,6 +57,13 @@ class Broker {
     //! so one client cannot exhaust memory by registering unbounded filters.
     size_t maxSubscriptions = DEFAULT_MAX_SUBSCRIPTIONS;
 
+    //! Upper bound on the distinct shared (\$share/group/filter) subscriptions
+    //! a single session may hold. They are bounded separately because each one
+    //! also registers a group member in the broker. Defaults to the session's
+    //! ordinary subscription limit unless explicitly configured.
+    size_t maxSharedSubscriptions = DEFAULT_MAX_SUBSCRIPTIONS;
+    bool sharedQuotaExplicit = false;
+
     //! Per-client inbound PUBLISH rate, in messages per second. 0 disables the
     //! limit. A publisher that exceeds it is disconnected, so a single client
     //! cannot saturate the broker's fan-out path with an unbounded burst.
@@ -98,6 +105,18 @@ public:
     //! before any client connects.
     void setMaxSubscriptions(size_t limit) { maxSubscriptions = limit; }
     size_t getMaxSubscriptions() const { return maxSubscriptions; }
+
+    //! Configure the maximum number of shared subscriptions per session. Must
+    //! be set before any client connects.
+    void setMaxSharedSubscriptions(size_t limit) {
+        maxSharedSubscriptions = limit;
+        sharedQuotaExplicit = true;
+    }
+    size_t getMaxSharedSubscriptions() const { return maxSharedSubscriptions; }
+    //! Whether an explicit shared-subscription limit was configured. When it was
+    //! not, sessions fall back to their ordinary subscription limit, so raising
+    //! FLOWMQ_MAX_SUBSCRIPTIONS also raises the shared quota.
+    bool hasExplicitSharedQuota() const { return sharedQuotaExplicit; }
 
     //! Configure the per-client inbound PUBLISH rate (messages/second; 0 means
     //! unlimited, the default). Must be set before any client connects.

@@ -37,6 +37,7 @@ All configuration is read from environment variables at startup.
 | `FLOWMQ_MAX_PACKET_SIZE` | `1048576` (1 MiB) | Largest Remaining Length accepted from a single client, in bytes; also advertised to MQTT 5 clients |
 | `FLOWMQ_WRITE_TIMEOUT_MS` | `5000` (5 s) | How long a single write may make no progress before the connection is dropped (bounds a stalled reader) |
 | `FLOWMQ_MAX_SUBSCRIPTIONS` | `1024` | Maximum number of topic filters a single session may hold; further filters are rejected |
+| `FLOWMQ_MAX_SHARED_SUBSCRIPTIONS` | `FLOWMQ_MAX_SUBSCRIPTIONS` | Maximum number of shared (`$share/...`) subscriptions a single session may hold |
 | `FLOWMQ_MAX_PUBLISH_RATE` | unlimited | Per-client inbound `PUBLISH` rate in messages/second; a publisher that exceeds it is disconnected |
 | `FLOWMQ_SERVER_KEEP_ALIVE` | unset | Preferred keep alive in seconds; MQTT 5 clients asking for more (or for none) are told this value in CONNACK |
 | `FLOWMQ_MAX_CONNECTIONS` | `1024` | Maximum number of simultaneous client connections; further connections are accepted then closed |
@@ -277,6 +278,27 @@ FLOWMQ_MAX_SUBSCRIPTIONS=256 ./flowmq   # allow up to 256 filters per session
   the QoS / options and does not consume a new slot.
 * `UNSUBSCRIBE` frees slots, so a session at its limit can release filters and
   subscribe to new ones.
+* A non-numeric, negative or zero value aborts startup naming the variable.
+
+#### Shared subscription limit (`FLOWMQ_MAX_SHARED_SUBSCRIPTIONS`)
+
+A shared subscription (`$share/group/filter`) is counted **separately** from
+ordinary filters: one entry also registers a group member in the broker, so an
+unbounded set of them would grow broker memory independently of the plain
+subscription quota. `FLOWMQ_MAX_SHARED_SUBSCRIPTIONS` caps how many distinct
+shared subscriptions a single session may hold.
+
+```bash
+FLOWMQ_MAX_SHARED_SUBSCRIPTIONS=32 ./flowmq   # up to 32 shared subscriptions
+```
+
+* Defaults to the value of `FLOWMQ_MAX_SUBSCRIPTIONS`, so raising the plain limit
+  raises the shared one too. Set it explicitly to bound them differently.
+* Filters beyond the limit are rejected in the `SUBACK` with `QUOTA_EXCEEDED`
+  (MQTT 5) or `0x80` failure (MQTT 3.1.1); the rest of a multi-topic
+  `SUBSCRIBE` is still processed.
+* Re-subscribing an **already-held** shared filter is always allowed, and
+  `UNSUBSCRIBE` frees a slot.
 * A non-numeric, negative or zero value aborts startup naming the variable.
 
 #### Publish rate limit (`FLOWMQ_MAX_PUBLISH_RATE`)

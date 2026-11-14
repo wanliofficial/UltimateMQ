@@ -124,6 +124,15 @@ public:
     //! FLOWMQ_MAX_SUBSCRIPTIONS.
     void setMaxSubscriptions(size_t limit) { maxSubscriptions = limit; }
     size_t getMaxSubscriptions() const { return maxSubscriptions; }
+    //! Upper bound on the number of distinct shared (\$share/group/filter)
+    //! subscriptions a single session may hold. They are excluded from
+    //! maxSubscriptions because one entry can be re-expanded into many group
+    //! registrations, so they need their own bound. Defaults to
+    //! DEFAULT_MAX_SUBSCRIPTIONS; tunable via FLOWMQ_MAX_SHARED_SUBSCRIPTIONS.
+    void setMaxSharedSubscriptions(size_t limit) { maxSharedSubscriptions = limit; }
+    size_t getMaxSharedSubscriptions() const { return maxSharedSubscriptions; }
+    //! Number of distinct shared subscriptions this session holds (thread safe)
+    size_t getSharedSubscriptionCount();
     //! MQTT 5 Receive Maximum: cap on the number of QoS 1/2 messages the broker
     //! may keep outstanding (sent, unacknowledged) to this client. Defaults to
     //! the protocol default of 65535, i.e. no effective limit.
@@ -148,6 +157,8 @@ private:
     static constexpr size_t MAX_QUEUED_MESSAGES = 1000;
     //! Upper bound on subscriptions held by this session
     size_t maxSubscriptions = DEFAULT_MAX_SUBSCRIPTIONS;
+    //! Upper bound on distinct shared subscriptions held by this session
+    size_t maxSharedSubscriptions = DEFAULT_MAX_SUBSCRIPTIONS;
     //! Cap on outstanding (sent, unacknowledged) QoS 1/2 messages to the client
     uint16_t receiveMaximum = 65535;
     uint16_t packetId = 1;
