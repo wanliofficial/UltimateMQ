@@ -88,7 +88,7 @@ Server::Server(int port, size_t maxConnections)
     if (maxPacketSize && *maxPacketSize) {
         char* end = nullptr;
         unsigned long long parsed = std::strtoull(maxPacketSize, &end, 10);
-        if (end == maxPacketSize || *end != '\0' || parsed == 0) {
+        if (end == maxPacketSize || *end != '\0' || *maxPacketSize == '-' || parsed == 0) {
             delete broker;
             broker = nullptr;
             throw std::runtime_error(std::string("invalid FLOWMQ_MAX_PACKET_SIZE: ") +
@@ -113,6 +113,22 @@ Server::Server(int port, size_t maxConnections)
         }
         broker->setWriteTimeoutMs(static_cast<int>(parsed));
         logInfo("write stall timeout: %d ms", broker->getWriteTimeoutMs());
+    }
+
+    // Per-session subscription limit: bounds how many topic filters one client
+    // may register, so it cannot exhaust memory with an unbounded set.
+    const char* maxSubscriptions = getenv("FLOWMQ_MAX_SUBSCRIPTIONS");
+    if (maxSubscriptions && *maxSubscriptions) {
+        char* end = nullptr;
+        unsigned long long parsed = std::strtoull(maxSubscriptions, &end, 10);
+        if (end == maxSubscriptions || *end != '\0' || *maxSubscriptions == '-' || parsed == 0) {
+            delete broker;
+            broker = nullptr;
+            throw std::runtime_error(std::string("invalid FLOWMQ_MAX_SUBSCRIPTIONS: ") +
+                                     maxSubscriptions);
+        }
+        broker->setMaxSubscriptions(static_cast<size_t>(parsed));
+        logInfo("max subscriptions per session: %zu", broker->getMaxSubscriptions());
     }
 
     if (store->enabled()) {

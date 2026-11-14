@@ -36,6 +36,7 @@ All configuration is read from environment variables at startup.
 | `FLOWMQ_STATE_FILE` | unset | Durable state file; retained messages and persistent sessions survive a restart when set |
 | `FLOWMQ_MAX_PACKET_SIZE` | `1048576` (1 MiB) | Largest Remaining Length accepted from a single client, in bytes; also advertised to MQTT 5 clients |
 | `FLOWMQ_WRITE_TIMEOUT_MS` | `5000` (5 s) | How long a single write may make no progress before the connection is dropped (bounds a stalled reader) |
+| `FLOWMQ_MAX_SUBSCRIPTIONS` | `1024` | Maximum number of topic filters a single session may hold; further filters are rejected |
 | `FLOWMQ_TLS_CERT` | unset | Server certificate (PEM); enables TLS when set together with `FLOWMQ_TLS_KEY` |
 | `FLOWMQ_TLS_KEY` | unset | Private key (PEM) matching `FLOWMQ_TLS_CERT` |
 | `FLOWMQ_TLS_CA` | unset | CA bundle used to verify client certificates |
@@ -170,6 +171,28 @@ FLOWMQ_WRITE_TIMEOUT_MS=2000 ./flowmq   # drop a stalled reader after 2 s
   that keeps draining data is never dropped, however large the transfer.
 * A non-numeric or non-positive value aborts startup with an error naming the
   variable.
+
+#### Subscription limit (`FLOWMQ_MAX_SUBSCRIPTIONS`)
+
+A client may send any number of `SUBSCRIBE` packets, and every distinct topic
+filter it registers costs memory (in the session and in the routing trie).
+Without a bound, one client could exhaust memory by subscribing to an unbounded
+set of filters. `FLOWMQ_MAX_SUBSCRIPTIONS` caps how many distinct filters a
+single session may hold.
+
+```bash
+FLOWMQ_MAX_SUBSCRIPTIONS=256 ./flowmq   # allow up to 256 filters per session
+```
+
+* The limit defaults to 1024, well above what most clients need.
+* Filters beyond the limit are rejected in the `SUBACK` with `QUOTA_EXCEEDED`
+  (MQTT 5) or `0x80` failure (MQTT 3.1.1) and are not registered; the rest of a
+  multi-topic `SUBSCRIBE` is still processed.
+* Re-subscribing an **already-held** filter is always allowed — it only updates
+  the QoS / options and does not consume a new slot.
+* `UNSUBSCRIBE` frees slots, so a session at its limit can release filters and
+  subscribe to new ones.
+* A non-numeric, negative or zero value aborts startup naming the variable.
 
 ## Contributing
 

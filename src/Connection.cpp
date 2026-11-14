@@ -406,28 +406,45 @@ void Connection::handleSubscribe(std::shared_ptr<SubscribePacket> subscribe) {
     if (!session) {
         throw std::runtime_error("SUBSCRIBE before CONNECT");
     }
+    // Sentinel meaning "this filter was accepted" in the per-filter outcome list.
+    constexpr int acceptMarker = -1;
     // Access control: subscribe only to filters the client may read. A denied
-    // filter is reported in the SUBACK and is not registered.
-    std::vector<bool> accepted;
-    for (const auto& subscription : subscribe->subscriptions) {
-        bool allowed = !(auth && auth->isForbidden(session->getUsername(), subscription.first,
-                                                   /*write=*/false));
-        if (!allowed) {
+    // filter is reported in the SUBACK and is not registered. A session also
+    // has a bounded number of subscriptions so one client cannot exhaust memory
+    // by subscribing to an unbounded set of filters; filters beyond the limit
+    // are reported with QUOTA_EXCEEDED.
+    const bool isV5 = frame.getVersion() == Version::MQTT5;
+    const size_t maxSubscriptions = session->getMaxSubscriptions();
+    // Per-filter outcome: <0 means accepted (the granted QoS is recorded later),
+    // otherwise the reason code reported for a rejected filter.
+    std::vector<int> rejected(subscribe->subscriptions.size(), acceptMarker);
+    for (size_t i = 0; i < subscribe->subscriptions.size(); ++i) {
+        const auto& subscription = subscribe->subscriptions[i];
+        if (auth && auth->isForbidden(session->getUsername(), subscription.first,
+                                      /*write=*/false)) {
             logDebug("client %s: denied subscribe to %s (acl)", session->getClientId().c_str(),
                      subscription.first.c_str());
-        } else {
-            session->subscribe(subscription.first, subscription.second);
+            rejected[i] = isV5 ? static_cast<int>(ReasonCode::NOT_AUTHORIZED) : 0x80;
+            continue;
         }
-        accepted.push_back(allowed);
+        if (!session->hasSubscription(subscription.first) &&
+            session->getSubscriptionCount() >= maxSubscriptions) {
+            // New filter would push the session past its quota; a re-subscribe
+            // of an existing filter is still allowed (it only updates options).
+            logDebug("client %s: subscription quota (%zu) reached, rejecting %s",
+                     session->getClientId().c_str(), maxSubscriptions,
+                     subscription.first.c_str());
+            rejected[i] = isV5 ? static_cast<int>(ReasonCode::QUOTA_EXCEEDED) : 0x80;
+            continue;
+        }
+        session->subscribe(subscription.first, subscription.second);
     }
-    SubackPacket suback{subscribe->packetId};
 
-    // Grant the requested QoS, or report the failure for the denied filters
-    const bool isV5 = frame.getVersion() == Version::MQTT5;
-    const uint8_t failureCode = isV5 ? static_cast<uint8_t>(ReasonCode::NOT_AUTHORIZED) : 0x80;
+    SubackPacket suback{subscribe->packetId};
+    // Grant the requested QoS, or report the per-filter failure otherwise
     for (size_t i = 0; i < subscribe->subscriptions.size(); ++i) {
-        if (!accepted[i]) {
-            suback.reasonCodes.push_back(static_cast<ReasonCode>(failureCode));
+        if (rejected[i] != acceptMarker) {
+            suback.reasonCodes.push_back(static_cast<ReasonCode>(static_cast<uint8_t>(rejected[i])));
         } else {
             suback.reasonCodes.push_back(static_cast<ReasonCode>(
                 static_cast<uint8_t>(subscribe->subscriptions[i].second.maximumQos)));
@@ -437,7 +454,7 @@ void Connection::handleSubscribe(std::shared_ptr<SubscribePacket> subscribe) {
 
     // Retained messages are delivered after the SUBACK (MQTT-3.3.1-9)
     for (size_t i = 0; i < subscribe->subscriptions.size(); ++i) {
-        if (!accepted[i]) {
+        if (rejected[i] != acceptMarker) {
             continue;
         }
         const auto& subscription = subscribe->subscriptions[i];

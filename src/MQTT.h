@@ -453,6 +453,12 @@ struct PingrespPacket : Packet {
     }
 };
 
+//! Default upper bound on the number of subscriptions a single session may
+//! hold, so one client cannot exhaust memory by registering an unbounded set of
+//! topic filters. Tunable via FLOWMQ_MAX_SUBSCRIPTIONS. Shared by Broker (config)
+//! and Session (enforcement) without their headers including each other.
+constexpr size_t DEFAULT_MAX_SUBSCRIPTIONS = 1024;
+
 } // namespace MQTT
 
 #endif

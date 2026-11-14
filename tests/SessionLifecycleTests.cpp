@@ -217,8 +217,7 @@ TEST_F(SessionLifecycleTest, PersistentSessionBuffersMessagesWhileOffline)
 }
 
 TEST_F(SessionLifecycleTest, NonPersistentCloseRemovesBrokerSubscriptions)
-{
-    auto session = std::make_shared<Session>(&broker, "npsub");
+{    auto session = std::make_shared<Session>(&broker, "npsub");
     session->connect(session, /*persistent=*/false);
     auto client = test::attach(*session);
     session->subscribe("np/t", optionsFor());
@@ -228,6 +227,42 @@ TEST_F(SessionLifecycleTest, NonPersistentCloseRemovesBrokerSubscriptions)
 
     // A gone session must not leave a routing entry behind
     EXPECT_FALSE(broker.isSubscribed("npsub", "np/t"));
+}
+
+TEST_F(SessionLifecycleTest, SubscriptionCountAndLookupTrackFilters)
+{
+    auto session = std::make_shared<Session>(&broker, "count");
+    session->connect(session, /*persistent=*/false);
+    auto client = test::attach(*session);
+
+    EXPECT_EQ(session->getSubscriptionCount(), 0u);
+    EXPECT_FALSE(session->hasSubscription("c/a"));
+
+    session->subscribe("c/a", optionsFor());
+    session->subscribe("c/b", optionsFor());
+    EXPECT_EQ(session->getSubscriptionCount(), 2u);
+    EXPECT_TRUE(session->hasSubscription("c/a"));
+    EXPECT_TRUE(session->hasSubscription("c/b"));
+
+    // Re-subscribing the same filter does not increase the count
+    session->subscribe("c/a", optionsFor());
+    EXPECT_EQ(session->getSubscriptionCount(), 2u);
+
+    session->unsubscribe("c/a");
+    EXPECT_EQ(session->getSubscriptionCount(), 1u);
+    EXPECT_FALSE(session->hasSubscription("c/a"));
+}
+
+TEST_F(SessionLifecycleTest, SubscriptionLimitDefaultsAndAppliesFromBroker)
+{
+    // A fresh session starts with the documented default limit
+    auto session = std::make_shared<Session>(&broker, "limit");
+    EXPECT_EQ(session->getMaxSubscriptions(), DEFAULT_MAX_SUBSCRIPTIONS);
+
+    // insertSession (called on connect) applies the broker's configured limit
+    broker.setMaxSubscriptions(3);
+    session->connect(session, /*persistent=*/false);
+    EXPECT_EQ(session->getMaxSubscriptions(), 3u);
 }
 
 TEST_F(SessionLifecycleTest, DiscardingAStaleSessionKeepsTheLiveOne)

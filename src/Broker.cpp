@@ -36,6 +36,7 @@ void Broker::restoreState(const PersistedState &state) {
             session->restore(persisted);
             session->setMutateCallback([this]() { notifyStateChanged(); });
             session->setAuth(auth);
+            session->setMaxSubscriptions(maxSubscriptions);
             sessions[persisted.clientId] = session;
             // Re-create the routing entries so live publishes reach the session
             // while it is offline (they are buffered until it reconnects)
@@ -63,6 +64,8 @@ void Broker::insertSession(const std::string &clientId, const std::shared_ptr<Se
     if (session) {
         // Every durable mutation of this session marks the store dirty
         session->setMutateCallback([this]() { notifyStateChanged(); });
+        // Apply the broker's subscription limit to the newly created session
+        session->setMaxSubscriptions(maxSubscriptions);
     }
 }
 

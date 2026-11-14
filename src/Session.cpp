@@ -213,6 +213,16 @@ void Session::subscribe(const std::string &topicFilter, const SubscriptionOption
     }
 }
 
+bool Session::hasSubscription(const std::string &topicFilter) {
+    std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
+    return subscriptions.find(topicFilter) != subscriptions.end();
+}
+
+size_t Session::getSubscriptionCount() {
+    std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
+    return subscriptions.size();
+}
+
 void Session::unsubscribe(const std::string &topicFilter) {
     {
         std::lock_guard<std::recursive_mutex> lock(deliveryMutex);

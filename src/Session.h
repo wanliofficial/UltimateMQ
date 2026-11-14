@@ -103,6 +103,17 @@ public:
     std::string matchingFilter(const std::string &topic);
     bool isPersistent() const { return persistent; }
 
+    //! Whether this session already holds the exact topic filter
+    bool hasSubscription(const std::string& topicFilter);
+    //! Number of distinct topic filters this session holds (thread safe)
+    size_t getSubscriptionCount();
+    //! Upper bound on the number of subscriptions a single session may hold.
+    //! Bounds per-client memory so one client cannot register an unbounded set
+    //! of filters. Default is DEFAULT_MAX_SUBSCRIPTIONS; tunable via
+    //! FLOWMQ_MAX_SUBSCRIPTIONS.
+    void setMaxSubscriptions(size_t limit) { maxSubscriptions = limit; }
+    size_t getMaxSubscriptions() const { return maxSubscriptions; }
+
 private:
     struct Delivery {
         Message message;
@@ -120,6 +131,8 @@ private:
     std::string username;
     //! Upper bound of the per-session delivery queue
     static constexpr size_t MAX_QUEUED_MESSAGES = 1000;
+    //! Upper bound on subscriptions held by this session
+    size_t maxSubscriptions = DEFAULT_MAX_SUBSCRIPTIONS;
     uint16_t packetId = 1;
     std::set<uint16_t> awaitingPubrel;
     std::map<std::string, SubscriptionOptions> subscriptions;

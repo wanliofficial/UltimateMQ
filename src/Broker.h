@@ -53,6 +53,10 @@ class Broker {
     //! freeing its thread. Bounds a slow reader's hold on a connection thread.
     int writeTimeoutMs = SecureTransport::WRITE_STALL_TIMEOUT_MS;
 
+    //! Upper bound on the number of subscriptions a single session may hold,
+    //! so one client cannot exhaust memory by registering unbounded filters.
+    size_t maxSubscriptions = DEFAULT_MAX_SUBSCRIPTIONS;
+
     //! Resolve the target sessions; called with the broker lock held
     void collectTargets(const Message &message, std::vector<std::shared_ptr<Session>> &targets);
 
@@ -78,6 +82,11 @@ public:
     //! dropped. Must be set before any client connects.
     void setWriteTimeoutMs(int ms) { writeTimeoutMs = ms; }
     int getWriteTimeoutMs() const { return writeTimeoutMs; }
+
+    //! Configure the maximum number of subscriptions per session. Must be set
+    //! before any client connects.
+    void setMaxSubscriptions(size_t limit) { maxSubscriptions = limit; }
+    size_t getMaxSubscriptions() const { return maxSubscriptions; }
     //! Flag the durable state as changed (cheap: a single atomic store)
     void notifyStateChanged() {
         if (store) {
