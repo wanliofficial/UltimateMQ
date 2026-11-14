@@ -35,6 +35,10 @@ class Client {
 public:
     virtual ~Client() = default;
     virtual void deliver(const Message& message, uint16_t packetId, QoS qos) = 0;
+    //! Resend a PUBREC for an inbound QoS 2 flow that is still awaiting its PUBREL.
+    //! Called on resume so a client whose PUBREL was lost can complete the
+    //! handshake instead of starting the QoS 2 flow over.
+    virtual void sendPubrec(uint16_t packetId) = 0;
     //! Called when a newer connection takes over this session; the receiver must
     //! stop using the session and release it
     virtual void onSuperseded() = 0;

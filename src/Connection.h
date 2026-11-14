@@ -61,6 +61,8 @@ public:
 
     //! Client interface: write a delivery to the socket (called without any broker/session lock)
     void deliver(const Message& message, uint16_t packetId, QoS qos) override;
+    //! Client interface: resend a PUBREC for an inbound QoS 2 flow awaiting PUBREL
+    void sendPubrec(uint16_t packetId) override;
     //! Client interface: a newer connection has taken over this session; stop using it
     void onSuperseded() override;
     void handleDeliver(const Message& message, uint16_t packetId, QoS qos);

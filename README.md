@@ -87,6 +87,9 @@ With it, the following survive a restart:
 * every session created with `cleanStart=false`, together with its
   subscriptions, its next packet id and its unacknowledged QoS 1/2 messages.
   An unacknowledged message is retransmitted with `DUP=1` on reconnect.
+* an inbound QoS 2 flow that is still awaiting its `PUBREL`: on reconnect (or
+  after a restart) the broker resends the `PUBREC` so the client can finish the
+  handshake with its `PUBREL`, instead of abandoning the flow.
 
 The file is written by a background thread at most once per second and again on
 `SIGINT`/`SIGTERM`, always atomically (a temporary file is renamed into place),

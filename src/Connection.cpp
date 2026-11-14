@@ -496,6 +496,17 @@ void Connection::handleDeliver(const Message &message, uint16_t packetId, QoS qo
     sendPacket(publish);
 }
 
+void Connection::sendPubrec(uint16_t packetId) {
+    if (state != State::CONNECTED) {
+        return;
+    }
+    // The original PUBREC always carried SUCCESS (only successful inbound QoS 2
+    // flows are remembered), so the resend does too.
+    PubrecPacket pubrec{packetId, ReasonCode::SUCCESS};
+    logDebug("resend PUBREC packetId=%u (awaiting PUBREL)", packetId);
+    sendPacket(pubrec);
+}
+
 void Connection::sendPacket(Packet &packet) {
     std::lock_guard<std::recursive_mutex> lock(writeMutex);
     if (sockfd < 0) {

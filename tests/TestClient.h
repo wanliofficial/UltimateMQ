@@ -17,6 +17,11 @@ public:
         qosValues.push_back(qos);
     }
 
+    void sendPubrec(uint16_t packetId) override {
+        std::lock_guard<std::mutex> lock(mutex);
+        resentPubrecs.push_back(packetId);
+    }
+
     void onSuperseded() override { superseded++; }
 
     size_t size() {
@@ -32,6 +37,7 @@ public:
     std::vector<Message> delivered;
     std::vector<uint16_t> packetIds;
     std::vector<QoS> qosValues;
+    std::vector<uint16_t> resentPubrecs;
     std::atomic<int> superseded{0};
 
 private:

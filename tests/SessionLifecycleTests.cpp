@@ -93,6 +93,49 @@ TEST_F(SessionLifecycleTest, ResumeRetransmitsUnackedMessagesWithDup)
     EXPECT_EQ(third->size(), 0u);
 }
 
+TEST_F(SessionLifecycleTest, ResumeResendsPubrecForInboundQos2AwaitingPubrel)
+{
+    auto session = std::make_shared<Session>(&broker, "q2");
+    session->connect(session, /*persistent=*/true);
+    auto first = test::attach(*session);
+
+    // An inbound QoS 2 PUBLISH: the broker publishes to subscribers and records
+    // that it is now awaiting this client's PUBREL (packet id 7).
+    ASSERT_EQ(session->publish(7, Message("q/t", "payload", QoS::QOS_2)),
+              ReasonCode::SUCCESS);
+
+    // The connection drops before the client's PUBREL arrives
+    session->close(first);
+    EXPECT_EQ(broker.findSession("q2"), session);
+
+    // On reconnect the broker must resend the PUBREC so the client can complete
+    // the flow with its PUBREL, using the original packet id.
+    auto second = std::make_shared<RecordingClient>();
+    session->resume(second);
+    EXPECT_EQ(second->resentPubrecs, (std::vector<uint16_t>{7}));
+
+    // Once the client's PUBREL is received the flow is done and nothing is resent
+    session->pubrel(7);
+    auto third = std::make_shared<RecordingClient>();
+    session->resume(third);
+    EXPECT_TRUE(third->resentPubrecs.empty());
+}
+
+TEST_F(SessionLifecycleTest, ResumeResendsEveryPendingInboundQos2Pubrec)
+{
+    auto session = std::make_shared<Session>(&broker, "q2multi");
+    session->connect(session, /*persistent=*/true);
+    test::attach(*session);
+
+    session->publish(3, Message("q/t", "a", QoS::QOS_2));
+    session->publish(9, Message("q/t", "b", QoS::QOS_2));
+
+    auto second = std::make_shared<RecordingClient>();
+    session->resume(second);
+    std::vector<uint16_t> expected{3, 9};
+    EXPECT_EQ(second->resentPubrecs, expected);
+}
+
 TEST_F(SessionLifecycleTest, ResumeStopsThePreviousClient)
 {
     auto session = std::make_shared<Session>(&broker, "handover");

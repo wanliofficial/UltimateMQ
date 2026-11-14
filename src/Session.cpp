@@ -236,6 +236,7 @@ void Session::bindClient(const std::shared_ptr<Client>& client) {
 
 void Session::resume(const std::shared_ptr<Client>& client) {
     std::shared_ptr<Client> previous;
+    std::vector<uint16_t> awaitingRel;
     {
         std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
         previous = std::move(this->client);
@@ -248,10 +249,19 @@ void Session::resume(const std::shared_ptr<Client>& client) {
             outgoing.dup = true;
             pendingDeliveries.emplace_back(std::move(outgoing), id, stored->qos);
         }
+        // Inbound QoS 2: the broker sent PUBREC but never got the matching PUBREL
+        // before the connection dropped. Remembering only the packet id is
+        // enough (the payload already reached the subscribers), so re-send the
+        // PUBREC now and let the client complete the flow with its PUBREL
+        // (MQTT-4.3.2-2 / MQTT-4.4.0-1).
+        awaitingRel.assign(awaitingPubrel.begin(), awaitingPubrel.end());
     }
     if (previous) {
         // Tell the connection that lost the session to release it
         previous->onSuperseded();
+    }
+    for (uint16_t id : awaitingRel) {
+        client->sendPubrec(id);
     }
 }
 
