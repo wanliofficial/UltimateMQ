@@ -150,6 +150,26 @@ than delivering it once that time has passed:
 The interval is in-memory only: it is never written to the durable state file, so
 a message restored after a restart is treated as having no expiry.
 
+#### Receive Maximum / flow control (MQTT 5)
+
+A subscriber tells the broker how much work it is willing to owe at once with the
+**Receive Maximum** property on `CONNECT` (MQTT-4.9). The broker caps the number of
+QoS 1/2 messages it keeps *outstanding* (sent but not yet acknowledged) to that
+value:
+
+* while the outstanding set is below the limit, QoS 1/2 messages are delivered and
+  counted as inflight as usual;
+* once the limit is reached, further QoS 1/2 messages for that client are **parked**
+  (no packet id, not inflight) until an acknowledgement frees a slot — `PUBACK`,
+  `PUBREC` or `PUBCOMP` then releases the next parked message in order;
+* **QoS 0 is never flow-controlled**: it has no acknowledgement, so there is no
+  outstanding count to bound.
+
+The default is `65535`, i.e. effectively unlimited, and a value of `0` is a protocol
+violation (the broker answers with a `PROTOCOL_ERROR` CONNACK and closes the
+connection). The parked backlog is part of the durable session, so it survives a
+restart and is delivered once the client reconnects and the window allows again.
+
 #### Transport security (`FLOWMQ_TLS_CERT` / `FLOWMQ_TLS_KEY`)
 
 By default the listener speaks plaintext, so with authentication enabled the

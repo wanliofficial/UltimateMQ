@@ -20,11 +20,12 @@ namespace MQTT {
 /*!
  * The on-disk form of one persistent session.
  *
- * Only what cannot be re-created is stored: the subscriptions and the
- * unacknowledged QoS>0 messages. The offline delivery queue is deliberately
- * NOT stored: for QoS>0 every queued message is also present in `inflight`,
- * and it is re-queued with DUP=1 when the session resumes, so persisting both
- * would deliver it twice. QoS 0 messages are at-most-once and may be lost.
+ * Only what cannot be re-created is stored: the subscriptions, the
+ * unacknowledged QoS>0 messages (inflight) and the flow-control backlog
+ * (blocked). The offline delivery queue is deliberately NOT stored: for QoS>0
+ * every queued message is also present in `inflight` or `blocked`, and it is
+ * re-queued on resume, so persisting the queue too would deliver it twice.
+ * QoS 0 messages are at-most-once and may be lost.
  */
 struct PersistedSession {
     std::string clientId;
@@ -32,6 +33,9 @@ struct PersistedSession {
     uint16_t nextPacketId = 1;
     std::map<std::string, SubscriptionOptions> subscriptions;
     std::vector<std::pair<uint16_t, Message>> inflight;
+    //! QoS>0 messages parked behind the client's Receive Maximum: no packet id
+    //! yet (first field is 0), to be promoted once a slot frees up.
+    std::vector<Message> blocked;
     std::set<uint16_t> awaitingPubrel;
 };
 

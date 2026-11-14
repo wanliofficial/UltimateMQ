@@ -47,6 +47,7 @@ PersistedState sampleState() {
     session.subscriptions["$/shared/g/x"] = SubscriptionOptions{QoS::QOS_1, true, true,
                                                                 RetainHandling::SEND_RETAINED_MESSAGES_AT_SUBSCRIBE_IF_NEW};
     session.inflight.emplace_back(3, messageFor("a/b", std::string("\x00\x01\x02", 3), QoS::QOS_1));
+    session.blocked.push_back(messageFor("a/c", std::string("\x10\x11", 2), QoS::QOS_2));
     session.awaitingPubrel.insert(3);
     session.awaitingPubrel.insert(9);
     state.sessions.push_back(session);
@@ -98,6 +99,10 @@ TEST(StoreTest, RoundTripsTheWholeState)
     ASSERT_EQ(session.inflight.size(), 1U);
     EXPECT_EQ(session.inflight[0].first, 3U);
     EXPECT_EQ(session.inflight[0].second.payload, (std::vector<uint8_t>{0x00, 0x01, 0x02}));
+    ASSERT_EQ(session.blocked.size(), 1U);
+    EXPECT_EQ(session.blocked[0].topic, "a/c");
+    EXPECT_EQ(session.blocked[0].payload, (std::vector<uint8_t>{0x10, 0x11}));
+    EXPECT_EQ(session.blocked[0].qos, QoS::QOS_2);
     EXPECT_EQ(session.awaitingPubrel, (std::set<uint16_t>{3, 9}));
 
     ::remove(path.c_str());

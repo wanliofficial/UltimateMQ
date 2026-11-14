@@ -52,6 +52,9 @@ Session::Snapshot Session::snapshot() const {
         }
     }
     snapshot.awaitingPubrel = awaitingPubrel;
+    for (const auto &blocked : blockedDeliveries) {
+        snapshot.blocked.push_back(blocked.message);
+    }
     return snapshot;
 }
 
@@ -68,6 +71,12 @@ void Session::restore(const Snapshot &snapshot) {
             inflightMessages[entry.first] = std::make_shared<Message>(entry.second);
         }
         awaitingPubrel = snapshot.awaitingPubrel;
+        blockedDeliveries.clear();
+        for (const auto &m : snapshot.blocked) {
+            Message copy = m;
+            copy.hasExpiry = false;  // restored backlog never expires in memory
+            blockedDeliveries.emplace_back(std::move(copy), /*packetId=*/0, copy.qos);
+        }
     }
     connected = false;
 }
@@ -100,11 +109,13 @@ void Session::close(const std::shared_ptr<Client> &client) {
         if (!persistent) {
             // A non-persistent session holds nothing worth keeping
             pendingDeliveries.clear();
+            blockedDeliveries.clear();
             filters.swap(subscriptions);
         }
         // A persistent session keeps its subscriptions, its offline message
-        // buffer (pendingDeliveries) and its unacknowledged inflight messages
-        // so that they can be retransmitted on the next connect
+        // buffer (pendingDeliveries), its flow-control backlog
+        // (blockedDeliveries) and its unacknowledged inflight messages so that
+        // they can be retransmitted on the next connect
         notify = std::move(onDisconnect);
         onDisconnect = nullptr;
     }
@@ -144,6 +155,7 @@ void Session::discard() {
         // Throw away everything: subscriptions, offline buffer and inflight
         filters.swap(subscriptions);
         pendingDeliveries.clear();
+        blockedDeliveries.clear();
         inflightMessages.clear();
         awaitingPubrel.clear();
         client.reset();
@@ -194,6 +206,7 @@ void Session::puback(uint16_t packetId) {
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
     if (inflightMessages.erase(packetId) > 0) {
         notifyMutation();
+        releaseBlocked();
     }
 }
 
@@ -201,6 +214,7 @@ ReasonCode Session::pubrec(uint16_t packetId) {
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
     if (inflightMessages.erase(packetId) > 0) {
         notifyMutation();
+        releaseBlocked();
     }
     return ReasonCode::SUCCESS;
 }
@@ -217,6 +231,7 @@ void Session::pubcomp(uint16_t packetId) {
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
     if (inflightMessages.erase(packetId) > 0) {
         notifyMutation();
+        releaseBlocked();
     }
 }
 
@@ -285,6 +300,9 @@ void Session::resume(const std::shared_ptr<Client>& client) {
             outgoing.dup = true;
             pendingDeliveries.emplace_back(std::move(outgoing), id, stored->qos);
         }
+        // Now that the unacked inflight messages have been re-queued (still
+        // occupying their window slots), promote any blocked messages that fit.
+        releaseBlocked();
         // Inbound QoS 2: the broker sent PUBREC but never got the matching PUBREL
         // before the connection dropped. Remembering only the packet id is
         // enough (the payload already reached the subscribers), so re-send the
@@ -385,14 +403,26 @@ void Session::deliverRetained(const std::string &topicFilter, const Subscription
 void Session::pushDelivery(const Message &message, QoS qos) {
     // Bound the per-session queue: a persistent session that stays offline
     // would otherwise grow without limit. Once the cap is reached new messages
-    // are dropped rather than buffered forever.
-    if (pendingDeliveries.size() >= MAX_QUEUED_MESSAGES) {
+    // are dropped rather than buffered forever. Blocked messages count toward
+    // the cap too, so flow control cannot bypass it.
+    if (pendingDeliveries.size() + blockedDeliveries.size() >= MAX_QUEUED_MESSAGES) {
         logDebug("session %s: queue full (%zu), dropping message on %s", clientId.c_str(),
-                 pendingDeliveries.size(), message.topic.c_str());
+                 pendingDeliveries.size() + blockedDeliveries.size(), message.topic.c_str());
         return;
     }
     Message outgoing = message;
     outgoing.qos = qos;
+    // MQTT 5 flow control: a QoS 1/2 message may only enter the inflight set
+    // while the outstanding count is below the client's Receive Maximum. Beyond
+    // that it is parked in blockedDeliveries (no packet id yet) and released as
+    // the client acknowledges earlier messages. QoS 0 has no acknowledgement and
+    // is therefore never flow-controlled.
+    if (qos != QoS::QOS_0 && inflightMessages.size() >= receiveMaximum) {
+        logDebug("session %s: receive maximum reached (%u), blocking message on %s",
+                 clientId.c_str(), receiveMaximum, message.topic.c_str());
+        blockedDeliveries.emplace_back(std::move(outgoing), /*packetId=*/0, qos);
+        return;
+    }
     uint16_t id = 0;
     if (qos != QoS::QOS_0) {
         id = nextPacketId();
@@ -402,6 +432,25 @@ void Session::pushDelivery(const Message &message, QoS qos) {
     // Only queue while the broker lock is held (Broker::publish) or while this
     // session lock is held: flush() is then called outside of both.
     pendingDeliveries.emplace_back(std::move(outgoing), id, qos);
+}
+
+void Session::releaseBlocked() {
+    // Called with deliveryMutex held after an inflight slot freed up. Promote
+    // as many blocked QoS>0 messages as the window now allows: assign a packet
+    // id, record it as inflight and enqueue it for sending. Any remaining stay
+    // blocked until a later acknowledgement frees another slot.
+    while (!blockedDeliveries.empty() &&
+           inflightMessages.size() < receiveMaximum &&
+           pendingDeliveries.size() < MAX_QUEUED_MESSAGES) {
+        Delivery blocked = std::move(blockedDeliveries.front());
+        blockedDeliveries.erase(blockedDeliveries.begin());
+        blocked.message.qos = blocked.qos;
+        uint16_t id = nextPacketId();
+        blocked.packetId = id;
+        inflightMessages[id] = std::make_shared<Message>(blocked.message);
+        notifyMutation();
+        pendingDeliveries.emplace_back(std::move(blocked.message), id, blocked.qos);
+    }
 }
 
 std::string Session::matchingFilter(const std::string &topic) {

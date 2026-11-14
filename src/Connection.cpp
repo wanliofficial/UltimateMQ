@@ -330,6 +330,23 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
         const size_t limit = broker ? broker->getMaxPacketSize() : Frame::DEFAULT_MAX_PACKET_SIZE;
         // MAXIMUM_PACKET_SIZE is a 4-byte field; the limit fits comfortably.
         connack.properties[PropertyID::MAXIMUM_PACKET_SIZE] = static_cast<uint32_t>(limit);
+        // Apply the client's Receive Maximum (MQTT-3.1.2-10 / 4.9): it caps how
+        // many QoS 1/2 messages the broker keeps outstanding to this client. A
+        // value of 0 is a protocol violation and the broker must close the
+        // connection. MQTT 3.1.1 has no such property, so nothing is set and the
+        // session keeps its default of no effective limit.
+        auto it = connect->properties.find(PropertyID::RECEIVE_MAXIMUM);
+        if (it != connect->properties.end() && std::holds_alternative<uint16_t>(it->second)) {
+            uint16_t receiveMaximum = std::get<uint16_t>(it->second);
+            if (receiveMaximum == 0) {
+                logInfo("client %s sent RECEIVE_MAXIMUM 0, closing connection",
+                        connect->clientId.c_str());
+                connack.reasonCode = ReasonCode::PROTOCOL_ERROR;
+                sendPacket(connack);
+                throw std::runtime_error("RECEIVE_MAXIMUM must not be 0");
+            }
+            sessionToUse->setReceiveMaximum(receiveMaximum);
+        }
     }
     sendPacket(connack);
 
@@ -400,6 +417,8 @@ void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
 void Connection::handlePuback(std::shared_ptr<PubackPacket> puback) {
     if (session) {
         session->puback(puback->packetId);
+        // A freed window slot may have released a flow-controlled message
+        session->flush();
     }
 }
 
@@ -424,6 +443,8 @@ void Connection::handlePubrel(std::shared_ptr<PubrelPacket> pubrel) {
 void Connection::handlePubcomp(std::shared_ptr<PubcompPacket> pubcomp) {
     if (session) {
         session->pubcomp(pubcomp->packetId);
+        // A freed window slot may have released a flow-controlled message
+        session->flush();
     }
 }
 

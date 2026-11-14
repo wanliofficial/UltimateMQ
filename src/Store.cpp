@@ -158,6 +158,12 @@ bool Store::write(const PersistedState &state) {
                    std::to_string(static_cast<int>(m.qos)) + " " + (m.retain ? "1" : "0") + " " +
                    toHex(m.payload) + "\n";
         }
+        for (const auto &blocked : session.blocked) {
+            const Message &m = blocked;
+            out += "blocked 0 " + toHex(m.topic) + " " +
+                   std::to_string(static_cast<int>(m.qos)) + " " + (m.retain ? "1" : "0") + " " +
+                   toHex(m.payload) + "\n";
+        }
         for (uint16_t id : session.awaitingPubrel) {
             out += "pubrel " + std::to_string(id) + "\n";
         }
@@ -260,7 +266,7 @@ bool Store::load(PersistedState &out, std::string *error) const {
             session.nextPacketId = static_cast<uint16_t>(nextId);
             out.sessions.push_back(std::move(session));
             current = &out.sessions.back();
-        } else if (kind == "sub" || kind == "inflight" || kind == "pubrel") {
+        } else if (kind == "sub" || kind == "inflight" || kind == "blocked" || kind == "pubrel") {
             if (current == nullptr) {
                 if (error) *error = "record without a session at line " + std::to_string(lineNo);
                 return false;
@@ -293,6 +299,16 @@ bool Store::load(PersistedState &out, std::string *error) const {
                 }
                 Message m = decodeMessage(topicHex, qos, retain != 0, payloadHex);
                 current->inflight.emplace_back(static_cast<uint16_t>(id), std::move(m));
+            } else if (kind == "blocked") {
+                unsigned id = 0;
+                std::string topicHex, payloadHex;
+                int qos = 0, retain = 0;
+                if (!(ss >> id >> topicHex >> qos >> retain >> payloadHex)) {
+                    if (error) *error = "bad blocked record at line " + std::to_string(lineNo);
+                    return false;
+                }
+                Message m = decodeMessage(topicHex, qos, retain != 0, payloadHex);
+                current->blocked.push_back(std::move(m));
             } else {
                 unsigned id = 0;
                 if (!(ss >> id)) {

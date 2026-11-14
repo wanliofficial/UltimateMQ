@@ -467,4 +467,93 @@ TEST_F(SessionLifecycleTest, ConcurrentPublishAndReconnectDoesNotCrash)
     EXPECT_EQ(broker.getConnectedClients(), 4);
 }
 
+TEST_F(SessionLifecycleTest, ReceiveMaximumCapsOutstandingQos1Messages)
+{
+    // A client that advertises Receive Maximum = 2 may have at most 2 QoS 1
+    // messages outstanding; the 3rd and 4th are parked until the client acks.
+    auto session = std::make_shared<Session>(&broker, "rcv1");
+    session->connect(session, /*persistent=*/true);
+    auto client = test::attach(*session);
+    session->subscribe("r/t", optionsFor(QoS::QOS_1));
+    session->setReceiveMaximum(2);
+
+    broker.publish(Message("r/t", "m1", QoS::QOS_1));
+    broker.publish(Message("r/t", "m2", QoS::QOS_1));
+    broker.publish(Message("r/t", "m3", QoS::QOS_1));
+    broker.publish(Message("r/t", "m4", QoS::QOS_1));
+    session->flush();
+
+    // Only the first two are delivered (window full); two remain blocked
+    ASSERT_EQ(client->size(), 2u);
+    EXPECT_EQ(std::string(client->delivered[0].payload.begin(), client->delivered[0].payload.end()), "m1");
+    EXPECT_EQ(std::string(client->delivered[1].payload.begin(), client->delivered[1].payload.end()), "m2");
+
+    // Acknowledging the first frees a slot; the next blocked message flows in
+    session->puback(client->packetIds[0]);
+    session->flush();
+    ASSERT_EQ(client->size(), 3u);
+    EXPECT_EQ(std::string(client->delivered[2].payload.begin(), client->delivered[2].payload.end()), "m3");
+}
+
+TEST_F(SessionLifecycleTest, ReceiveMaximumDoesNotThrottleQos0)
+{
+    // QoS 0 has no acknowledgement and is therefore never flow-controlled, even
+    // with a Receive Maximum of 1.
+    auto session = std::make_shared<Session>(&broker, "rcv0");
+    session->connect(session, /*persistent=*/true);
+    auto client = test::attach(*session);
+    session->subscribe("z/t", optionsFor(QoS::QOS_0));
+    session->setReceiveMaximum(1);
+
+    broker.publish(Message("z/t", "a", QoS::QOS_0));
+    broker.publish(Message("z/t", "b", QoS::QOS_0));
+    broker.publish(Message("z/t", "c", QoS::QOS_0));
+    session->flush();
+
+    EXPECT_EQ(client->size(), 3u);
+}
+
+TEST_F(SessionLifecycleTest, ReceiveMaximumWindowReleasesOnPubcomp)
+{
+    // The same gating applies to QoS 2 and releases on PUBREC->PUBCOMP.
+    auto session = std::make_shared<Session>(&broker, "rcv2");
+    session->connect(session, /*persistent=*/true);
+    auto client = test::attach(*session);
+    session->subscribe("q2/t", optionsFor(QoS::QOS_2));
+    session->setReceiveMaximum(1);
+
+    broker.publish(Message("q2/t", "a", QoS::QOS_2));
+    broker.publish(Message("q2/t", "b", QoS::QOS_2));
+    session->flush();
+
+    ASSERT_EQ(client->size(), 1u);
+    EXPECT_EQ(std::string(client->delivered[0].payload.begin(), client->delivered[0].payload.end()), "a");
+
+    // The PUBREC the broker sent is acked by the client's PUBREL; the flow
+    // completes with PUBCOMP, which frees the window slot.
+    session->pubrel(client->packetIds[0]);
+    session->pubcomp(client->packetIds[0]);
+    session->flush();
+
+    ASSERT_EQ(client->size(), 2u);
+    EXPECT_EQ(std::string(client->delivered[1].payload.begin(), client->delivered[1].payload.end()), "b");
+}
+
+TEST_F(SessionLifecycleTest, DefaultReceiveMaximumIsUnlimited)
+{
+    // Without setReceiveMaximum the default leaves behaviour unchanged: many
+    // QoS 1 messages are all delivered.
+    auto session = std::make_shared<Session>(&broker, "rcvdef");
+    session->connect(session, /*persistent=*/true);
+    auto client = test::attach(*session);
+    session->subscribe("d/t", optionsFor(QoS::QOS_1));
+
+    for (int i = 0; i < 50; ++i) {
+        broker.publish(Message("d/t", "m" + std::to_string(i), QoS::QOS_1));
+    }
+    session->flush();
+
+    EXPECT_EQ(client->size(), 50u);
+}
+
 } // namespace MQTT

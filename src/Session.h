@@ -124,6 +124,10 @@ public:
     //! FLOWMQ_MAX_SUBSCRIPTIONS.
     void setMaxSubscriptions(size_t limit) { maxSubscriptions = limit; }
     size_t getMaxSubscriptions() const { return maxSubscriptions; }
+    //! MQTT 5 Receive Maximum: cap on the number of QoS 1/2 messages the broker
+    //! may keep outstanding (sent, unacknowledged) to this client. Defaults to
+    //! the protocol default of 65535, i.e. no effective limit.
+    void setReceiveMaximum(uint16_t limit) { receiveMaximum = limit; }
 
 private:
     struct Delivery {
@@ -144,11 +148,17 @@ private:
     static constexpr size_t MAX_QUEUED_MESSAGES = 1000;
     //! Upper bound on subscriptions held by this session
     size_t maxSubscriptions = DEFAULT_MAX_SUBSCRIPTIONS;
+    //! Cap on outstanding (sent, unacknowledged) QoS 1/2 messages to the client
+    uint16_t receiveMaximum = 65535;
     uint16_t packetId = 1;
     std::set<uint16_t> awaitingPubrel;
     std::map<std::string, SubscriptionOptions> subscriptions;
     std::map<uint16_t, std::shared_ptr<Message>> inflightMessages;
     std::vector<Delivery> pendingDeliveries;
+    //! QoS>0 messages waiting for an inflight slot to free up under the client's
+    //! MQTT 5 Receive Maximum. They have no packet id yet and are not inflight,
+    //! so they are not retransmitted until released into the inflight set.
+    std::vector<Delivery> blockedDeliveries;
     std::shared_ptr<Client> client;
 
     //! Disconnect-time session expiry. hasExpiry marks the deadline as armed;
@@ -167,6 +177,9 @@ private:
     void pushDelivery(const Message& message, QoS qos);
     void removeSubscriptions(const std::map<std::string, SubscriptionOptions>& filters);
     uint16_t nextPacketId();
+    //! Move blocked QoS>0 messages into the inflight set / send queue while the
+    //! outstanding count is below the client's Receive Maximum.
+    void releaseBlocked();
 
     Broker* broker;
     Auth* auth = nullptr;
