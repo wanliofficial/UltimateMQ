@@ -116,7 +116,10 @@ carry a **Session Expiry Interval**, and the broker honours it
 
 * interval `0` — the session is discarded immediately, even if it was
   persistent, so a later reconnect starts fresh;
-* a positive interval — the session is kept and can be resumed;
+* a positive interval — the session is kept and can be resumed **until that many
+  seconds after the disconnect pass**; a background sweep then drops it if no
+  client reconnects, so an abandoned session cannot accumulate indefinitely.
+  Reconnecting before the deadline revives it;
 * no `DISCONNECT` (an abrupt disconnect or a keep-alive timeout) — the session
   is kept if it was created with `cleanStart=false`, exactly as before.
 
@@ -124,7 +127,12 @@ MQTT 3.1.1 has no such property, so a graceful `DISCONNECT` ends the session.
 
 > Note: a client's own `CONNECT` session-expiry and the DISCONNECT interval use
 > the same wire property; a malformed property (e.g. a wrong length byte) causes
-> the broker to drop the connection rather than mis-parse it.
+> the broker to drop the connection rather than mis-parse it. Integer properties
+> (session-expiry, message-expiry, receive-maximum, topic-alias, …) are read in
+> big-endian wire order, so a value such as `3600` seconds is honoured exactly.
+
+The sweep runs from the accept loop about once a second; an idle server therefore
+wakes periodically just to expire sessions, at negligible cost.
 
 #### Transport security (`FLOWMQ_TLS_CERT` / `FLOWMQ_TLS_KEY`)
 

@@ -23,6 +23,8 @@ Session::~Session() = default;
 void Session::connect(const std::shared_ptr<Session> &self, bool persistent) {
     this->persistent = persistent;
     connected = true;
+    // A live session never expires: cancel any disconnect-time expiry
+    clearExpiry();
     if (broker) {
         auth = broker->getAuth();
     }
@@ -158,6 +160,26 @@ void Session::discard() {
     }
 }
 
+void Session::armExpiry(std::chrono::seconds seconds) {
+    std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
+    if (seconds.count() <= 0) {
+        hasExpiry = false;
+        return;
+    }
+    expiryDeadline = std::chrono::steady_clock::now() + seconds;
+    hasExpiry = true;
+}
+
+void Session::clearExpiry() {
+    std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
+    hasExpiry = false;
+}
+
+bool Session::isExpired(std::chrono::steady_clock::time_point now) const {
+    std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
+    return hasExpiry && now >= expiryDeadline;
+}
+
 ReasonCode Session::publish(uint16_t packetId, const Message &message) {
     broker->publish(message);
     if (message.qos == QoS::QOS_2) {
@@ -251,6 +273,10 @@ void Session::resume(const std::shared_ptr<Client>& client) {
         std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
         previous = std::move(this->client);
         this->client = client;
+        // The session is live again: it no longer has a pending expiry and it is
+        // connected again (a resumed session must count as an active client).
+        hasExpiry = false;
+        connected = true;
         // Retransmit every QoS>0 message that was delivered but never
         // acknowledged, keeping the original packet id and setting DUP=1
         // (MQTT-3.3.1-8 / MQTT-4.4.0-1)

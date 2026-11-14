@@ -4,8 +4,22 @@
 #include <iostream>
 #include "Log.h"
 #include <algorithm>
+#include <cstdint>
 
 namespace MQTT {
+
+namespace {
+//! Read a 2- or 4-byte integer property in big-endian (wire) order. The earlier
+//! implementation reinterpreted the bytes as a native integer, which silently
+//! byte-swapped every value on little-endian hosts.
+uint16_t readU16BE(const uint8_t *p) {
+    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
+}
+uint32_t readU32BE(const uint8_t *p) {
+    return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+}
+} // namespace
 
 size_t Frame::feed(const uint8_t *buffer, size_t length) {
     size_t used = 0;
@@ -191,7 +205,7 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
                 if (offset + 1 + 4 > length || buffer[offset] != 4) {
                     throw std::runtime_error("Invalid properties: MESSAGE_EXPIRY_INTERVAL");
                 }
-                properties[propertyId] = *reinterpret_cast<const uint32_t*>(buffer + offset + 1);
+                properties[propertyId] = readU32BE(buffer + offset + 1);
                 offset += 1 + 4;
                 break;
             case PropertyID::CONTENT_TYPE:
@@ -228,7 +242,7 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
                 if (offset + 1 + 4 > length || buffer[offset] != 4) {
                     throw std::runtime_error("Invalid properties: SESSION_EXPIRY_INTERVAL");
                 }
-                properties[propertyId] = *reinterpret_cast<const uint32_t*>(buffer + offset + 1);
+                properties[propertyId] = readU32BE(buffer + offset + 1);
                 offset += 1 + 4;
                 break;
             case PropertyID::ASSIGNED_CLIENT_IDENTIFIER:
@@ -244,7 +258,7 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
                 if (offset + 1 + 2 > length || buffer[offset] != 2) {
                     throw std::runtime_error("Invalid properties: SERVER_KEEP_ALIVE");
                 }
-                properties[propertyId] = *reinterpret_cast<const uint16_t*>(buffer + offset + 1);;
+                properties[propertyId] = readU16BE(buffer + offset + 1);
                 offset += 1 + 2;
                 break;
             case PropertyID::AUTHENTICATION_METHOD:
@@ -276,7 +290,7 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
                 if (offset + 1 + 2 > length || buffer[offset] != 2) {
                     throw std::runtime_error("Invalid properties: RECEIVE_MAXIMUM");
                 }
-                properties[propertyId] = *reinterpret_cast<const uint16_t*>(buffer + offset + 1);
+                properties[propertyId] = readU16BE(buffer + offset + 1);
                 offset += 1 + 2;
                 break;
             case PropertyID::TOPIC_ALIAS_MAXIMUM:
@@ -284,7 +298,7 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
                 if (offset + 1 + 2 > length || buffer[offset] != 2) {
                     throw std::runtime_error("Invalid properties: TOPIC_ALIAS_MAXIMUM");
                 }
-                properties[propertyId] = *reinterpret_cast<const uint16_t*>(buffer + offset + 1);
+                properties[propertyId] = readU16BE(buffer + offset + 1);
                 offset += 1 + 2;
                 break;
             case PropertyID::TOPIC_ALIAS:
@@ -292,7 +306,7 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
                 if (offset + 1 + 2 > length || buffer[offset] != 2) {
                     throw std::runtime_error("Invalid properties: TOPIC_ALIAS");
                 }
-                properties[propertyId] = *reinterpret_cast<const uint16_t*>(buffer + offset + 1);
+                properties[propertyId] = readU16BE(buffer + offset + 1);
                 offset += 1 + 2;
                 break;
             case PropertyID::MAXIMUM_QOS:
@@ -307,7 +321,7 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
                 if (offset + 1 + 4 > length || buffer[offset] != 4) {
                     throw std::runtime_error("Invalid properties: MAXIMUM_PACKET_SIZE");
                 }
-                properties[propertyId] = *reinterpret_cast<const uint32_t*>(buffer + offset + 1);
+                properties[propertyId] = readU32BE(buffer + offset + 1);
                 offset += 1 + 4;
                 break;
             case PropertyID::WILDCARD_SUBSCRIPTION_AVAILABLE:

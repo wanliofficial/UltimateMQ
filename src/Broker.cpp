@@ -3,9 +3,11 @@
 #include "Session.h"
 #include "Log.h"
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <thread>
 #include <random>
+#include <vector>
 
 namespace MQTT {
 
@@ -92,6 +94,28 @@ void Broker::forgetSession(Session* session) {
 void Broker::removeSession(const std::string &clientId) {
     std::lock_guard<std::recursive_mutex> lock(mutex);
     sessions.erase(clientId);
+}
+
+void Broker::sweepExpiredSessions() {
+    auto now = std::chrono::steady_clock::now();
+    std::vector<std::shared_ptr<Session>> victims;
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        for (auto it = sessions.begin(); it != sessions.end();) {
+            auto &session = it->second;
+            if (session && !session->isConnected() && session->isExpired(now)) {
+                victims.push_back(session);
+                it = sessions.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    // Discard outside the broker lock: discard() takes the broker lock itself
+    // (to remove subscriptions) and would deadlock otherwise.
+    for (auto &session : victims) {
+        session->discard();
+    }
 }
 
 void Broker::removeSession(Session* session) {

@@ -82,6 +82,12 @@ void Connection::run() {
             owned->discard();
         } else {
             owned->close(shared_from_this());
+            if (gracefulDisconnect && sessionExpirySeconds > 0) {
+                // The session is kept, but must be dropped if it is not resumed
+                // before the DISCONNECT Session Expiry Interval elapses
+                // (MQTT-3.14.4-2). The background sweeper enforces the deadline.
+                owned->armExpiry(std::chrono::seconds(sessionExpirySeconds));
+            }
         }
     }
     closeSocket();

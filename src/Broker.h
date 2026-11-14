@@ -102,6 +102,9 @@ public:
 
     void insertSession(const std::string &clientId, const std::shared_ptr<Session>& session);
     std::shared_ptr<Session> findSession(const std::string &clientId) const;
+    //! Remove and drop every disconnected session whose disconnect-time expiry
+    //! deadline has passed. Called periodically by the server's event loop.
+    void sweepExpiredSessions();
     //! Remove the session from the map if it is the one mapped to `session`
     void forgetSession(Session* session);
     void removeSession(const std::string &clientId);

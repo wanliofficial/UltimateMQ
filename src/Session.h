@@ -3,6 +3,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -69,6 +70,16 @@ public:
     ReasonCode pubrec(uint16_t packetId);
     ReasonCode pubrel(uint16_t packetId);
     void pubcomp(uint16_t packetId);
+
+    //! Arm a disconnect-time expiry: after a graceful disconnect the session is
+    //! dropped this many seconds later unless a client reconnects first. Called
+    //! when a persistent session is kept alive on a DISCONNECT with a positive
+    //! Session Expiry Interval. A value of 0 cancels any pending expiry.
+    void armExpiry(std::chrono::seconds seconds);
+    //! Cancel any pending expiry (a live session never expires)
+    void clearExpiry();
+    //! Whether this session's expiry deadline has passed (thread safe)
+    bool isExpired(std::chrono::steady_clock::time_point now) const;
 
     //! Bind the session to the connection that drives it (may be nullptr to detach)
     void bindClient(const std::shared_ptr<Client>& client);
@@ -139,6 +150,12 @@ private:
     std::map<uint16_t, std::shared_ptr<Message>> inflightMessages;
     std::vector<Delivery> pendingDeliveries;
     std::shared_ptr<Client> client;
+
+    //! Disconnect-time session expiry. hasExpiry marks the deadline as armed;
+    //! expiryDeadline is an absolute steady-clock time point. Guarded by
+    //! deliveryMutex.
+    bool hasExpiry = false;
+    std::chrono::steady_clock::time_point expiryDeadline;
 
     mutable std::recursive_mutex deliveryMutex;
     std::function<void()> onDisconnect;

@@ -194,7 +194,16 @@ void Server::installSignalHandlers() {
 
 void Server::run() {
     while (running) {
-        // Wait for either a new client or the shutdown wake-up pipe
+        // Drop any sessions whose disconnect-time expiry has elapsed. Bounding
+        // the poll timeout guarantees the loop wakes to run this even when idle.
+        if (std::chrono::steady_clock::now() - lastSweep >= sweepInterval) {
+            if (broker) {
+                broker->sweepExpiredSessions();
+            }
+            lastSweep = std::chrono::steady_clock::now();
+        }
+        // Wait for either a new client, the periodic wake-up, or the shutdown
+        // wake-up pipe
         struct pollfd fds[2];
         int count = 0;
         fds[count].fd = listener->fd();
@@ -205,8 +214,15 @@ void Server::run() {
             fds[count].events = POLLIN;
             ++count;
         }
+        // Wake at most once per sweep interval so an idle loop still sweeps
+        auto untilSweep = sweepInterval - (std::chrono::steady_clock::now() - lastSweep);
+        int pollTimeoutMs = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(untilSweep).count());
+        if (pollTimeoutMs < 0) {
+            pollTimeoutMs = 0;
+        }
 
-        int ready = ::poll(fds, count, -1);
+        int ready = ::poll(fds, count, pollTimeoutMs);
         if (ready < 0) {
             if (errno == EINTR) {
                 continue;

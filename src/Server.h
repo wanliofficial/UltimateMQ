@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -50,6 +51,10 @@ private:
     std::atomic<size_t> maxConnections;
     mutable std::mutex connectionsMutex;
     std::map<int, std::shared_ptr<Connection>> connections;
+    //! How often the accept loop wakes to drop sessions whose disconnect-time
+    //! expiry has elapsed (MQTT-5 Session Expiry Interval on DISCONNECT).
+    std::chrono::milliseconds sweepInterval{1000};
+    std::chrono::steady_clock::time_point lastSweep{std::chrono::steady_clock::now()};
 };
 
 } // namespace MQTT

@@ -3,6 +3,7 @@
 #include "../src/Session.h"
 #include "TestClient.h"
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -58,6 +59,77 @@ TEST_F(SessionLifecycleTest, DiscardDropsPersistentSession)
     session->discard();
 
     EXPECT_EQ(broker.findSession("drop"), nullptr);
+}
+
+TEST_F(SessionLifecycleTest, ArmExpiryMarksSessionExpiredLater)
+{
+    auto session = std::make_shared<Session>(&broker, "exp");
+    session->connect(session, /*persistent=*/true);
+    auto client = test::attach(*session);
+    session->close(client);  // persistent: kept, but now disconnected
+
+    auto now = std::chrono::steady_clock::now();
+    EXPECT_FALSE(session->isExpired(now));
+
+    session->armExpiry(std::chrono::seconds(60));
+    EXPECT_FALSE(session->isExpired(now));
+    EXPECT_TRUE(session->isExpired(now + std::chrono::seconds(61)));
+}
+
+TEST_F(SessionLifecycleTest, ClearExpiryCancelsPendingExpiry)
+{
+    auto session = std::make_shared<Session>(&broker, "exp2");
+    session->connect(session, /*persistent=*/true);
+    auto client = test::attach(*session);
+    session->close(client);
+
+    session->armExpiry(std::chrono::seconds(60));
+    auto future = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    EXPECT_TRUE(session->isExpired(future));
+
+    session->clearExpiry();
+    EXPECT_FALSE(session->isExpired(future));
+}
+
+TEST_F(SessionLifecycleTest, ResumeCancelsPendingExpiry)
+{
+    // A reconnecting client revives an expired session: it must no longer be
+    // swept out from under the new connection.
+    auto session = std::make_shared<Session>(&broker, "exp3");
+    session->connect(session, /*persistent=*/true);
+    session->subscribe("r/#", optionsFor());
+    auto client = test::attach(*session);
+    session->close(client);
+    session->armExpiry(std::chrono::seconds(60));
+
+    // Simulate a reconnect
+    auto newClient = test::attach(*session);
+    session->resume(newClient);
+
+    auto future = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    EXPECT_FALSE(session->isExpired(future));
+}
+
+TEST_F(SessionLifecycleTest, SweepDropsAnExpiredSession)
+{
+    auto session = std::make_shared<Session>(&broker, "sweep");
+    session->connect(session, /*persistent=*/true);
+    session->subscribe("s/#", optionsFor());
+    auto client = test::attach(*session);
+    session->close(client);
+    session->armExpiry(std::chrono::seconds(1));
+    EXPECT_EQ(broker.findSession("sweep"), session);
+
+    // A still-connected session is never swept even if it somehow has an expiry
+    auto live = std::make_shared<Session>(&broker, "live");
+    live->connect(live, /*persistent=*/true);
+    live->armExpiry(std::chrono::seconds(0));  // 0 cancels; stays armed=false
+    broker.sweepExpiredSessions();
+    EXPECT_EQ(broker.findSession("live"), live);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    broker.sweepExpiredSessions();
+    EXPECT_EQ(broker.findSession("sweep"), nullptr);
 }
 
 TEST_F(SessionLifecycleTest, ResumeRetransmitsUnackedMessagesWithDup)
