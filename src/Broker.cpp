@@ -125,10 +125,69 @@ void Broker::sweepExpiredSessions() {
             }
         }
     }
+    // Publish any delayed Wills whose Will Delay Interval has elapsed. Done
+    // outside the lock (publish() takes it) and independently of the session
+    // sweep, so a delayed Will fires even for a non-persistent session that was
+    // torn down at disconnect.
+    publishDueWills();
     // Discard outside the broker lock: discard() takes the broker lock itself
     // (to remove subscriptions) and would deadlock otherwise.
     for (auto &session : victims) {
         session->discard();
+    }
+}
+
+void Broker::armWill(const std::string &clientId, const Message &will, QoS qos,
+                     bool retain, uint32_t delaySeconds) {
+    if (delaySeconds == 0) {
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    PendingWill pending;
+    pending.message = will;
+    pending.qos = qos;
+    pending.retain = retain;
+    pending.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(delaySeconds);
+    // Capture the username so the write ACL still applies when the Will is
+    // published, even if the session has since been torn down.
+    if (auto session = findSession(clientId)) {
+        pending.username = session->getUsername();
+    }
+    pendingWills[clientId] = std::move(pending);
+    notifyStateChanged();
+}
+
+void Broker::cancelWill(const std::string &clientId) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    if (pendingWills.erase(clientId) > 0) {
+        notifyStateChanged();
+    }
+}
+
+void Broker::publishDueWills() {
+    auto now = std::chrono::steady_clock::now();
+    std::vector<PendingWill> due;
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        for (auto it = pendingWills.begin(); it != pendingWills.end();) {
+            if (it->second.deadline <= now) {
+                due.push_back(std::move(it->second));
+                it = pendingWills.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    // Publish outside the broker lock (publish() takes it itself).
+    for (auto &pending : due) {
+        // The Will is published as the originating client, so the same write ACL
+        // applies as for a regular PUBLISH.
+        if (auth && auth->isForbidden(pending.username, pending.message.topic,
+                                      /*write=*/true)) {
+            logDebug("broker: denied delayed will on %s (acl)", pending.message.topic.c_str());
+            continue;
+        }
+        publish(pending.message);
     }
 }
 

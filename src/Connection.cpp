@@ -350,7 +350,24 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     if (connect->willFlag && connect->willTopic && connect->willMsg) {
         willPending = true;
         willMessage = Message(*connect->willTopic, *connect->willMsg, connect->willQos, connect->willRetain);
+        willDelay = 0;
+        // MQTT 5 Will Delay Interval (MQTT-3.1.2-12 / 5.4.3.2): a nonzero delay
+        // means the Will must be held on the session and published by the broker
+        // sweeper only after the delay elapses, giving the client a window to
+        // reconnect and cancel it. Parsed here from the will property set.
+        if (connect->willProperties) {
+            auto it = connect->willProperties->find(PropertyID::WILL_DELAY_INTERVAL);
+            if (it != connect->willProperties->end() && std::holds_alternative<uint32_t>(it->second)) {
+                willDelay = std::get<uint32_t>(it->second);
+            }
+        }
     }
+
+    // A reconnect within a pending Will's delay window cancels that Will
+    // (MQTT-3.1.4-6): the client came back before it was published. This covers
+    // both a resumed session and a fresh connect that supersedes a prior
+    // connection's pending Will for the same client id.
+    broker->cancelWill(connect->clientId);
 
     // Resolve the session for this client id. A clean start discards any session
     // left behind by an earlier connection; otherwise the existing session is
@@ -378,6 +395,18 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     sessionToUse->setUsername(username);
     sessionToUse->setPersistent(!connect->cleanStart);
     session = sessionToUse;
+
+    // If this client's Will carries a delay, hand it to the broker so it is
+    // published by the sweeper only after the delay elapses (MQTT-3.1.4-6 /
+    // 5.4.3.2), giving the client a window to reconnect and cancel it. The
+    // broker holds it (not this connection) so it survives the disconnect. With
+    // no delay the Will stays on the connection and is published immediately on
+    // an abnormal disconnect, as before.
+    if (connect->willFlag && connect->willTopic && connect->willMsg && willDelay > 0) {
+        willPending = false;
+        broker->armWill(connect->clientId, willMessage, connect->willQos,
+                        connect->willRetain, willDelay);
+    }
 
     setDisconnectCallback([weak = weak_from_this()]() {
         if (auto connection = weak.lock()) {

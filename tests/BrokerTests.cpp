@@ -140,3 +140,37 @@ TEST_F(BrokerTest, OverlappingSubscriptionsDeliverOnce)
     // Both filters match, but the client must receive a single copy
     EXPECT_EQ(client->size(), 1u);
 }
+
+TEST_F(BrokerTest, DelayedWillIsNotPublishedUntilDue)
+{
+    // A Will armed with a delay must not be delivered before its deadline,
+    // then must be delivered once the sweeper runs past it.
+    auto sub = std::make_shared<MQTT::Session>(broker, "dw-sub");
+    sub->connect(sub, /*persistent=*/true);
+    sub->subscribe("dw/#", MQTT::SubscriptionOptions{MQTT::QoS::QOS_0, false, false,
+                                                      MQTT::RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES});
+    auto subClient = MQTT::test::attach(*sub);
+
+    broker->armWill("dw-will", MQTT::Message("dw/goodbye", "bye"), MQTT::QoS::QOS_0, false, 1);
+    broker->sweepExpiredSessions();
+    EXPECT_EQ(subClient->size(), 0u) << "delayed Will fired before its interval elapsed";
+
+    // After the deadline passes, the sweeper publishes it
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    broker->sweepExpiredSessions();
+    EXPECT_EQ(subClient->size(), 1u);
+}
+
+TEST_F(BrokerTest, CancelWillPreventsPublication)
+{
+    auto sub = std::make_shared<MQTT::Session>(broker, "cw-sub");
+    sub->connect(sub, /*persistent=*/true);
+    sub->subscribe("cw/#", MQTT::SubscriptionOptions{MQTT::QoS::QOS_0, false, false,
+                                                      MQTT::RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES});
+    auto subClient = MQTT::test::attach(*sub);
+
+    broker->armWill("cw-will", MQTT::Message("cw/goodbye", "bye"), MQTT::QoS::QOS_0, false, 5);
+    broker->cancelWill("cw-will");
+    broker->sweepExpiredSessions();
+    EXPECT_EQ(subClient->size(), 0u) << "a cancelled Will must never be published";
+}

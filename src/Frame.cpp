@@ -324,6 +324,14 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
                 properties[propertyId] = readU32BE(buffer + offset + 1);
                 offset += 1 + 4;
                 break;
+            case PropertyID::WILL_DELAY_INTERVAL:
+                // MQTT 5 four-byte integer: id, length byte (0x04), then the value
+                if (offset + 1 + 4 > length || buffer[offset] != 4) {
+                    throw std::runtime_error("Invalid properties: WILL_DELAY_INTERVAL");
+                }
+                properties[propertyId] = readU32BE(buffer + offset + 1);
+                offset += 1 + 4;
+                break;
             case PropertyID::WILDCARD_SUBSCRIPTION_AVAILABLE:
                 if (offset + 1 > length) {
                     throw std::runtime_error("Invalid properties: insufficient data");    

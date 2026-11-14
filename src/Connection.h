@@ -118,6 +118,11 @@ private:
     std::chrono::steady_clock::time_point publishBucketStamp;
     bool willPending = false;
     Message willMessage;
+    //! Parsed Will Delay Interval (seconds) for this connection's Will. 0 means
+    //! publish immediately on abnormal disconnect; >0 arms the Will on the
+    //! session so the sweeper publishes it after the delay (cancellable by a
+    //! reconnect). See handleConnect.
+    uint32_t willDelay = 0;
     std::function<void()> disconnectCallback;
     std::unique_ptr<SecureTransport> transport;
     static const int BUFFER_SIZE = 4096;

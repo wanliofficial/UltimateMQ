@@ -35,6 +35,21 @@ class Broker {
     std::map<std::string, std::vector<SharedSubscription>> sharedSubscriptions;
     // Retained messages, keyed by their exact topic name
     std::map<std::string, Message> retainedMessages;
+
+    //! A Will held pending its Will Delay Interval. The broker owns these (not
+    //! the session or connection) so a delayed Will survives the disconnect even
+    //! of a non-persistent session, and so the sweeper can publish it later.
+    struct PendingWill {
+        Message message;
+        QoS qos = QoS::QOS_0;
+        bool retain = false;
+        std::chrono::steady_clock::time_point deadline;
+        std::string username;
+    };
+    //! Delayed Wills keyed by client id. Populated on an abnormal disconnect
+    //! whose CONNECT carried a Will Delay Interval; published by the sweeper once
+    //! the deadline passes, or cancelled if the client reconnects first.
+    std::map<std::string, PendingWill> pendingWills;
     mutable std::recursive_mutex mutex;
 
     //! Authentication / access control. The Broker does not own the Auth object:
@@ -145,6 +160,17 @@ public:
     //! Remove and drop every disconnected session whose disconnect-time expiry
     //! deadline has passed. Called periodically by the server's event loop.
     void sweepExpiredSessions();
+    //! Arm a delayed Will (MQTT Will Delay Interval) to be published by the
+    //! sweeper once the delay elapses, keyed by client id. A reconnect calls
+    //! cancelWill to drop it before it fires.
+    void armWill(const std::string &clientId, const Message &will, QoS qos,
+                 bool retain, uint32_t delaySeconds);
+    //! Cancel a pending delayed Will for this client id (a reconnect within the
+    //! window cancels it). No-op if none is pending.
+    void cancelWill(const std::string &clientId);
+    //! Publish every pending delayed Will whose deadline has passed. Called by
+    //! the sweeper alongside the session-expiry sweep.
+    void publishDueWills();
     //! Remove the session from the map if it is the one mapped to `session`
     void forgetSession(Session* session);
     void removeSession(const std::string &clientId);

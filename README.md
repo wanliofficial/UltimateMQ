@@ -472,6 +472,23 @@ discarded instead.) The hand-over follows MQTT-3.1.4-3:
   awaiting a `PUBREL` carry over to the new connection;
 * a `cleanStart=true` connect starts a fresh session and drops the old state.
 
+#### Will Delay Interval (MQTT 5)
+
+A client may set a **Will Delay Interval** in its CONNECT Will properties. When
+it does, an abnormal disconnect does not publish the Will immediately — the
+broker holds it and publishes it only once the interval elapses (MQTT-3.1.4-6 /
+5.4.3.2). This gives a client a window to reconnect and cancel the Will:
+
+* the delayed Will is held by the broker (keyed by client id), so it survives the
+  disconnect even of a non-persistent session, and is published by the same
+  background sweeper that enforces session expiry;
+* **reconnecting within the window cancels the Will** — any new `CONNECT` for the
+  same client id drops a pending delayed Will before it fires, whether the session
+  is resumed or replaced;
+* a Will with no delay (or on MQTT 3.1.1) keeps the original behaviour: it is
+  published immediately on an abnormal disconnect and discarded on a graceful one
+  or a session takeover.
+
 ## Contributing
 
 Please read CONTRIBUTING.md for details on our code of conduct and the process for submitting pull requests.
