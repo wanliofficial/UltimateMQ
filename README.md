@@ -37,6 +37,7 @@ All configuration is read from environment variables at startup.
 | `FLOWMQ_MAX_PACKET_SIZE` | `1048576` (1 MiB) | Largest Remaining Length accepted from a single client, in bytes; also advertised to MQTT 5 clients |
 | `FLOWMQ_WRITE_TIMEOUT_MS` | `5000` (5 s) | How long a single write may make no progress before the connection is dropped (bounds a stalled reader) |
 | `FLOWMQ_MAX_SUBSCRIPTIONS` | `1024` | Maximum number of topic filters a single session may hold; further filters are rejected |
+| `FLOWMQ_MAX_CONNECTIONS` | `1024` | Maximum number of simultaneous client connections; further connections are accepted then closed |
 | `FLOWMQ_TLS_CERT` | unset | Server certificate (PEM); enables TLS when set together with `FLOWMQ_TLS_KEY` |
 | `FLOWMQ_TLS_KEY` | unset | Private key (PEM) matching `FLOWMQ_TLS_CERT` |
 | `FLOWMQ_TLS_CA` | unset | CA bundle used to verify client certificates |
@@ -192,6 +193,22 @@ FLOWMQ_MAX_SUBSCRIPTIONS=256 ./flowmq   # allow up to 256 filters per session
   the QoS / options and does not consume a new slot.
 * `UNSUBSCRIBE` frees slots, so a session at its limit can release filters and
   subscribe to new ones.
+* A non-numeric, negative or zero value aborts startup naming the variable.
+
+#### Connection limit (`FLOWMQ_MAX_CONNECTIONS`)
+
+Each connected client holds a thread and a socket, so an unbounded accept loop
+is a resource-exhaustion lever. `FLOWMQ_MAX_CONNECTIONS` caps how many client
+connections the broker serves at once.
+
+```bash
+FLOWMQ_MAX_CONNECTIONS=512 ./flowmq   # serve at most 512 clients at a time
+```
+
+* The limit defaults to 1024.
+* Once it is reached, newly accepted connections are closed immediately (the
+  client never receives a `CONNACK`); already-established clients are unaffected.
+* Disconnecting a client frees a slot for a new one.
 * A non-numeric, negative or zero value aborts startup naming the variable.
 
 ## Contributing

@@ -27,6 +27,8 @@ public:
     void stop();
 
     size_t getActiveConnections() const;
+    //! The configured maximum number of simultaneous connections
+    size_t getMaxConnections() const { return maxConnections; }
 
     //! Install handlers so SIGINT/SIGTERM stop the server gracefully (which
     //! flushes the state file). Call before start().

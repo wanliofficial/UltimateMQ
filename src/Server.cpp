@@ -30,6 +30,21 @@ void handleSignal(int) {
 
 Server::Server(int port, size_t maxConnections)
     : maxConnections(maxConnections == 0 ? 1024 : maxConnections) {
+    // Cap the number of simultaneous client connections. Each holds a thread
+    // and a socket, so an unbounded accept loop is a resource-exhaustion lever.
+    // The constructor argument (or 1024) is the default; FLOWMQ_MAX_CONNECTIONS
+    // overrides it so a deployment can fit its thread/memory budget.
+    const char* maxConnectionsEnv = getenv("FLOWMQ_MAX_CONNECTIONS");
+    if (maxConnectionsEnv && *maxConnectionsEnv) {
+        char* end = nullptr;
+        unsigned long long parsed = std::strtoull(maxConnectionsEnv, &end, 10);
+        if (end == maxConnectionsEnv || *end != '\0' || *maxConnectionsEnv == '-' ||
+            parsed == 0) {
+            throw std::runtime_error(std::string("invalid FLOWMQ_MAX_CONNECTIONS: ") +
+                                     maxConnectionsEnv);
+        }
+        this->maxConnections = static_cast<size_t>(parsed);
+    }
     listener = std::make_unique<Listener>(port);
     auth = std::make_unique<Auth>();
     std::string error;
@@ -155,7 +170,7 @@ void Server::start() {
     // Start the background writer only once the state has been restored
     store->start([this]() { return broker->snapshotState(); });
     running = true;
-    logInfo("MQTT server started");
+    logInfo("MQTT server started (max connections: %zu)", getMaxConnections());
     run();
 }
 
