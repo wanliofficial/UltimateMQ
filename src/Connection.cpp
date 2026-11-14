@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 #include <poll.h>
 #include <cerrno>
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <sstream>
@@ -35,6 +36,12 @@ Connection::Connection(int sockfd, Broker* broker, std::shared_ptr<TlsContext> t
     // Cap the packet size before any byte (including the first CONNECT) is read.
     // The version is fixed later, but the limit does not depend on it.
     frame.setMaxPacketSize(broker ? broker->getMaxPacketSize() : Frame::DEFAULT_MAX_PACKET_SIZE);
+    // Snapshot the inbound rate limit (0 means unlimited). The bucket starts
+    // full with one second of allowance so a short burst is tolerated, then
+    // refills at the configured rate.
+    publishRateLimit = broker ? broker->getMaxPublishRate() : 0;
+    publishTokens = static_cast<double>(publishRateLimit);
+    publishBucketStamp = std::chrono::steady_clock::now();
 }
 
 Connection::~Connection() {
@@ -375,6 +382,25 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     logInfo("client connected: %s (resumed=%d)", connect->clientId.c_str(), (int)resumed);
 }
 
+bool Connection::allowPublish() {
+    if (publishRateLimit == 0) {
+        return true;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed =
+        std::chrono::duration<double>(now - publishBucketStamp).count();
+    publishBucketStamp = now;
+    // Refill, but never beyond one second of allowance so an idle client
+    // cannot bank an unbounded burst.
+    publishTokens = std::min(publishTokens + elapsed * static_cast<double>(publishRateLimit),
+                             static_cast<double>(publishRateLimit));
+    if (publishTokens < 1.0) {
+        return false;
+    }
+    publishTokens -= 1.0;
+    return true;
+}
+
 bool Connection::resolveTopicAlias(const std::shared_ptr<PublishPacket> &publish) {
     // MQTT 3.1.1 has no properties, so no alias can be present.
     if (frame.getVersion() != Version::MQTT5) {
@@ -424,6 +450,18 @@ bool Connection::resolveTopicAlias(const std::shared_ptr<PublishPacket> &publish
 void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
     if (!session) {
         throw std::runtime_error("PUBLISH before CONNECT");
+    }
+    // Inbound rate limit: a publisher exceeding its allowance is disconnected
+    // (MQTT 5 gets a DISCONNECT QUOTA_EXCEEDED; MQTT 3.1.1 is simply closed).
+    if (!allowPublish()) {
+        logDebug("client %s: publish rate limit (%zu/s) exceeded",
+                 session->getClientId().c_str(), publishRateLimit);
+        if (frame.getVersion() == Version::MQTT5) {
+            DisconnectPacket disconnect{ReasonCode::QUOTA_EXCEEDED};
+            sendPacket(disconnect);
+        }
+        state = State::DISCONNECTED;
+        return;
     }
     // MQTT 5 Topic Alias: expand an alias into its topic name (or register it)
     // before the message is routed, so the rest of the path only sees real

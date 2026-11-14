@@ -104,11 +104,18 @@ private:
     //! one with a topic name registers/updates the mapping, one without a topic
     //! resolves through it.
     static constexpr uint16_t TOPIC_ALIAS_MAXIMUM = 16;
-    std::map<uint16_t, std::string> topicAliases;
-    //! Expand an inbound PUBLISH's Topic Alias into its topic name. Returns false
+    std::map<uint16_t, std::string> topicAliases;    //! Expand an inbound PUBLISH's Topic Alias into its topic name. Returns false
     //! (after signalling the error to the client) when the alias is invalid, as
     //! MQTT-3.3.2-9 requires the connection to be closed in that case.
     bool resolveTopicAlias(const std::shared_ptr<PublishPacket>& publish);
+    //! Per-client inbound PUBLISH rate limit (token bucket). Returns false when
+    //! a message must be refused because the client exceeded its allowance.
+    bool allowPublish();
+    //! Messages per second this client may publish; 0 means unlimited
+    size_t publishRateLimit = 0;
+    //! Tokens available to this connection's bucket, capped at one second's worth
+    double publishTokens = 0;
+    std::chrono::steady_clock::time_point publishBucketStamp;
     bool willPending = false;
     Message willMessage;
     std::function<void()> disconnectCallback;

@@ -37,6 +37,7 @@ All configuration is read from environment variables at startup.
 | `FLOWMQ_MAX_PACKET_SIZE` | `1048576` (1 MiB) | Largest Remaining Length accepted from a single client, in bytes; also advertised to MQTT 5 clients |
 | `FLOWMQ_WRITE_TIMEOUT_MS` | `5000` (5 s) | How long a single write may make no progress before the connection is dropped (bounds a stalled reader) |
 | `FLOWMQ_MAX_SUBSCRIPTIONS` | `1024` | Maximum number of topic filters a single session may hold; further filters are rejected |
+| `FLOWMQ_MAX_PUBLISH_RATE` | unlimited | Per-client inbound `PUBLISH` rate in messages/second; a publisher that exceeds it is disconnected |
 | `FLOWMQ_MAX_CONNECTIONS` | `1024` | Maximum number of simultaneous client connections; further connections are accepted then closed |
 | `FLOWMQ_TLS_CERT` | unset | Server certificate (PEM); enables TLS when set together with `FLOWMQ_TLS_KEY` |
 | `FLOWMQ_TLS_KEY` | unset | Private key (PEM) matching `FLOWMQ_TLS_CERT` |
@@ -275,6 +276,29 @@ FLOWMQ_MAX_SUBSCRIPTIONS=256 ./flowmq   # allow up to 256 filters per session
   the QoS / options and does not consume a new slot.
 * `UNSUBSCRIBE` frees slots, so a session at its limit can release filters and
   subscribe to new ones.
+* A non-numeric, negative or zero value aborts startup naming the variable.
+
+#### Publish rate limit (`FLOWMQ_MAX_PUBLISH_RATE`)
+
+Every inbound `PUBLISH` is fanned out to all matching subscribers, so one fast
+publisher can saturate every connection thread the broker runs. The keep-alive
+timer bounds a silent client, and the write-stall timeout bounds a slow reader,
+but nothing bounded how many messages a single healthy client could inject per
+second. `FLOWMQ_MAX_PUBLISH_RATE` does.
+
+```bash
+FLOWMQ_MAX_PUBLISH_RATE=500 ./flowmq   # at most 500 messages/second per client
+```
+
+* Unset by default, which keeps the historical behaviour of no limit.
+* The limit is a **token bucket** per connection: it starts with one second's
+  allowance (so a short burst is tolerated) and refills at the configured rate.
+  Bursts beyond that are refused rather than queued.
+* A publisher that exceeds its allowance is **disconnected**: MQTT 5 clients get
+  a `DISCONNECT` with `QUOTA_EXCEEDED` (`0x97`), MQTT 3.1.1 connections are
+  simply closed. The messages it already sent are delivered normally.
+* Other clients are unaffected: the limit applies per connection and resets on
+  reconnect.
 * A non-numeric, negative or zero value aborts startup naming the variable.
 
 #### Connection limit (`FLOWMQ_MAX_CONNECTIONS`)

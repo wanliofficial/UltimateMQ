@@ -146,6 +146,23 @@ Server::Server(int port, size_t maxConnections)
         logInfo("max subscriptions per session: %zu", broker->getMaxSubscriptions());
     }
 
+    // Per-client inbound PUBLISH rate limit (opt-in). Bounds how many messages
+    // one publisher may inject per second, so a single client cannot saturate
+    // the broker's fan-out path with an unbounded burst.
+    const char* maxPublishRate = getenv("FLOWMQ_MAX_PUBLISH_RATE");
+    if (maxPublishRate && *maxPublishRate) {
+        char* end = nullptr;
+        unsigned long long parsed = std::strtoull(maxPublishRate, &end, 10);
+        if (end == maxPublishRate || *end != '\0' || *maxPublishRate == '-' || parsed == 0) {
+            delete broker;
+            broker = nullptr;
+            throw std::runtime_error(std::string("invalid FLOWMQ_MAX_PUBLISH_RATE: ") +
+                                     maxPublishRate);
+        }
+        broker->setMaxPublishRate(static_cast<size_t>(parsed));
+        logInfo("max publish rate per client: %zu msg/s", broker->getMaxPublishRate());
+    }
+
     if (store->enabled()) {
         PersistedState persisted;
         std::string loadError;

@@ -57,6 +57,11 @@ class Broker {
     //! so one client cannot exhaust memory by registering unbounded filters.
     size_t maxSubscriptions = DEFAULT_MAX_SUBSCRIPTIONS;
 
+    //! Per-client inbound PUBLISH rate, in messages per second. 0 disables the
+    //! limit. A publisher that exceeds it is disconnected, so a single client
+    //! cannot saturate the broker's fan-out path with an unbounded burst.
+    size_t maxPublishRate = 0;
+
     //! Resolve the target sessions; called with the broker lock held
     void collectTargets(const Message &message, std::vector<std::shared_ptr<Session>> &targets);
 
@@ -87,6 +92,11 @@ public:
     //! before any client connects.
     void setMaxSubscriptions(size_t limit) { maxSubscriptions = limit; }
     size_t getMaxSubscriptions() const { return maxSubscriptions; }
+
+    //! Configure the per-client inbound PUBLISH rate (messages/second; 0 means
+    //! unlimited, the default). Must be set before any client connects.
+    void setMaxPublishRate(size_t rate) { maxPublishRate = rate; }
+    size_t getMaxPublishRate() const { return maxPublishRate; }
     //! Flag the durable state as changed (cheap: a single atomic store)
     void notifyStateChanged() {
         if (store) {
