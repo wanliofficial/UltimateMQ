@@ -597,4 +597,46 @@ TEST_F(SessionLifecycleTest, DefaultReceiveMaximumIsUnlimited)
     EXPECT_EQ(client->size(), 50u);
 }
 
+TEST_F(SessionLifecycleTest, NoLocalSubscriptionSuppressesOwnMessages)
+{
+    // MQTT-3.8.2-3: a subscription with the No Local option set must not
+    // receive messages this same client published. Publishing goes through
+    // Session::publish so the message is tagged with its originator.
+    auto subscriber = std::make_shared<Session>(&broker, "nl-self");
+    subscriber->connect(subscriber, /*persistent=*/true);
+    auto client = test::attach(*subscriber);
+    // Subscribe with No Local set
+    SubscriptionOptions noLocalOpts{QoS::QOS_0, /*noLocal=*/true, false,
+                                    RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES};
+    subscriber->subscribe("nl/t", noLocalOpts);
+
+    // The SAME client publishes to its own session
+    subscriber->publish(1, Message("nl/t", "own", QoS::QOS_0));
+    subscriber->flush();
+
+    // The no-local subscriber must NOT receive its own message
+    EXPECT_EQ(client->size(), 0u);
+}
+
+TEST_F(SessionLifecycleTest, NormalSubscriptionStillReceivesOthers)
+{
+    // Control: without No Local, a subscriber receives other clients' messages.
+    auto publisher = std::make_shared<Session>(&broker, "nrm-pub");
+    publisher->connect(publisher, /*persistent=*/true);
+    test::attach(*publisher);
+
+    auto subscriber = std::make_shared<Session>(&broker, "nrm-sub");
+    subscriber->connect(subscriber, /*persistent=*/true);
+    auto subscriberClient = test::attach(*subscriber);
+    subscriber->subscribe("nrm/t", optionsFor(QoS::QOS_0));
+
+    publisher->publish(1, Message("nrm/t", "hello", QoS::QOS_0));
+    publisher->flush();
+    subscriber->flush();
+
+    ASSERT_EQ(subscriberClient->size(), 1u);
+    EXPECT_EQ(std::string(subscriberClient->delivered[0].payload.begin(),
+                          subscriberClient->delivered[0].payload.end()), "hello");
+}
+
 } // namespace MQTT

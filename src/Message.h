@@ -23,6 +23,11 @@ struct Message {
     //! to the durable state, so a restored message never expires.
     bool hasExpiry = false;
     std::chrono::steady_clock::time_point expiryDeadline;
+    //! The session that originated this message, set on the live fan-out path.
+    //! Used to honour the MQTT 5 No Local subscription option: a subscriber that
+    //! asked for it must not receive its own publications. Never written to the
+    //! durable state, so a restored message has no originator.
+    void* originSession = nullptr;
 
     Message() = default;
 

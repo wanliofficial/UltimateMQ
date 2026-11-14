@@ -333,6 +333,23 @@ FLOWMQ_MAX_SHARED_SUBSCRIPTIONS=32 ./flowmq   # up to 32 shared subscriptions
   `UNSUBSCRIBE` frees a slot.
 * A non-numeric, negative or zero value aborts startup naming the variable.
 
+#### Subscription options (`No Local`, `Retain As Published`, `Retain Handling`)
+
+Each `SUBSCRIBE` entry carries subscription options, all honoured on the live
+delivery path:
+
+* **No Local** (MQTT-3.8.2-3): a subscription with this option set does not
+  receive messages the *same client* published. The comparison uses the session
+  that originated the message, so a client still receives other clients' messages
+  on the same topic. Retained messages delivered on subscribe have no originator
+  and are therefore always delivered.
+* **Retain As Published** (MQTT-3.3.1-9): by default the broker clears the retain
+  flag when forwarding a live message; set this to forward it exactly as received.
+* **Retain Handling** (MQTT-3.3.1-9): `0` sends retained messages on subscribe,
+  `1` only if the subscription is new, `2` never sends retained messages.
+* **Maximum QoS**: the delivered QoS is the minimum of the published QoS and the
+  granted QoS.
+
 #### Publish rate limit (`FLOWMQ_MAX_PUBLISH_RATE`)
 
 Every inbound `PUBLISH` is fanned out to all matching subscribers, so one fast

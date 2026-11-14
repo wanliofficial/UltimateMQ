@@ -193,7 +193,13 @@ bool Session::isExpired(std::chrono::steady_clock::time_point now) const {
 }
 
 ReasonCode Session::publish(uint16_t packetId, const Message &message) {
-    if (message.qos == QoS::QOS_2) {
+    // Tag the message with this session so the fan-out can honour the MQTT 5
+    // No Local option: a subscriber that opted in must not receive its own
+    // publications. Set for every inbound publish; a restored (durable) message
+    // never goes through here, so its originator stays null.
+    Message outgoing = message;
+    outgoing.originSession = this;
+    if (outgoing.qos == QoS::QOS_2) {
         {
             std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
             // A QoS 2 flow is complete only once the client's PUBREL has been
@@ -204,13 +210,13 @@ ReasonCode Session::publish(uint16_t packetId, const Message &message) {
                 return ReasonCode::PACKET_IDENTIFIER_IN_USE;
             }
         }
-        broker->publish(message);
+        broker->publish(outgoing);
         std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
         awaitingPubrel.insert(packetId);
         notifyMutation();
         return ReasonCode::SUCCESS;
     }
-    broker->publish(message);
+    broker->publish(outgoing);
     return ReasonCode::SUCCESS;
 }
 
@@ -385,6 +391,15 @@ void Session::deliver(const std::string &topic, const Message &message) {
         // MQTT-3.3.1-8: when forwarding a live message the retain flag is cleared
         // unless the subscription asked for retain-as-published
         outgoing.retain = false;
+    }
+    // MQTT-3.8.2-3: a subscription with the No Local option set must not
+    // receive messages this same client published. Compare the originator set
+    // on the live fan-out path.
+    if (it != subscriptions.end() && it->second.noLocal &&
+        message.originSession == this) {
+        logDebug("session %s: skipping own message on %s (no local)",
+                 clientId.c_str(), message.topic.c_str());
+        return;
     }
     pushDelivery(outgoing, qos);
 }
