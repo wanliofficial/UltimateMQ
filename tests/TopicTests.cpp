@@ -32,6 +32,21 @@ TEST(TopicTest, Match)
     EXPECT_FALSE(Topic::match("a/b/c", "x/+/c"));
 }
 
+TEST(TopicTest, WildcardsDoNotMatchDollarTopics)
+{
+    // MQTT-4.7.2-1: a wildcard first level must not match a '$' topic.
+    EXPECT_FALSE(Topic::match("$SYS/broker/uptime", "#"));
+    EXPECT_FALSE(Topic::match("$SYS/broker/uptime", "+/broker/uptime"));
+    EXPECT_FALSE(Topic::match("$SYS/broker/uptime", "+/#"));
+    // An explicit '$' first level still matches.
+    EXPECT_TRUE(Topic::match("$SYS/broker/uptime", "$SYS/broker/uptime"));
+    EXPECT_TRUE(Topic::match("$SYS/broker/uptime", "$SYS/#"));
+    EXPECT_TRUE(Topic::match("$SYS/broker/uptime", "$SYS/+/uptime"));
+    // A '$' later in the topic is an ordinary character.
+    EXPECT_TRUE(Topic::match("a/$x", "#"));
+    EXPECT_TRUE(Topic::match("a/$x", "a/+"));
+}
+
 TEST(TopicTest, IsShared)
 {
     EXPECT_TRUE(Topic::isShared("$share/group/topic"));

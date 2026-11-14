@@ -397,6 +397,29 @@ FLOWMQ_MAX_CONNECTIONS=512 ./flowmq   # serve at most 512 clients at a time
 * Disconnecting a client frees a slot for a new one.
 * A non-numeric, negative or zero value aborts startup naming the variable.
 
+#### Restarting on the same port
+
+The listener sets `SO_REUSEADDR`, so a restart (a redeploy, a crash recovery, or
+any quick stop/start) can take the port back **immediately**. Without it, the
+previous instance's sockets linger in `TIME_WAIT` and `bind()` would fail with
+`EADDRINUSE` for up to a minute. A bind failure now also reports the OS error,
+so a genuine conflict (another process already listening) is obvious. This only
+allows reusing ports that are in `TIME_WAIT`; it does not let two live processes
+share the port.
+
+#### Reserved `$` topics
+
+Topics whose first character is `$` (such as `$SYS/...`) are reserved by MQTT
+and are matched according to MQTT-4.7.2-1:
+
+* a subscription whose **first level is a wildcard** (`#`, `+/state`, `+`) does
+  **not** receive those topics, nor their retained messages;
+* a subscription that names the first level explicitly (`$SYS/#`,
+  `$SYS/+/uptime`) does receive them.
+
+A `$` anywhere other than the first character is an ordinary character, so
+`a/$x` still matches `a/+`.
+
 ## Contributing
 
 Please read CONTRIBUTING.md for details on our code of conduct and the process for submitting pull requests.

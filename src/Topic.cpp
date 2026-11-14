@@ -51,6 +51,13 @@ bool Topic::isValid(const std::string &topic) {
 
 // Check if a topic matches a topic filter (supporting wildcards + and #)
 bool Topic::match(const std::string &topic, const std::string &topicFilter) {
+    // MQTT-4.7.2-1: a filter whose first level is a wildcard never matches a
+    // topic whose first character is '$' (reserved for $SYS and similar). Only
+    // an explicit "$..." first level can match such a topic.
+    if (!topic.empty() && topic[0] == '$' && !topicFilter.empty() &&
+        (topicFilter[0] == '#' || topicFilter[0] == '+')) {
+        return false;
+    }
     std::vector<std::string> topicLevels = split(topic);
     std::vector<std::string> filterLevels = split(topicFilter);
 

@@ -23,6 +23,11 @@ std::vector<std::string> Trie::match(const std::string &topic)
     std::vector<std::string> matches;
     std::vector<std::string> topicLevels = Topic::split(topic);
 
+    // MQTT-4.7.2-1: a wildcard at the first level must not match a topic
+    // beginning with '$'. Skipping the wildcard branches at level 0 leaves only
+    // exact (and therefore explicit "$...") first levels able to match.
+    const bool reservedTopic = !topic.empty() && topic[0] == '$';
+
     // Helper function to perform DFS on the trie
     std::function<void(TrieNode *, size_t)> dfs = [&](TrieNode *node, size_t level) {
         if (level == topicLevels.size()) {
@@ -36,6 +41,10 @@ std::vector<std::string> Trie::match(const std::string &topic)
         auto it = node->children.find(topicLevels[level]);
         if (it != node->children.end()) {
             dfs(it->second.get(), level + 1);
+        }
+
+        if (reservedTopic && level == 0) {
+            return;
         }
 
         // Check for '+' wildcard
