@@ -193,12 +193,24 @@ bool Session::isExpired(std::chrono::steady_clock::time_point now) const {
 }
 
 ReasonCode Session::publish(uint16_t packetId, const Message &message) {
-    broker->publish(message);
     if (message.qos == QoS::QOS_2) {
+        {
+            std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
+            // A QoS 2 flow is complete only once the client's PUBREL has been
+            // answered. A second PUBLISH reusing that identifier would start a
+            // flow whose PUBREL could never be paired, so MQTT-3.3.4-1 forbids
+            // it; report PACKET_IDENTIFIER_IN_USE (0x91) without re-routing.
+            if (awaitingPubrel.count(packetId) > 0) {
+                return ReasonCode::PACKET_IDENTIFIER_IN_USE;
+            }
+        }
+        broker->publish(message);
         std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
         awaitingPubrel.insert(packetId);
         notifyMutation();
+        return ReasonCode::SUCCESS;
     }
+    broker->publish(message);
     return ReasonCode::SUCCESS;
 }
 
@@ -215,16 +227,23 @@ ReasonCode Session::pubrec(uint16_t packetId) {
     if (inflightMessages.erase(packetId) > 0) {
         notifyMutation();
         releaseBlocked();
+        return ReasonCode::SUCCESS;
     }
-    return ReasonCode::SUCCESS;
+    // No such outstanding QoS 2 delivery: MQTT-4.3.3-5 expects
+    // PACKET_IDENTIFIER_NOT_FOUND. The PUBREL is still sent so the client can
+    // complete (or abandon) its flow; a client that sent a stale PUBREC simply
+    // gets the matching PUBCOMP below.
+    return ReasonCode::PACKET_IDENTIFIER_NOT_FOUND;
 }
 
 ReasonCode Session::pubrel(uint16_t packetId) {
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
     if (awaitingPubrel.erase(packetId) > 0) {
         notifyMutation();
+        return ReasonCode::SUCCESS;
     }
-    return ReasonCode::SUCCESS;
+    // A PUBREL for an identifier that started no QoS 2 flow (MQTT-4.3.3-5).
+    return ReasonCode::PACKET_IDENTIFIER_NOT_FOUND;
 }
 
 void Session::pubcomp(uint16_t packetId) {

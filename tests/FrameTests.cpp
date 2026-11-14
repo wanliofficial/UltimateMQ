@@ -394,4 +394,31 @@ TEST_F(FrameTest, ParsePublishWithEmptyTopicNameIsAccepted)
     ASSERT_NE(packet.properties.find(PropertyID::TOPIC_ALIAS), packet.properties.end());
 }
 
+TEST_F(FrameTest, SerializePubackWithFailureCodeIsTwoBytesOnMqtt311)
+{
+    // MQTT 3.1.1 PUBACK is strictly packet id + 2 bytes: a non-SUCCESS reason
+    // code must not leak onto the wire (MQTT-3.4.2-1).
+    Frame v4(Version::MQTT311);
+    PubackPacket puback{7, ReasonCode::NOT_AUTHORIZED};
+    EXPECT_EQ(v4.serialize(puback),
+              (std::vector<uint8_t>{0x40, 0x02, 0x00, 0x07}));
+}
+
+TEST_F(FrameTest, SerializePubcompWithFailureCodeIsTwoBytesOnMqtt311)
+{
+    Frame v4(Version::MQTT311);
+    PubcompPacket pubcomp{9, ReasonCode::PACKET_IDENTIFIER_NOT_FOUND};
+    EXPECT_EQ(v4.serialize(pubcomp),
+              (std::vector<uint8_t>{0x70, 0x02, 0x00, 0x09}));
+}
+
+TEST_F(FrameTest, SerializePubackFailureCarriesReasonCodeOnMqtt5)
+{
+    // MQTT 5 adds the reason code plus a (here empty) property section.
+    Frame v5(Version::MQTT5);
+    PubackPacket puback{7, ReasonCode::PACKET_IDENTIFIER_IN_USE};
+    EXPECT_EQ(v5.serialize(puback),
+              (std::vector<uint8_t>{0x40, 0x04, 0x00, 0x07, 0x91, 0x00}));
+}
+
 } // namespace MQTT

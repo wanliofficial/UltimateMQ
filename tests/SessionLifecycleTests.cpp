@@ -255,6 +255,47 @@ TEST_F(SessionLifecycleTest, ResumeResendsPubrecForInboundQos2AwaitingPubrel)
     EXPECT_TRUE(third->resentPubrecs.empty());
 }
 
+TEST_F(SessionLifecycleTest, InboundQos2PacketIdReuseIsRejectedWhileAwaitingPubrel)
+{
+    auto session = std::make_shared<Session>(&broker, "q2reuse");
+    session->connect(session, /*persistent=*/false);
+    test::attach(*session);
+
+    ASSERT_EQ(session->publish(5, Message("q2/reuse", "first", QoS::QOS_2)),
+              ReasonCode::SUCCESS);
+    // A second QoS 2 PUBLISH reusing id 5 before the PUBREL would start a flow
+    // whose PUBREL could never be paired (MQTT-3.3.4-1).
+    EXPECT_EQ(session->publish(5, Message("q2/reuse", "second", QoS::QOS_2)),
+              ReasonCode::PACKET_IDENTIFIER_IN_USE);
+    // A different id is still accepted.
+    EXPECT_EQ(session->publish(6, Message("q2/reuse", "third", QoS::QOS_2)),
+              ReasonCode::SUCCESS);
+    // After the PUBREL the id is free again.
+    EXPECT_EQ(session->pubrel(5), ReasonCode::SUCCESS);
+    EXPECT_EQ(session->publish(5, Message("q2/reuse", "fourth", QoS::QOS_2)),
+              ReasonCode::SUCCESS);
+}
+
+TEST_F(SessionLifecycleTest, SpuriousPubrelReportsPacketIdentifierNotFound)
+{
+    auto session = std::make_shared<Session>(&broker, "q2stray");
+    session->connect(session, /*persistent=*/false);
+    test::attach(*session);
+
+    // No QoS 2 flow ever started with id 42 (MQTT-4.3.3-5).
+    EXPECT_EQ(session->pubrel(42), ReasonCode::PACKET_IDENTIFIER_NOT_FOUND);
+}
+
+TEST_F(SessionLifecycleTest, PubrecWithoutOutstandingDeliveryReportsNotFound)
+{
+    auto session = std::make_shared<Session>(&broker, "q2pubrec");
+    session->connect(session, /*persistent=*/false);
+    test::attach(*session);
+
+    // Nothing was delivered under id 77, so the PUBREC is stale (MQTT-4.3.3-5).
+    EXPECT_EQ(session->pubrec(77), ReasonCode::PACKET_IDENTIFIER_NOT_FOUND);
+}
+
 TEST_F(SessionLifecycleTest, ResumeResendsEveryPendingInboundQos2Pubrec)
 {
     auto session = std::make_shared<Session>(&broker, "q2multi");

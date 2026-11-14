@@ -1039,11 +1039,14 @@ std::vector<uint8_t> Frame::serializePuback(const PubackPacket &packet) {
     std::vector<uint8_t> buffer;
     buffer.push_back(static_cast<uint8_t>(PacketType::PUBACK) << 4);
     // Calculate remaining length
+    // MQTT 3.1.1 acks are exactly a packet identifier: no reason code and no
+    // property section (MQTT-3.4.2-1, 3.5.2, 3.6.2, 3.7.2).
+    const bool isV5 = version == Version::MQTT5;
     uint32_t remainingLength = 2; // Packet Identifier (2 bytes)
-    if (packet.reasonCode != ReasonCode::SUCCESS) {
-        remainingLength += 1; // Reason Code (1 byte)
-    }
-    if (version == Version::MQTT5) {
+    if (isV5) {
+        if (packet.reasonCode != ReasonCode::SUCCESS) {
+            remainingLength += 1; // Reason Code (1 byte)
+        }
         remainingLength += 1; // Property Length
     }
 
@@ -1055,12 +1058,12 @@ std::vector<uint8_t> Frame::serializePuback(const PubackPacket &packet) {
     buffer.push_back((packet.packetId >> 8) & 0xFF);
     buffer.push_back(packet.packetId & 0xFF);
 
-    // Serialize Reason Code if not SUCCESS
-    if (packet.reasonCode != ReasonCode::SUCCESS) {
-        buffer.push_back(static_cast<uint8_t>(packet.reasonCode));
-    }
-    // Serialize properties (MQTT 5 only, no properties are emitted)
-    if (version == Version::MQTT5) {
+    // Serialize Reason Code if not SUCCESS (MQTT 5 only)
+    if (isV5) {
+        if (packet.reasonCode != ReasonCode::SUCCESS) {
+            buffer.push_back(static_cast<uint8_t>(packet.reasonCode));
+        }
+        // No properties are emitted
         buffer.push_back(0); // Property Length
     }
     return buffer;
@@ -1070,11 +1073,14 @@ std::vector<uint8_t> Frame::serializePubrec(const PubrecPacket &packet) {
     std::vector<uint8_t> buffer;
     buffer.push_back(static_cast<uint8_t>(PacketType::PUBREC) << 4);
     // Calculate remaining length
+    // MQTT 3.1.1 acks are exactly a packet identifier: no reason code and no
+    // property section (MQTT-3.4.2-1, 3.5.2, 3.6.2, 3.7.2).
+    const bool isV5 = version == Version::MQTT5;
     uint32_t remainingLength = 2; // Packet Identifier (2 bytes)
-    if (packet.reasonCode != ReasonCode::SUCCESS) {
-        remainingLength += 1; // Reason Code (1 byte)
-    }
-    if (version == Version::MQTT5) {
+    if (isV5) {
+        if (packet.reasonCode != ReasonCode::SUCCESS) {
+            remainingLength += 1; // Reason Code (1 byte)
+        }
         remainingLength += 1; // Property Length
     }
 
@@ -1086,12 +1092,12 @@ std::vector<uint8_t> Frame::serializePubrec(const PubrecPacket &packet) {
     buffer.push_back((packet.packetId >> 8) & 0xFF);
     buffer.push_back(packet.packetId & 0xFF);
 
-    // Serialize Reason Code if not SUCCESS
-    if (packet.reasonCode != ReasonCode::SUCCESS) {
-        buffer.push_back(static_cast<uint8_t>(packet.reasonCode));
-    }
-    // Serialize properties (MQTT 5 only, no properties are emitted)
-    if (version == Version::MQTT5) {
+    // Serialize Reason Code if not SUCCESS (MQTT 5 only)
+    if (isV5) {
+        if (packet.reasonCode != ReasonCode::SUCCESS) {
+            buffer.push_back(static_cast<uint8_t>(packet.reasonCode));
+        }
+        // No properties are emitted
         buffer.push_back(0); // Property Length
     }
     return buffer;
@@ -1101,11 +1107,14 @@ std::vector<uint8_t> Frame::serializePubrel(const PubrelPacket &packet) {
     std::vector<uint8_t> buffer;
     buffer.push_back((static_cast<uint8_t>(PacketType::PUBREL) << 4) | 0x02);
     // Calculate remaining length
+    // MQTT 3.1.1 acks are exactly a packet identifier: no reason code and no
+    // property section (MQTT-3.4.2-1, 3.5.2, 3.6.2, 3.7.2).
+    const bool isV5 = version == Version::MQTT5;
     uint32_t remainingLength = 2; // Packet Identifier (2 bytes)
-    if (packet.reasonCode != ReasonCode::SUCCESS) {
-        remainingLength += 1; // Reason Code (1 byte)
-    }
-    if (version == Version::MQTT5) {
+    if (isV5) {
+        if (packet.reasonCode != ReasonCode::SUCCESS) {
+            remainingLength += 1; // Reason Code (1 byte)
+        }
         remainingLength += 1; // Property Length
     }
 
@@ -1117,12 +1126,12 @@ std::vector<uint8_t> Frame::serializePubrel(const PubrelPacket &packet) {
     buffer.push_back((packet.packetId >> 8) & 0xFF);
     buffer.push_back(packet.packetId & 0xFF);
 
-    // Serialize Reason Code if not SUCCESS
-    if (packet.reasonCode != ReasonCode::SUCCESS) {
-        buffer.push_back(static_cast<uint8_t>(packet.reasonCode));
-    }
-    // Serialize properties (MQTT 5 only, no properties are emitted)
-    if (version == Version::MQTT5) {
+    // Serialize Reason Code if not SUCCESS (MQTT 5 only)
+    if (isV5) {
+        if (packet.reasonCode != ReasonCode::SUCCESS) {
+            buffer.push_back(static_cast<uint8_t>(packet.reasonCode));
+        }
+        // No properties are emitted
         buffer.push_back(0); // Property Length
     }
     return buffer;
@@ -1132,11 +1141,14 @@ std::vector<uint8_t> Frame::serializePubcomp(const PubcompPacket &packet) {
     std::vector<uint8_t> buffer;
     buffer.push_back(static_cast<uint8_t>(PacketType::PUBCOMP) << 4);
     // Calculate remaining length
+    // MQTT 3.1.1 acks are exactly a packet identifier: no reason code and no
+    // property section (MQTT-3.4.2-1, 3.5.2, 3.6.2, 3.7.2).
+    const bool isV5 = version == Version::MQTT5;
     uint32_t remainingLength = 2; // Packet Identifier (2 bytes)
-    if (packet.reasonCode != ReasonCode::SUCCESS) {
-        remainingLength += 1; // Reason Code (1 byte)
-    }
-    if (version == Version::MQTT5) {
+    if (isV5) {
+        if (packet.reasonCode != ReasonCode::SUCCESS) {
+            remainingLength += 1; // Reason Code (1 byte)
+        }
         remainingLength += 1; // Property Length
     }
 
@@ -1148,12 +1160,12 @@ std::vector<uint8_t> Frame::serializePubcomp(const PubcompPacket &packet) {
     buffer.push_back((packet.packetId >> 8) & 0xFF);
     buffer.push_back(packet.packetId & 0xFF);
 
-    // Serialize Reason Code if not SUCCESS
-    if (packet.reasonCode != ReasonCode::SUCCESS) {
-        buffer.push_back(static_cast<uint8_t>(packet.reasonCode));
-    }
-    // Serialize properties (MQTT 5 only, no properties are emitted)
-    if (version == Version::MQTT5) {
+    // Serialize Reason Code if not SUCCESS (MQTT 5 only)
+    if (isV5) {
+        if (packet.reasonCode != ReasonCode::SUCCESS) {
+            buffer.push_back(static_cast<uint8_t>(packet.reasonCode));
+        }
+        // No properties are emitted
         buffer.push_back(0); // Property Length
     }
     return buffer;

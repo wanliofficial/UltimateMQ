@@ -124,6 +124,24 @@ QoS 0 messages are at-most-once and are not persisted. The offline queue of a
 session is not stored separately: QoS>0 messages already live in its
 unacknowledged set and are re-queued on reconnect, which avoids duplicates.
 
+#### Inbound QoS 2 packet identifiers
+
+An in-flight QoS 2 flow is tied to its packet identifier until the client's
+`PUBREL` has been answered, and the broker reports the problems MQTT defines
+instead of silently accepting them (MQTT-3.3.4-1, MQTT-4.3.3-5):
+
+* a second `PUBLISH` reusing an identifier whose flow has not completed is
+  answered with `PUBREC` `PACKET_IDENTIFIER_IN_USE` (`0x91`) and is **not**
+  routed — otherwise its `PUBREL` would have no counterpart;
+* a `PUBREL` for an identifier that started no flow, and a `PUBREC` for an
+  outstanding delivery that does not exist, are answered with
+  `PACKET_IDENTIFIER_NOT_FOUND` (`0x92`). The connection stays open, so a
+  client that lost track of its state can recover.
+
+MQTT 3.1.1 acks (`PUBACK`, `PUBREC`, `PUBREL`, `PUBCOMP`) are always exactly a
+packet identifier — two bytes of body, with no reason code and no property
+section — whatever the broker's outcome was.
+
 #### Session expiry on disconnect (MQTT 5)
 
 A persistent session is normally kept when its connection ends so it can be
