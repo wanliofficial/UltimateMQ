@@ -184,7 +184,18 @@ void Connection::setDisconnectCallback(std::function<void()> callback) {
     disconnectCallback = std::move(callback);
 }
 
-void Connection::onSuperseded() {
+void Connection::onSuperseded(Version version) {
+    // Tell an MQTT 5 client why it is being disconnected (MQTT-3.1.4-3). A 3.1.1
+    // connection has no DISCONNECT reason, so it is simply closed.
+    if (version == Version::MQTT5 && state == State::CONNECTED) {
+        try {
+            DisconnectPacket disconnect{ReasonCode::SESSION_TAKEN_OVER};
+            sendPacket(disconnect);
+        } catch (const std::exception &e) {
+            // The peer may already be gone; the takeover still proceeds.
+            logDebug("superseded connection could not be notified: %s", e.what());
+        }
+    }
     // Another connection now owns the session: stop touching it and shut down.
     // The session itself is left intact so it can be resumed by the new client.
     {
@@ -192,6 +203,10 @@ void Connection::onSuperseded() {
         session.reset();
         connected = false;
     }
+    // The superseded connection must not publish its Will (MQTT-3.1.4-3): the
+    // client has not died, it has moved to a new connection, which carries its
+    // own Will. Publishing here would report a false disconnect to subscribers.
+    willPending = false;
     state = State::DISCONNECTED;
 }
 
@@ -415,7 +430,7 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     // alive through the shared_ptr it receives here. resume() also retransmits
     // the unacknowledged QoS>0 messages of a resumed session.
     if (resumed) {
-        sessionToUse->resume(shared_from_this());
+        sessionToUse->resume(shared_from_this(), frame.getVersion());
         sessionToUse->flush();
     } else {
         sessionToUse->bindClient(shared_from_this());

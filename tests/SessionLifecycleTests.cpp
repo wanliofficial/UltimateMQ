@@ -104,7 +104,7 @@ TEST_F(SessionLifecycleTest, ResumeCancelsPendingExpiry)
 
     // Simulate a reconnect
     auto newClient = test::attach(*session);
-    session->resume(newClient);
+    session->resume(newClient, Version::MQTT5);
 
     auto future = std::chrono::steady_clock::now() + std::chrono::seconds(120);
     EXPECT_FALSE(session->isExpired(future));
@@ -175,7 +175,7 @@ TEST_F(SessionLifecycleTest, ExpiredQueuedMessageIsNotFlushed)
 
     // Reconnect with a new client and drain the queue
     auto live = std::make_shared<RecordingClient>();
-    session->resume(live);
+    session->resume(live, Version::MQTT5);
     session->flush();
 
     ASSERT_EQ(live->size(), 1u);
@@ -212,7 +212,7 @@ TEST_F(SessionLifecycleTest, ResumeRetransmitsUnackedMessagesWithDup)
 
     // Reconnect: the message is retransmitted with the same packet id, DUP=1
     auto second = std::make_shared<RecordingClient>();
-    session->resume(second);
+    session->resume(second, Version::MQTT5);
     session->flush();
 
     ASSERT_EQ(second->size(), 1u);
@@ -222,7 +222,7 @@ TEST_F(SessionLifecycleTest, ResumeRetransmitsUnackedMessagesWithDup)
     // Once acknowledged it is not retransmitted again
     session->puback(packetId);
     auto third = std::make_shared<RecordingClient>();
-    session->resume(third);
+    session->resume(third, Version::MQTT5);
     session->flush();
     EXPECT_EQ(third->size(), 0u);
 }
@@ -245,13 +245,13 @@ TEST_F(SessionLifecycleTest, ResumeResendsPubrecForInboundQos2AwaitingPubrel)
     // On reconnect the broker must resend the PUBREC so the client can complete
     // the flow with its PUBREL, using the original packet id.
     auto second = std::make_shared<RecordingClient>();
-    session->resume(second);
+    session->resume(second, Version::MQTT5);
     EXPECT_EQ(second->resentPubrecs, (std::vector<uint16_t>{7}));
 
     // Once the client's PUBREL is received the flow is done and nothing is resent
     session->pubrel(7);
     auto third = std::make_shared<RecordingClient>();
-    session->resume(third);
+    session->resume(third, Version::MQTT5);
     EXPECT_TRUE(third->resentPubrecs.empty());
 }
 
@@ -306,7 +306,7 @@ TEST_F(SessionLifecycleTest, ResumeResendsEveryPendingInboundQos2Pubrec)
     session->publish(9, Message("q/t", "b", QoS::QOS_2));
 
     auto second = std::make_shared<RecordingClient>();
-    session->resume(second);
+    session->resume(second, Version::MQTT5);
     std::vector<uint16_t> expected{3, 9};
     EXPECT_EQ(second->resentPubrecs, expected);
 }
@@ -318,7 +318,7 @@ TEST_F(SessionLifecycleTest, ResumeStopsThePreviousClient)
     auto first = test::attach(*session);
 
     auto second = std::make_shared<RecordingClient>();
-    session->resume(second);
+    session->resume(second, Version::MQTT5);
 
     EXPECT_EQ(first->superseded.load(), 1);
 }
@@ -330,7 +330,7 @@ TEST_F(SessionLifecycleTest, StaleCloseDoesNotTearDownResumedSession)
     auto first = test::attach(*session);
 
     auto second = std::make_shared<RecordingClient>();
-    session->resume(second);
+    session->resume(second, Version::MQTT5);
 
     // The old connection finishing late must not unregister the live session
     session->close(first);
@@ -383,7 +383,7 @@ TEST_F(SessionLifecycleTest, PersistentSessionBuffersMessagesWhileOffline)
     broker.publish(Message("o/t", "buffered"));
 
     auto second = std::make_shared<RecordingClient>();
-    session->resume(second);
+    session->resume(second, Version::MQTT5);
     session->flush();
 
     ASSERT_EQ(second->size(), 1u);

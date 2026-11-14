@@ -65,7 +65,7 @@ public:
     //! Client interface: resend a PUBREC for an inbound QoS 2 flow awaiting PUBREL
     void sendPubrec(uint16_t packetId) override;
     //! Client interface: a newer connection has taken over this session; stop using it
-    void onSuperseded() override;
+    void onSuperseded(Version version) override;
     void handleDeliver(const Message& message, uint16_t packetId, QoS qos);
     void sendPacket(Packet &packet);
 

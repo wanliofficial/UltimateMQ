@@ -22,7 +22,7 @@ public:
         resentPubrecs.push_back(packetId);
     }
 
-    void onSuperseded() override { superseded++; }
+    void onSuperseded(Version version) override { (void)version; superseded++; }
 
     size_t size() {
         std::lock_guard<std::mutex> lock(mutex);

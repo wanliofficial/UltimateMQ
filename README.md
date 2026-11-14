@@ -420,6 +420,25 @@ and are matched according to MQTT-4.7.2-1:
 A `$` anywhere other than the first character is an ordinary character, so
 `a/$x` still matches `a/+`.
 
+#### Session takeover
+
+A `CONNECT` with `cleanStart=false` for a client id whose session is still held
+**takes it over** (MQTT-3.1.4-1): the new connection becomes the session's live
+client and the previous one is detached, so two connections can never interleave
+writes on one session. (With `cleanStart=true` the old session is simply
+discarded instead.) The hand-over follows MQTT-3.1.4-3:
+
+* the displaced connection is shut down — an MQTT 5 client receives
+  `DISCONNECT` `SESSION_TAKEN_OVER` (`0x8E`); MQTT 3.1.1 has no such reason and
+  is just closed;
+* the displaced connection's **Will message is discarded** — the client has not
+  died, it has moved, and publishing its Will would report a false disconnect to
+  subscribers (a genuine drop still publishes it);
+* a `cleanStart=false` connect with the same client id resumes the session: its
+  subscriptions, unacknowledged QoS 1/2 messages and any inbound QoS 2 flow
+  awaiting a `PUBREL` carry over to the new connection;
+* a `cleanStart=true` connect starts a fresh session and drops the old state.
+
 ## Contributing
 
 Please read CONTRIBUTING.md for details on our code of conduct and the process for submitting pull requests.

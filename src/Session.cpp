@@ -311,7 +311,7 @@ void Session::bindClient(const std::shared_ptr<Client>& client) {
     pendingDeliveries.clear();
 }
 
-void Session::resume(const std::shared_ptr<Client>& client) {
+void Session::resume(const std::shared_ptr<Client>& client, Version protocolVersion) {
     std::shared_ptr<Client> previous;
     std::vector<uint16_t> awaitingRel;
     {
@@ -342,7 +342,7 @@ void Session::resume(const std::shared_ptr<Client>& client) {
     }
     if (previous) {
         // Tell the connection that lost the session to release it
-        previous->onSuperseded();
+        previous->onSuperseded(protocolVersion);
     }
     for (uint16_t id : awaitingRel) {
         client->sendPubrec(id);

@@ -41,8 +41,10 @@ public:
     //! handshake instead of starting the QoS 2 flow over.
     virtual void sendPubrec(uint16_t packetId) = 0;
     //! Called when a newer connection takes over this session; the receiver must
-    //! stop using the session and release it
-    virtual void onSuperseded() = 0;
+    //! stop using the session and release it. \p version is the MQTT version of
+    //! the session being handed over, so a protocol-aware client can tell its
+    //! peer why it was disconnected.
+    virtual void onSuperseded(Version version) = 0;
 };
 
 class Session : public std::enable_shared_from_this<Session> {
@@ -85,7 +87,10 @@ public:
     void bindClient(const std::shared_ptr<Client>& client);
     //! Rebind a persistent session to a new connection and retransmit the
     //! unacknowledged QoS>0 messages it still holds
-    void resume(const std::shared_ptr<Client>& client);
+    //! Bind \p client as the live client, retransmitting anything outstanding.
+    //! \p protocolVersion is the version the new connection negotiated, used to
+    //! tell a superseded connection how to report the takeover.
+    void resume(const std::shared_ptr<Client>& client, Version protocolVersion);
     void setDisconnectCallback(std::function<void()> callback);
 
     //! The username this session authenticated with (empty for anonymous / auth-disabled)
