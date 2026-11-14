@@ -38,6 +38,7 @@ All configuration is read from environment variables at startup.
 | `FLOWMQ_WRITE_TIMEOUT_MS` | `5000` (5 s) | How long a single write may make no progress before the connection is dropped (bounds a stalled reader) |
 | `FLOWMQ_MAX_SUBSCRIPTIONS` | `1024` | Maximum number of topic filters a single session may hold; further filters are rejected |
 | `FLOWMQ_MAX_PUBLISH_RATE` | unlimited | Per-client inbound `PUBLISH` rate in messages/second; a publisher that exceeds it is disconnected |
+| `FLOWMQ_SERVER_KEEP_ALIVE` | unset | Preferred keep alive in seconds; MQTT 5 clients asking for more (or for none) are told this value in CONNACK |
 | `FLOWMQ_MAX_CONNECTIONS` | `1024` | Maximum number of simultaneous client connections; further connections are accepted then closed |
 | `FLOWMQ_TLS_CERT` | unset | Server certificate (PEM); enables TLS when set together with `FLOWMQ_TLS_KEY` |
 | `FLOWMQ_TLS_KEY` | unset | Private key (PEM) matching `FLOWMQ_TLS_CERT` |
@@ -300,6 +301,31 @@ FLOWMQ_MAX_PUBLISH_RATE=500 ./flowmq   # at most 500 messages/second per client
 * Other clients are unaffected: the limit applies per connection and resets on
   reconnect.
 * A non-numeric, negative or zero value aborts startup naming the variable.
+
+#### Server keep alive (`FLOWMQ_SERVER_KEEP_ALIVE`)
+
+The keep alive is a client promise: "I will send something at least this often,
+otherwise consider me dead". The broker reaps a connection after 1.5 times the
+promised interval, but a client is free to ask for `0`, meaning *no* keep alive,
+and such a connection is **never** reaped — a crashed client can hold a socket
+and a thread indefinitely. `FLOWMQ_SERVER_KEEP_ALIVE` lets the broker impose its
+own value.
+
+```bash
+FLOWMQ_SERVER_KEEP_ALIVE=60 ./flowmq   # no client may idle longer than 60 s
+```
+
+* Unset by default, which keeps the historical behaviour of honouring exactly
+  what the client asked for.
+* When set, an MQTT 5 client that asks for **more** than this value, or for
+  `0`, is answered with the `Server Keep Alive` CONNACK property and must use
+  the broker's value instead (MQTT-3.1.2-21). The broker then reaps the
+  connection at 1.5x the override.
+* A client asking for **less** than the broker's preference is left alone: a
+  shorter promise is already stricter, and the broker never loosens it.
+* MQTT 3.1.1 has no property section, so 3.1.1 clients keep their own value.
+* A non-numeric, negative, zero or greater-than-`65535` value aborts startup
+  naming the variable.
 
 #### Connection limit (`FLOWMQ_MAX_CONNECTIONS`)
 

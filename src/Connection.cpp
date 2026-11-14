@@ -285,6 +285,11 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
         username = *connect->username;
     }
 
+    // Keep alive: normally the client's value, but the broker may prefer a
+    // shorter (or finite) one. MQTT 5 lets the server override it through the
+    // Server Keep Alive CONNACK property (MQTT-3.1.2-21); the client must then
+    // use that value, and 3.1.1 clients are unaffected. Without this, a client
+    // asking for 0 would leave its connection un-reaped forever.
     keepAliveSeconds = connect->keepAlive;
     armKeepAliveTimer();
 
@@ -344,6 +349,15 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
         // (MQTT-3.1.2-26). Advertising it is what makes alias-only PUBLISHes
         // legal; the mapping itself is tracked per connection below.
         connack.properties[PropertyID::TOPIC_ALIAS_MAXIMUM] = TOPIC_ALIAS_MAXIMUM;
+        // A preferred keep alive caps how long a dead connection lingers: a
+        // client that asked for more (or for none, which would otherwise never
+        // be reaped) is told the broker's value and must use it (MQTT-3.1.2-21).
+        const uint16_t preferred = broker ? broker->getServerKeepAlive() : 0;
+        if (preferred != 0 && (keepAliveSeconds == 0 || keepAliveSeconds > preferred)) {
+            keepAliveSeconds = preferred;
+            armKeepAliveTimer();
+            connack.properties[PropertyID::SERVER_KEEP_ALIVE] = preferred;
+        }
         // Apply the client's Receive Maximum (MQTT-3.1.2-10 / 4.9): it caps how
         // many QoS 1/2 messages the broker keeps outstanding to this client. A
         // value of 0 is a protocol violation and the broker must close the

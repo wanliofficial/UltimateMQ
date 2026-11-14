@@ -62,6 +62,12 @@ class Broker {
     //! cannot saturate the broker's fan-out path with an unbounded burst.
     size_t maxPublishRate = 0;
 
+    //! Keep alive the broker prefers, in seconds. 0 disables the override and
+    //! the broker honours whatever the client asks for. When set, a client that
+    //! asks for more (or for none) is told to use this value via the MQTT 5
+    //! Server Keep Alive property, so dead connections are always reaped.
+    uint16_t serverKeepAlive = 0;
+
     //! Resolve the target sessions; called with the broker lock held
     void collectTargets(const Message &message, std::vector<std::shared_ptr<Session>> &targets);
 
@@ -97,6 +103,11 @@ public:
     //! unlimited, the default). Must be set before any client connects.
     void setMaxPublishRate(size_t rate) { maxPublishRate = rate; }
     size_t getMaxPublishRate() const { return maxPublishRate; }
+
+    //! Configure the keep alive the broker prefers (seconds; 0 keeps the
+    //! client's own value). Must be set before any client connects.
+    void setServerKeepAlive(uint16_t seconds) { serverKeepAlive = seconds; }
+    uint16_t getServerKeepAlive() const { return serverKeepAlive; }
     //! Flag the durable state as changed (cheap: a single atomic store)
     void notifyStateChanged() {
         if (store) {

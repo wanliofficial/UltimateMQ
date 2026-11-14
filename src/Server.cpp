@@ -163,6 +163,25 @@ Server::Server(int port, size_t maxConnections)
         logInfo("max publish rate per client: %zu msg/s", broker->getMaxPublishRate());
     }
 
+    // Preferred keep alive (opt-in). Without it a client may ask for 0 (no
+    // keep alive) and its dead connection would never be reaped. When set,
+    // MQTT 5 clients that ask for more (or for none) are told the broker's
+    // value through the Server Keep Alive property.
+    const char* serverKeepAlive = getenv("FLOWMQ_SERVER_KEEP_ALIVE");
+    if (serverKeepAlive && *serverKeepAlive) {
+        char* end = nullptr;
+        unsigned long long parsed = std::strtoull(serverKeepAlive, &end, 10);
+        if (end == serverKeepAlive || *end != '\0' || *serverKeepAlive == '-' ||
+            parsed == 0 || parsed > 65535) {
+            delete broker;
+            broker = nullptr;
+            throw std::runtime_error(std::string("invalid FLOWMQ_SERVER_KEEP_ALIVE: ") +
+                                     serverKeepAlive);
+        }
+        broker->setServerKeepAlive(static_cast<uint16_t>(parsed));
+        logInfo("server keep alive: %u s", broker->getServerKeepAlive());
+    }
+
     if (store->enabled()) {
         PersistedState persisted;
         std::string loadError;
