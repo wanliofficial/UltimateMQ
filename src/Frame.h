@@ -16,15 +16,24 @@ class Frame {
     bool headerComplete = false;
     size_t remainingLengthBytes = 0;
     size_t remainingLength = 0;
+    //! Upper bound for one packet's Remaining Length; enforced in feed()
+    size_t maxPacketSize = DEFAULT_MAX_PACKET_SIZE;
 
 public:
     static constexpr size_t MAX_MULTIPLIER = 128 * 128 * 128;
     static constexpr size_t MAX_LENGTH = 268435455; 
+    //! Default cap on a single packet's Remaining Length (1 MiB). Bounds the
+    //! per-connection buffering so a client cannot declare a 256 MiB packet and
+    //! stall the broker by dribbling it out one byte at a time.
+    static constexpr size_t DEFAULT_MAX_PACKET_SIZE = 1024 * 1024;
     Frame() = default;
     Frame(Version version) : version(version) {}
 
     void setVersion(Version version) { this->version = version; }
     Version getVersion() const { return version; }
+    //! Configure the largest Remaining Length this frame will buffer
+    void setMaxPacketSize(size_t size) { maxPacketSize = size; }
+    size_t getMaxPacketSize() const { return maxPacketSize; }
 
     // Parse MQTT packets
     std::shared_ptr<Packet> parse(const uint8_t *buffer, size_t length);

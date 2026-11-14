@@ -81,6 +81,23 @@ Server::Server(int port, size_t maxConnections)
 
     broker = new Broker(auth.get(), store.get());
 
+    // Maximum packet size (opt-in). Bounds per-connection buffering so a client
+    // cannot stall the broker with a huge packet. The default keeps historical
+    // behaviour; only raise it when the deployment needs large payloads.
+    const char* maxPacketSize = getenv("FLOWMQ_MAX_PACKET_SIZE");
+    if (maxPacketSize && *maxPacketSize) {
+        char* end = nullptr;
+        unsigned long long parsed = std::strtoull(maxPacketSize, &end, 10);
+        if (end == maxPacketSize || *end != '\0' || parsed == 0) {
+            delete broker;
+            broker = nullptr;
+            throw std::runtime_error(std::string("invalid FLOWMQ_MAX_PACKET_SIZE: ") +
+                                     maxPacketSize);
+        }
+        broker->setMaxPacketSize(static_cast<size_t>(parsed));
+        logInfo("max packet size: %zu bytes", broker->getMaxPacketSize());
+    }
+
     if (store->enabled()) {
         PersistedState persisted;
         std::string loadError;

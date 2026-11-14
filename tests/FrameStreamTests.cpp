@@ -85,4 +85,63 @@ TEST_F(FrameStreamTest, ResetDropsPartialPacket)
     EXPECT_TRUE(frame.isComplete());
 }
 
+TEST_F(FrameStreamTest, DefaultMaxPacketSizeIsOneMebibyte)
+{
+    EXPECT_EQ(frame.getMaxPacketSize(), Frame::DEFAULT_MAX_PACKET_SIZE);
+    EXPECT_EQ(Frame::DEFAULT_MAX_PACKET_SIZE, 1024u * 1024u);
+}
+
+TEST_F(FrameStreamTest, AcceptsPacketAtTheMaximumSize)
+{
+    // A tiny limit so the boundary is cheap to exercise
+    frame.setMaxPacketSize(8);
+    // PUBLISH (qos0), topic "a": variable header is 3 bytes, so a Remaining
+    // Length of 8 is exactly at the limit and must be accepted.
+    std::vector<uint8_t> header = {0x30, 0x08, 0x00, 0x01, 'a', '1', '2', '3', '4', '5'};
+    EXPECT_NO_THROW(frame.feed(header.data(), header.size()));
+    EXPECT_TRUE(frame.isComplete());
+}
+
+TEST_F(FrameStreamTest, RejectsPacketAboveTheMaximumSize)
+{
+    frame.setMaxPacketSize(8);
+    // PUBLISH header advertising a Remaining Length of 9, one over the limit.
+    // feed() must refuse it as soon as the length is known, before any body byte.
+    std::vector<uint8_t> header = {0x30, 0x09};
+    EXPECT_THROW(frame.feed(header.data(), header.size()), std::runtime_error);
+}
+
+TEST_F(FrameStreamTest, RejectsBeforeBufferingTheBody)
+{
+    frame.setMaxPacketSize(4);
+    // Advertise a large Remaining Length, then dribble a single body byte. The
+    // throw must happen on the length field, so the body byte is never consumed
+    // and only the two header bytes were buffered.
+    std::vector<uint8_t> data = {0x30, 0x7F, 0x00};
+    EXPECT_THROW(frame.feed(data.data(), data.size()), std::runtime_error);
+    EXPECT_EQ(frame.feed(data.data(), 0), 0u);
+}
+
+TEST_F(FrameStreamTest, LimitAppliesBeforeTheLengthIsFullyDecoded)
+{
+    // A multi-byte Remaining Length (0x80 0x01 = 128) must be checked once the
+    // field is complete, not byte by byte along the way.
+    frame.setMaxPacketSize(64);
+    std::vector<uint8_t> data = {0x30, 0x80, 0x01};
+    EXPECT_THROW(frame.feed(data.data(), data.size()), std::runtime_error);
+}
+
+TEST_F(FrameStreamTest, RaisingTheLimitAcceptsLargerPackets)
+{
+    // The boundary test's 9-byte packet is refused at limit 8...
+    frame.setMaxPacketSize(8);
+    EXPECT_THROW(frame.feed(std::vector<uint8_t>{0x30, 0x09}.data(), 2), std::runtime_error);
+    // ...and accepted once the limit is raised. The header is re-fed after reset.
+    frame.reset();
+    frame.setMaxPacketSize(9);
+    std::vector<uint8_t> header = {0x30, 0x09, 0x00, 0x01, 'a', '1', '2', '3', '4', '5', '6'};
+    EXPECT_NO_THROW(frame.feed(header.data(), header.size()));
+    EXPECT_TRUE(frame.isComplete());
+}
+
 } // namespace MQTT

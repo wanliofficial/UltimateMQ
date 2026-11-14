@@ -34,6 +34,7 @@ All configuration is read from environment variables at startup.
 | `FLOWMQ_PASSWORD_FILE` | unset | User database; enables authentication when present |
 | `FLOWMQ_ACL_FILE` | unset | Per-user topic access rules; enables ACL enforcement when present |
 | `FLOWMQ_STATE_FILE` | unset | Durable state file; retained messages and persistent sessions survive a restart when set |
+| `FLOWMQ_MAX_PACKET_SIZE` | `1048576` (1 MiB) | Largest Remaining Length accepted from a single client, in bytes; also advertised to MQTT 5 clients |
 | `FLOWMQ_TLS_CERT` | unset | Server certificate (PEM); enables TLS when set together with `FLOWMQ_TLS_KEY` |
 | `FLOWMQ_TLS_KEY` | unset | Private key (PEM) matching `FLOWMQ_TLS_CERT` |
 | `FLOWMQ_TLS_CA` | unset | CA bundle used to verify client certificates |
@@ -123,6 +124,26 @@ FLOWMQ_PASSWORD_FILE=/etc/flowmq/users.txt \
 * Set `FLOWMQ_TLS_VERIFY_CLIENTS` together with `FLOWMQ_TLS_CA` to also require
   a client certificate signed by that CA (mutual TLS). A client without a valid
   certificate is dropped at the handshake.
+
+#### Maximum packet size (`FLOWMQ_MAX_PACKET_SIZE`)
+
+A client can declare any Remaining Length up to 256 MiB in an MQTT header. Without
+a cap the broker would buffer that declaration for a client that dribbles the body
+out (or never finishes), so one connection can be made to pin a large amount of
+memory. `FLOWMQ_MAX_PACKET_SIZE` bounds this: as soon as a packet's Remaining
+Length is read and found to exceed the limit, the connection is dropped before any
+body byte is buffered.
+
+```bash
+FLOWMQ_MAX_PACKET_SIZE=8388608 ./flowmq   # allow up to 8 MiB per packet
+```
+
+* The limit defaults to 1 MiB, which comfortably covers normal telemetry.
+* The limit is applied to every packet, including the first `CONNECT`.
+* MQTT 5 clients are told the value through the `Maximum Packet Size` CONNACK
+  property, so well-behaved clients keep their own packets within it. MQTT 3.1.1
+  has no property section and is simply enforced on the wire.
+* A non-numeric or zero value aborts startup with an error naming the variable.
 
 ## Contributing
 

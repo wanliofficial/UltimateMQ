@@ -249,6 +249,27 @@ TEST_F(FrameTest, SerializeConnackForMqtt5KeepsV5ReasonCode)
     EXPECT_EQ(v5.serialize(badCredentials), (std::vector<uint8_t>{0x20, 0x02, 0x00, 0x86}));
 }
 
+TEST_F(FrameTest, SerializeConnackForMqtt5AdvertisesMaximumPacketSize)
+{
+    Frame v5(Version::MQTT5);
+    ConnackPacket connack(false, ReasonCode::SUCCESS);
+    connack.properties[PropertyID::MAXIMUM_PACKET_SIZE] = static_cast<uint32_t>(1024 * 1024);
+    // 0x20, remaining length 8, flags 0, reason 0, property length 5,
+    // property id 0x27, then the 4-byte big-endian value 0x00100000.
+    EXPECT_EQ(v5.serialize(connack),
+              (std::vector<uint8_t>{0x20, 0x08, 0x00, 0x00, 0x05, 0x27,
+                                    0x00, 0x10, 0x00, 0x00}));
+}
+
+TEST_F(FrameTest, SerializeConnackForMqtt311IgnoresProperties)
+{
+    Frame v4(Version::MQTT311);
+    ConnackPacket connack(false, ReasonCode::SUCCESS);
+    connack.properties[PropertyID::MAXIMUM_PACKET_SIZE] = static_cast<uint32_t>(1024 * 1024);
+    // MQTT 3.1.1 has no property section, so it is dropped entirely.
+    EXPECT_EQ(v4.serialize(connack), (std::vector<uint8_t>{0x20, 0x02, 0x00, 0x00}));
+}
+
 TEST_F(FrameTest, SerializePublishForMqtt311HasNoProperties)
 {
     Frame v4(Version::MQTT311);

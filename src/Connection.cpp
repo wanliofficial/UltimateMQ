@@ -29,7 +29,11 @@ Connection::Connection(int sockfd, Broker* broker, std::shared_ptr<TlsContext> t
     : sockfd(sockfd), state(State::IDLE), broker(broker),
       auth(broker ? broker->getAuth() : nullptr),
       transport(std::make_unique<SecureTransport>(sockfd, std::move(tls))),
-      lastActivity(std::chrono::steady_clock::now()) { }
+      lastActivity(std::chrono::steady_clock::now()) {
+    // Cap the packet size before any byte (including the first CONNECT) is read.
+    // The version is fixed later, but the limit does not depend on it.
+    frame.setMaxPacketSize(broker ? broker->getMaxPacketSize() : Frame::DEFAULT_MAX_PACKET_SIZE);
+}
 
 Connection::~Connection() {
     closeSocket();
@@ -304,6 +308,14 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     // actually being resumed.
     ConnackPacket connack{false, ReasonCode::SUCCESS};
     connack.sessionPresent = resumed;
+    // Advertise our Maximum Packet Size to MQTT 5 clients (MQTT-3.1.2-6): they
+    // then keep their own packets within the limit we will enforce. Older
+    // versions have no property section, so nothing is added for them.
+    if (frame.getVersion() == Version::MQTT5) {
+        const size_t limit = broker ? broker->getMaxPacketSize() : Frame::DEFAULT_MAX_PACKET_SIZE;
+        // MAXIMUM_PACKET_SIZE is a 4-byte field; the limit fits comfortably.
+        connack.properties[PropertyID::MAXIMUM_PACKET_SIZE] = static_cast<uint32_t>(limit);
+    }
     sendPacket(connack);
 
     {

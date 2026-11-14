@@ -15,6 +15,17 @@ TEST_F(BrokerTest, InitializationTest)
     EXPECT_NO_THROW(MQTT::Broker());
 }
 
+TEST_F(BrokerTest, MaxPacketSizeDefaultsToOneMebibyte)
+{
+    EXPECT_EQ(broker->getMaxPacketSize(), MQTT::Frame::DEFAULT_MAX_PACKET_SIZE);
+}
+
+TEST_F(BrokerTest, MaxPacketSizeIsConfigurable)
+{
+    broker->setMaxPacketSize(2 * 1024 * 1024);
+    EXPECT_EQ(broker->getMaxPacketSize(), 2u * 1024 * 1024);
+}
+
 TEST_F(BrokerTest, ConnectClientTest)
 {
     auto session = std::make_shared<MQTT::Session>(broker, "client1");

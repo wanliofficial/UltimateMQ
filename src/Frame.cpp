@@ -40,6 +40,12 @@ size_t Frame::feed(const uint8_t *buffer, size_t length) {
         }
         if ((encoded & 0x80) == 0) {
             headerComplete = true;
+            // The whole Remaining Length is now known. Refuse oversized packets
+            // here, before buffering a single body byte, so the per-connection
+            // partial buffer can never grow past the limit plus the header.
+            if (remainingLength > maxPacketSize) {
+                throw std::runtime_error("packet exceeds maximum packet size");
+            }
         }
     }
     return used;
@@ -764,18 +770,14 @@ std::vector<uint8_t> Frame::serializeConnect(const ConnectPacket &packet) {
 std::vector<uint8_t> Frame::serializeConnack(const ConnackPacket &packet) {
     std::vector<uint8_t> buffer;
     buffer.push_back(static_cast<uint8_t>(PacketType::CONNACK) << 4);
-    // Serialize remaining length (2 bytes for the variable header)
-    buffer.push_back(0x02);
 
-    // Serialize variable header
-    // Byte 1: Connect Acknowledge Flags
+    // Variable header, byte 1: Connect Acknowledge Flags
     uint8_t connAckFlags = 0;
     if (version != Version::MQTT311 && packet.sessionPresent) {
         connAckFlags |= 0x01;
     }
-    buffer.push_back(connAckFlags);
 
-    // Byte 2: Connect Return Code / Reason Code
+    // Variable header, byte 2: Connect Return Code / Reason Code
     uint8_t code = static_cast<uint8_t>(packet.reasonCode);
     if (version == Version::MQTT311 || version == Version::MQTT31) {
         // MQTT 3.x uses the older return code table; the values that matter
@@ -802,7 +804,25 @@ std::vector<uint8_t> Frame::serializeConnack(const ConnackPacket &packet) {
             break;
         }
     }
-    buffer.push_back(code);
+
+    // Assemble the variable header (flags + code), plus the property section for
+    // MQTT 5 when there are properties to advertise.
+    std::vector<uint8_t> body;
+    body.push_back(connAckFlags);
+    body.push_back(code);
+    if (version == Version::MQTT5) {
+        auto propertiesBuffer = serializeProperties(packet.properties);
+        if (!propertiesBuffer.empty()) {
+            auto propertyLengthBytes = encodeRemainingLength(propertiesBuffer.size());
+            body.insert(body.end(), propertyLengthBytes.begin(), propertyLengthBytes.end());
+            body.insert(body.end(), propertiesBuffer.begin(), propertiesBuffer.end());
+        }
+    }
+
+    // Fixed header: type byte, remaining length, then the variable header body.
+    auto remainingLengthBytes = encodeRemainingLength(body.size());
+    buffer.insert(buffer.end(), remainingLengthBytes.begin(), remainingLengthBytes.end());
+    buffer.insert(buffer.end(), body.begin(), body.end());
     return buffer;
 }
 

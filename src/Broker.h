@@ -14,6 +14,7 @@
 #include "Subscription.h"
 #include "Auth.h"
 #include "Store.h"
+#include "Frame.h"
 
 namespace MQTT {
 class Session;
@@ -43,6 +44,10 @@ class Broker {
     //! Durable state. Not owned by the broker (the Server owns it); may be null.
     Store* store = nullptr;
 
+    //! Upper bound for a single packet's Remaining Length, advertised to MQTT 5
+    //! clients and enforced per connection. Defaults to Frame::DEFAULT_MAX_PACKET_SIZE.
+    size_t maxPacketSize = Frame::DEFAULT_MAX_PACKET_SIZE;
+
     //! Resolve the target sessions; called with the broker lock held
     void collectTargets(const Message &message, std::vector<std::shared_ptr<Session>> &targets);
 
@@ -58,6 +63,11 @@ public:
     //! Attach the persistence store (must be done before restore()). Not owned.
     void setStore(Store* storeHandle) { store = storeHandle; }
     Store* getStore() const { return store; }
+
+    //! Configure the maximum packet size accepted from clients (and advertised
+    //! to MQTT 5 clients via CONNACK). Must be set before any client connects.
+    void setMaxPacketSize(size_t size) { maxPacketSize = size; }
+    size_t getMaxPacketSize() const { return maxPacketSize; }
     //! Flag the durable state as changed (cheap: a single atomic store)
     void notifyStateChanged() {
         if (store) {
