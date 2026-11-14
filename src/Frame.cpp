@@ -187,11 +187,12 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
                 offset += 1;
                 break;
             case PropertyID::MESSAGE_EXPIRY_INTERVAL:
-                if (offset + 4 > length) {
-                    throw std::runtime_error("Invalid properties: insufficient data");
+                // MQTT 5 four-byte integer: id, length byte (0x04), then the value
+                if (offset + 1 + 4 > length || buffer[offset] != 4) {
+                    throw std::runtime_error("Invalid properties: MESSAGE_EXPIRY_INTERVAL");
                 }
-                properties[propertyId] = *reinterpret_cast<const uint32_t*>(buffer + offset);    
-                offset += 4;
+                properties[propertyId] = *reinterpret_cast<const uint32_t*>(buffer + offset + 1);
+                offset += 1 + 4;
                 break;
             case PropertyID::CONTENT_TYPE:
                 if (offset + 2 > length) {
@@ -223,11 +224,12 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
             //     offset += subscriptionIdentifierBytes;
             //     break;
             case PropertyID::SESSION_EXPIRY_INTERVAL:
-                if (offset + 4 > length) {
-                    throw std::runtime_error("Invalid properties: insufficient data");
+                // MQTT 5 four-byte integer: id, length byte (0x04), then the value
+                if (offset + 1 + 4 > length || buffer[offset] != 4) {
+                    throw std::runtime_error("Invalid properties: SESSION_EXPIRY_INTERVAL");
                 }
-                properties[propertyId] = *reinterpret_cast<const uint32_t*>(buffer + offset);;
-                offset += 4;
+                properties[propertyId] = *reinterpret_cast<const uint32_t*>(buffer + offset + 1);
+                offset += 1 + 4;
                 break;
             case PropertyID::ASSIGNED_CLIENT_IDENTIFIER:
                 if (offset + 2 > length) {
@@ -238,11 +240,12 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
                 offset += assignedClientId.length() + 2;
                 break;
             case PropertyID::SERVER_KEEP_ALIVE:
-                if (offset + 2 > length) {
-                    throw std::runtime_error("Invalid properties: insufficient data");  
-                }   
-                properties[propertyId] = *reinterpret_cast<const uint16_t*>(buffer + offset);;
-                offset += 2;
+                // MQTT 5 two-byte integer: id, length byte (0x02), then the value
+                if (offset + 1 + 2 > length || buffer[offset] != 2) {
+                    throw std::runtime_error("Invalid properties: SERVER_KEEP_ALIVE");
+                }
+                properties[propertyId] = *reinterpret_cast<const uint16_t*>(buffer + offset + 1);;
+                offset += 1 + 2;
                 break;
             case PropertyID::AUTHENTICATION_METHOD:
                 if (offset + 2 > length) {
@@ -269,25 +272,28 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
                 offset += 1;
                 break;
             case PropertyID::RECEIVE_MAXIMUM:
-                if (offset + 2 > length) {
-                    throw std::runtime_error("Invalid properties: insufficient data");  
-                }   
-                properties[propertyId] = *reinterpret_cast<const uint16_t*>(buffer + offset);
-                offset += 2;
+                // MQTT 5 two-byte integer: id, length byte (0x02), then the value
+                if (offset + 1 + 2 > length || buffer[offset] != 2) {
+                    throw std::runtime_error("Invalid properties: RECEIVE_MAXIMUM");
+                }
+                properties[propertyId] = *reinterpret_cast<const uint16_t*>(buffer + offset + 1);
+                offset += 1 + 2;
                 break;
             case PropertyID::TOPIC_ALIAS_MAXIMUM:
-                if (offset + 2 > length) {
-                    throw std::runtime_error("Invalid properties: insufficient data");    
-                }   
-                properties[propertyId] = *reinterpret_cast<const uint16_t*>(buffer + offset);
-                offset += 2;
+                // MQTT 5 two-byte integer: id, length byte (0x02), then the value
+                if (offset + 1 + 2 > length || buffer[offset] != 2) {
+                    throw std::runtime_error("Invalid properties: TOPIC_ALIAS_MAXIMUM");
+                }
+                properties[propertyId] = *reinterpret_cast<const uint16_t*>(buffer + offset + 1);
+                offset += 1 + 2;
                 break;
             case PropertyID::TOPIC_ALIAS:
-                if (offset + 2 > length) {
-                    throw std::runtime_error("Invalid properties: insufficient data");    
-                }   
-                properties[propertyId] = *reinterpret_cast<const uint16_t*>(buffer + offset);    
-                offset += 2;
+                // MQTT 5 two-byte integer: id, length byte (0x02), then the value
+                if (offset + 1 + 2 > length || buffer[offset] != 2) {
+                    throw std::runtime_error("Invalid properties: TOPIC_ALIAS");
+                }
+                properties[propertyId] = *reinterpret_cast<const uint16_t*>(buffer + offset + 1);
+                offset += 1 + 2;
                 break;
             case PropertyID::MAXIMUM_QOS:
                 if (offset + 1 > length) {
@@ -297,11 +303,12 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
                 offset += 1;
                 break;
             case PropertyID::MAXIMUM_PACKET_SIZE:
-                if (offset + 4 > length) {  
-                    throw std::runtime_error("Invalid properties: insufficient data");    
-                }   
-                properties[propertyId] = *reinterpret_cast<const uint32_t*>(buffer + offset);
-                offset += 4;
+                // MQTT 5 four-byte integer: id, length byte (0x04), then the value
+                if (offset + 1 + 4 > length || buffer[offset] != 4) {
+                    throw std::runtime_error("Invalid properties: MAXIMUM_PACKET_SIZE");
+                }
+                properties[propertyId] = *reinterpret_cast<const uint32_t*>(buffer + offset + 1);
+                offset += 1 + 4;
                 break;
             case PropertyID::WILDCARD_SUBSCRIPTION_AVAILABLE:
                 if (offset + 1 > length) {
@@ -627,7 +634,20 @@ PingrespPacket Frame::parsePingresp(const uint8_t *buffer, size_t length) {
 }
 
 DisconnectPacket Frame::parseDisconnect(const uint8_t *buffer, size_t length) {
-    return DisconnectPacket();
+    auto disconnect = DisconnectPacket();
+    if (length == 0) {
+        // DISCONNECT with an empty body means reason code 0 (normal) and no properties
+        return disconnect;
+    }
+    // Reason code is the first byte (present whenever there is a body)
+    disconnect.reasonCode = static_cast<ReasonCode>(buffer[0]);
+    size_t offset = 1;
+    // Remaining bytes are the property length followed by the properties
+    if (length - offset > 0) {
+        auto [properties, propLength] = parseProperties(buffer + offset, length - offset);
+        disconnect.properties = properties;
+    }
+    return disconnect;
 }
 
 AuthPacket Frame::parseAuth(const uint8_t *payload, size_t length) {

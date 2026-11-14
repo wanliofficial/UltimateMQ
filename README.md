@@ -107,6 +107,25 @@ QoS 0 messages are at-most-once and are not persisted. The offline queue of a
 session is not stored separately: QoS>0 messages already live in its
 unacknowledged set and are re-queued on reconnect, which avoids duplicates.
 
+#### Session expiry on disconnect (MQTT 5)
+
+A persistent session is normally kept when its connection ends so it can be
+resumed. MQTT 5 lets a client control this on the way out: a `DISCONNECT` may
+carry a **Session Expiry Interval**, and the broker honours it
+(MQTT-3.14.4-2):
+
+* interval `0` — the session is discarded immediately, even if it was
+  persistent, so a later reconnect starts fresh;
+* a positive interval — the session is kept and can be resumed;
+* no `DISCONNECT` (an abrupt disconnect or a keep-alive timeout) — the session
+  is kept if it was created with `cleanStart=false`, exactly as before.
+
+MQTT 3.1.1 has no such property, so a graceful `DISCONNECT` ends the session.
+
+> Note: a client's own `CONNECT` session-expiry and the DISCONNECT interval use
+> the same wire property; a malformed property (e.g. a wrong length byte) causes
+> the broker to drop the connection rather than mis-parse it.
+
 #### Transport security (`FLOWMQ_TLS_CERT` / `FLOWMQ_TLS_KEY`)
 
 By default the listener speaks plaintext, so with authentication enabled the

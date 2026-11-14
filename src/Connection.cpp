@@ -65,9 +65,10 @@ void Connection::run() {
         publishWill();
     }
 
-    // Detach from the session: if this connection still owns it, tear it down.
-    // A session that was taken over by a newer connection is left untouched so
-    // that it can be resumed there.
+    // Detach from the session. A graceful DISCONNECT with a zero session-expiry
+    // interval discards the session immediately (MQTT-3.14.4-2); otherwise a
+    // persistent session is kept so it can be resumed on a later connect. A
+    // session already taken over by a newer connection is left untouched.
     if (session) {
         std::shared_ptr<Session> owned;
         {
@@ -75,7 +76,13 @@ void Connection::run() {
             owned = session;
             session.reset();
         }
-        owned->close(shared_from_this());
+        if (gracefulDisconnect && sessionExpirySeconds == 0) {
+            // The client asked to end the session (or is MQTT 3.1.1): drop it
+            // rather than leaving it resumable.
+            owned->discard();
+        } else {
+            owned->close(shared_from_this());
+        }
     }
     closeSocket();
 }
@@ -488,8 +495,21 @@ void Connection::handlePingreq(std::shared_ptr<PingreqPacket> pingreq) {
 
 void Connection::handleDisconnect(std::shared_ptr<DisconnectPacket> disconnect) {
     // A normal DISCONNECT discards the Will message (MQTT-3.14.4-3); the read
-    // loop then exits and run() tears the session down
+    // loop then exits and run() tears the session down.
     willPending = false;
+    // MQTT 5 Session Expiry Interval (MQTT-3.14.4-2): 0 (or absent when the
+    // CONNECT did not request persistence) discards the session immediately;
+    // a positive interval keeps it resumable for that long. An interval of 0
+    // overrides persistence, so a graceful DISCONNECT ends the session.
+    gracefulDisconnect = true;
+    if (frame.getVersion() == Version::MQTT5) {
+        auto it = disconnect->properties.find(PropertyID::SESSION_EXPIRY_INTERVAL);
+        if (it != disconnect->properties.end() &&
+            std::holds_alternative<uint32_t>(it->second)) {
+            uint32_t interval = std::get<uint32_t>(it->second);
+            sessionExpirySeconds = interval;
+        }
+    }
     state = State::DISCONNECTED;
 }
 

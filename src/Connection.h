@@ -88,6 +88,13 @@ private:
     std::chrono::steady_clock::time_point lastActivity;
     uint16_t keepAliveSeconds = 0;
     std::chrono::milliseconds readTimeout{0};
+    //! Set when the client sent a graceful DISCONNECT (as opposed to the read
+    //! loop ending on an error or keep-alive timeout). Governs whether a
+    //! zero session-expiry interval discards the session on teardown.
+    bool gracefulDisconnect = false;
+    //! MQTT 5 session expiry interval from a graceful DISCONNECT; 0 (the default
+    //! when absent or on MQTT 3.1.1) means the session is discarded on disconnect.
+    uint32_t sessionExpirySeconds = 0;
     bool willPending = false;
     Message willMessage;
     std::function<void()> disconnectCallback;

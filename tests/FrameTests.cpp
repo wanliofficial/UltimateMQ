@@ -104,7 +104,7 @@ TEST_F(FrameTest, ParsePingReqPacket)
     EXPECT_EQ(packet.type, PacketType::PINGREQ);
 }
 
-TEST_F(FrameTest, ParseDisconnectPacket) 
+TEST_F(FrameTest, ParseDisconnectPacket)
 {
     std::vector<uint8_t> payload = {
         0x00,  // Reason Code (Normal disconnection)
@@ -115,6 +115,47 @@ TEST_F(FrameTest, ParseDisconnectPacket)
 
     EXPECT_EQ(packet.type, PacketType::DISCONNECT);
     EXPECT_EQ(packet.reasonCode, ReasonCode::SUCCESS);
+}
+
+TEST_F(FrameTest, ParseDisconnectWithSessionExpiry)
+{
+    // DISCONNECT carrying a Session Expiry Interval property: reason code, then
+    // a property length (0x06), then the property (id 0x11, length 0x04, 4 bytes).
+    std::vector<uint8_t> payload = {
+        0x00,                   // Reason Code (Normal disconnection)
+        0x06,                   // Properties length
+        0x11, 0x04, 0x00, 0x00, 0x0e, 0x10   // Session Expiry Interval = 3600
+    };
+
+    auto packet = frame->parseDisconnect(payload.data(), payload.size());
+
+    EXPECT_EQ(packet.type, PacketType::DISCONNECT);
+    ASSERT_EQ(packet.properties.count(PropertyID::SESSION_EXPIRY_INTERVAL), 1u);
+    EXPECT_TRUE(std::holds_alternative<uint32_t>(
+        packet.properties[PropertyID::SESSION_EXPIRY_INTERVAL]));
+}
+
+TEST_F(FrameTest, ParseConnectSessionExpiryProperty)
+{
+    // Regression guard: a four-byte integer property in CONNECT properties must
+    // consume its length byte. Previously the parser skipped the length byte and
+    // mis-read the value, throwing "Invalid property ID" on well-formed packets.
+    std::vector<uint8_t> payload = {
+        0x00, 0x04, 'M', 'Q', 'T', 'T',  // Protocol name
+        0x05,                            // Protocol version
+        0b00000010,                      // Connect flags (clean start)
+        0x00, 0x3c,                      // Keep alive = 60
+        0x06,                            // Properties length
+        0x11, 0x04, 0x00, 0x00, 0x0e, 0x10,  // Session Expiry Interval = 3600
+        0x00, 0x03, 'c', 'i', 'd'        // Client ID
+    };
+
+    auto packet = frame->parseConnect(payload.data(), payload.size());
+
+    ASSERT_EQ(packet.properties.count(PropertyID::SESSION_EXPIRY_INTERVAL), 1u);
+    EXPECT_TRUE(std::holds_alternative<uint32_t>(
+        packet.properties[PropertyID::SESSION_EXPIRY_INTERVAL]));
+    EXPECT_EQ(packet.clientId, "cid");
 }
 
 TEST_F(FrameTest, ParseAuthPacket) 
