@@ -70,6 +70,8 @@ public:
     void handleDeliver(const Message& message, uint16_t packetId, QoS qos,
                        uint32_t subscriptionIdentifier = 0);
     void sendPacket(Packet &packet);
+    //! End the connection with a reason code (MQTT 5 only) instead of vanishing
+    void closeWithReason(ReasonCode reason);
 
 private:
     void runReadLoop();

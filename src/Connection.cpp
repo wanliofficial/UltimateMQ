@@ -15,6 +15,9 @@
 #include <sstream>
 #include <iomanip>
 #include <memory>
+#include <atomic>
+#include <chrono>
+#include <random>
 #include "Log.h"
 
 namespace MQTT {
@@ -24,6 +27,24 @@ namespace {
 constexpr int CONNECT_TIMEOUT_SECONDS = 10;
 //! Granularity used to check the keep alive timer while waiting for data
 constexpr int POLL_SLICE_MS = 250;
+
+//! Build a ClientID for a client that sent a zero-length one. The broker must
+//! treat such a client as if it had supplied this value (MQTT-3.1.3-6), so the
+//! name is random to keep sessions apart, and the caller retries until it is
+//! not already in use (MQTT-3.1.3-7).
+std::string generateClientId() {
+    static std::atomic<uint64_t> counter{0};
+    static const uint64_t seed = [] {
+        std::random_device device;
+        auto now = static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        return (static_cast<uint64_t>(device()) << 32) ^ device() ^ now;
+    }();
+    std::ostringstream out;
+    out << "auto-" << std::hex << std::setw(16) << std::setfill('0')
+        << (seed ^ (counter.fetch_add(1) * 0x9E3779B97F4A7C15ull));
+    return out.str();
+}
 }
 
 Connection::Connection(int sockfd, Broker* broker, std::shared_ptr<TLSContext> TLS)
@@ -62,8 +83,16 @@ void Connection::run() {
         }
         scheduleReadTimeout();
         runReadLoop();
+    } catch (const Frame::PacketTooLarge &e) {
+        logError("dropping connection: %s", e.what());
+        // MQTT-4.13: a packet above the limit is reported as PACKET_TOO_LARGE,
+        // not as a malformed one, so the client knows to send smaller packets.
+        closeWithReason(ReasonCode::PACKET_TOO_LARGE);
     } catch (const std::exception &e) {
         logError("dropping connection: %s", e.what());
+        // Anything else the broker cannot parse is malformed (MQTT-4.13): tell
+        // an MQTT 5 client which error ended the connection instead of vanishing.
+        closeWithReason(ReasonCode::MALFORMED_PACKET);
     }
     state = State::DISCONNECTED;
 
@@ -305,6 +334,34 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
         }
     }
 
+    // A zero-length ClientID is a special case: the broker must assign a unique
+    // one and treat the client as if it had supplied it (MQTT-3.1.3-6), and
+    // report it in the CONNACK (MQTT-3.1.3-7). It is only legal with CleanStart
+    // set, because there is no name the session could be resumed under
+    // (MQTT-3.1.3-8 region / MQTT 3.1.1 return code 0x02 below).
+    bool assignedClientId = false;
+    if (connect->clientId.empty()) {
+        if (!connect->cleanStart) {
+            logInfo("rejecting client: a zero-length ClientID requires a clean start");
+            if (frame.getVersion() == Version::MQTT5) {
+                ConnackPacket connack{false, ReasonCode::CLIENT_IDENTIFIER_NOT_VALID};
+                sendPacket(connack);
+            } else {
+                // MQTT 3.1.1 has no 0x85 reason code; its CONNACK return code for
+                // "identifier rejected" is 0x02.
+                ConnackPacket connack{false, static_cast<ReasonCode>(0x02)};
+                sendPacket(connack);
+            }
+            state = State::DISCONNECTED;
+            return;
+        }
+        do {
+            connect->clientId = generateClientId();
+        } while (broker && broker->findSession(connect->clientId) != nullptr);
+        assignedClientId = true;
+        logDebug("assigned ClientID %s", connect->clientId.c_str());
+    }
+
     std::string username;
     // When a verified client certificate is available and the client sends no
     // MQTT username, the certificate's identity can stand in for the username
@@ -472,6 +529,11 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
         // (MQTT-3.1.2-26). Advertising it is what makes alias-only PUBLISHes
         // legal; the mapping itself is tracked per connection below.
         connack.properties[PropertyID::TOPIC_ALIAS_MAXIMUM] = TOPIC_ALIAS_MAXIMUM;
+        // MQTT-3.1.3-7: when the broker named the client, it must say what it
+        // chose, otherwise the client cannot resume that session later.
+        if (assignedClientId) {
+            connack.properties[PropertyID::ASSIGNED_CLIENT_IDENTIFIER] = connect->clientId;
+        }
         // A preferred keep alive caps how long a dead connection lingers: a
         // client that asked for more (or for none, which would otherwise never
         // be reaped) is told the broker's value and must use it (MQTT-3.1.2-21).
@@ -721,6 +783,31 @@ void Connection::handleSubscribe(std::shared_ptr<SubscribePacket> subscribe) {
     }
     // Sentinel meaning "this filter was accepted" in the per-filter outcome list.
     constexpr int acceptMarker = -1;
+    // MQTT-3.8.3-3: the payload must hold at least one filter/options pair. A
+    // SUBSCRIBE with an empty payload is a protocol error, not a no-op.
+    if (subscribe->subscriptions.empty()) {
+        logInfo("client %s: SUBSCRIBE with no topic filters", session->getClientId().c_str());
+        closeWithReason(ReasonCode::PROTOCOL_ERROR);
+        return;
+    }
+    // Validate the subscription options before any of them is applied. A
+    // Maximum QoS of 3, a Retain Handling of 3 and No Local on a shared
+    // subscription are protocol errors (MQTT-3.8.3.1); reporting them as a
+    // per-filter failure would leave the client believing it is subscribed.
+    for (const auto &[filter, options] : subscribe->subscriptions) {
+        const bool badQos = static_cast<uint8_t>(options.maximumQos) > 2;
+        const bool badRetainHandling =
+            static_cast<uint8_t>(options.retainHandling) > 2;
+        const bool noLocalOnShared = options.noLocal && Topic::isShared(filter);
+        if (badQos || badRetainHandling || noLocalOnShared) {
+            logInfo("client %s: invalid subscription options for %s (qos=%d, retainHandling=%d, noLocal=%d)",
+                    session->getClientId().c_str(), filter.c_str(),
+                    static_cast<int>(options.maximumQos),
+                    static_cast<int>(options.retainHandling), (int)options.noLocal);
+            closeWithReason(ReasonCode::PROTOCOL_ERROR);
+            return;
+        }
+    }
     // Access control: subscribe only to filters the client may read. A denied
     // filter is reported in the SUBACK and is not registered. A session also
     // has a bounded number of subscriptions so one client cannot exhaust memory
@@ -802,6 +889,12 @@ void Connection::handleSubscribe(std::shared_ptr<SubscribePacket> subscribe) {
 void Connection::handleUnsubscribe(std::shared_ptr<UnsubscribePacket> unsubscribe) {
     if (!session) {
         throw std::runtime_error("UNSUBSCRIBE before CONNECT");
+    }
+    // MQTT-3.10.3-2: an UNSUBSCRIBE with no filters is a protocol error.
+    if (unsubscribe->topicFilters.empty()) {
+        logInfo("client %s: UNSUBSCRIBE with no topic filters", session->getClientId().c_str());
+        closeWithReason(ReasonCode::PROTOCOL_ERROR);
+        return;
     }
     for (const auto& topic : unsubscribe->topicFilters) {
         session->unsubscribe(topic);
@@ -904,6 +997,16 @@ void Connection::sendPubrec(uint16_t packetId) {
     PubrecPacket pubrec{packetId, ReasonCode::SUCCESS};
     logDebug("resend PUBREC packetId=%u (awaiting PUBREL)", packetId);
     sendPacket(pubrec);
+}
+
+void Connection::closeWithReason(ReasonCode reason) {
+    // MQTT 5 clients are told why the connection ends (MQTT-4.13). MQTT 3.1.1
+    // has no DISCONNECT packet from the server, so the socket simply closes.
+    if (frame.getVersion() == Version::MQTT5 && state == State::CONNECTED) {
+        DisconnectPacket disconnect{reason};
+        sendPacket(disconnect);
+    }
+    state = State::DISCONNECTED;
 }
 
 void Connection::sendPacket(Packet &packet) {

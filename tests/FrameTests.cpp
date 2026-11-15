@@ -604,4 +604,80 @@ TEST_F(FrameTest, RejectsASubscriptionIdentifierOfZero)
     EXPECT_THROW(mqtt5.parseSubscribe(payload.data(), payload.size()), std::runtime_error);
 }
 
+TEST_F(FrameTest, RejectsASubscribeWithReservedOptionBits)
+{
+    // MQTT-3.8.4-1: bits 6 and 7 of the subscription options are reserved and a
+    // SUBSCRIBE that sets either is malformed.
+    Frame mqtt5(Version::MQTT5);
+    std::vector<uint8_t> payload = {
+        0x00, 0x01,                    // packet id
+        0x00,                          // property length
+        0x00, 0x03, 'a', '/', 'b',     // filter
+        0xC0,                          // reserved bits 7 and 6 set
+    };
+    EXPECT_THROW(mqtt5.parseSubscribe(payload.data(), payload.size()), std::runtime_error);
+}
+
+TEST_F(FrameTest, AcceptsASubscribeWithOnlyTheDefinedOptionBits)
+{
+    Frame mqtt5(Version::MQTT5);
+    std::vector<uint8_t> payload = {
+        0x00, 0x01,
+        0x00,
+        0x00, 0x03, 'a', '/', 'b',
+        0x2E,                          // QoS 2, no local, retain as published, retain handling 2
+    };
+    auto subscribe = mqtt5.parseSubscribe(payload.data(), payload.size());
+    ASSERT_EQ(subscribe.subscriptions.size(), 1u);
+    const auto &options = subscribe.subscriptions[0].second;
+    EXPECT_EQ(options.maximumQos, QoS::QOS_2);
+    EXPECT_TRUE(options.noLocal);
+    EXPECT_TRUE(options.retainAsPublished);
+    EXPECT_EQ(options.retainHandling, RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES);
+}
+
+TEST_F(FrameTest, RejectsAPropertyAppearingTwice)
+{
+    // "It is a Protocol Error to include the Payload Format Indicator more than
+    // once": the second copy must not silently replace the first.
+    Frame mqtt5(Version::MQTT5);
+    // parseProperties expects the property length first
+    std::vector<uint8_t> section = {0x04, 0x01, 0x00, 0x01, 0x01};
+    EXPECT_THROW(mqtt5.parseProperties(section.data(), section.size()),
+                 std::runtime_error);
+}
+
+TEST_F(FrameTest, AllowsRepeatedUserProperties)
+{
+    // User Property is the one property that may appear many times.
+    Frame mqtt5(Version::MQTT5);
+    std::vector<uint8_t> section = {
+        0x0E,                                  // property length
+        0x26, 0x00, 0x01, 'k', 0x00, 0x01, 'v',
+        0x26, 0x00, 0x01, 'k', 0x00, 0x01, 'w',
+    };
+    auto parsed = mqtt5.parseProperties(section.data(), section.size()).first;
+    const auto &pairs = std::get<UserProperties>(parsed.at(PropertyID::USER_PROPERTY));
+    EXPECT_EQ(pairs.size(), 1u);
+    EXPECT_EQ(pairs.at("k"), "w");  // a repeated key keeps the last value
+}
+
+TEST_F(FrameTest, RejectsABooleanPropertyThatIsNeitherZeroNorOne)
+{
+    // Payload Format Indicator, Maximum QoS, Retain Available and friends are
+    // booleans: any value above 1 is a protocol error.
+    Frame mqtt5(Version::MQTT5);
+    std::vector<uint8_t> section = {0x02, 0x01, 0x02};
+    EXPECT_THROW(mqtt5.parseProperties(section.data(), section.size()),
+                 std::runtime_error);
+}
+
+TEST_F(FrameTest, AcceptsABooleanPropertyOfOne)
+{
+    Frame mqtt5(Version::MQTT5);
+    std::vector<uint8_t> section = {0x02, 0x01, 0x01};
+    auto parsed = mqtt5.parseProperties(section.data(), section.size()).first;
+    EXPECT_EQ(std::get<uint8_t>(parsed.at(PropertyID::PAYLOAD_FORMAT_INDICATOR)), 1);
+}
+
 } // namespace MQTT

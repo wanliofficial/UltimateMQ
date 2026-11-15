@@ -3,6 +3,7 @@
 #pragma once
 
 #include "MQTT.h"
+#include <stdexcept>
 
 namespace MQTT {
 
@@ -20,6 +21,14 @@ class Frame {
     size_t maxPacketSize = DEFAULT_MAX_PACKET_SIZE;
 
 public:
+    //! A packet whose declared Remaining Length exceeds the configured limit.
+    //! Distinct from a generic parse failure because the server must report it
+    //! as PACKET_TOO_LARGE (0x95) rather than MALFORMED_PACKET (MQTT-4.13).
+    class PacketTooLarge : public std::runtime_error {
+    public:
+        explicit PacketTooLarge(const std::string &what) : std::runtime_error(what) {}
+    };
+
     static constexpr size_t MAX_MULTIPLIER = 128 * 128 * 128;
     static constexpr size_t MAX_LENGTH = 268435455; 
     //! Default cap on a single packet's Remaining Length (1 MiB). Bounds the

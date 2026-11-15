@@ -587,6 +587,40 @@ they touch the routing path:
   SUBACK as `TOPIC_FILTER_INVALID` (MQTT 5, `0x8f`) or `0x80` (MQTT 3.1.1), and
   the remaining filters in the same SUBSCRIBE are still processed.
 
+#### Anonymous clients (zero-length Client ID)
+
+A `CONNECT` may carry an empty Client ID. The broker then **names the client
+itself** (MQTT-3.1.3-6) and reports the chosen value in the CONNACK's
+`Assigned Client Identifier` property (MQTT-3.1.3-7), so the client can come
+back under that name:
+
+* the generated name (`auto-` plus a random suffix) is checked against the
+  sessions already held, so two anonymous clients never share one session;
+* an **anonymous** client that asks for `cleanStart=false` is refused —
+  `CLIENT_IDENTIFIER_NOT_VALID` (`0x85`) on MQTT 5, return code `0x02` on
+  MQTT 3.1.1 — because there is no name the session could be resumed under;
+* MQTT 3.1.1 has no property section, so it cannot be told the assigned name;
+  the connection still works, it just cannot be resumed by name.
+
+#### Malformed packets and protocol errors
+
+An MQTT 5 client that sends something the broker cannot accept is told why,
+instead of watching the socket vanish (MQTT-4.13):
+
+| Situation | Reported as |
+|---|---|
+| A packet that cannot be parsed, a duplicated property, or a boolean property that is neither 0 nor 1 | `DISCONNECT` `MALFORMED_PACKET` (`0x81`) |
+| A packet larger than `FLOWMQ_MAX_PACKET_SIZE` | `DISCONNECT` `PACKET_TOO_LARGE` (`0x95`) |
+| A `SUBSCRIBE` with no filters, a subscription Maximum QoS of 3, Retain Handling 3, or No Local on a shared subscription | `DISCONNECT` `PROTOCOL_ERROR` (`0x82`) |
+| An `UNSUBSCRIBE` with no filters | `DISCONNECT` `PROTOCOL_ERROR` (`0x82`) |
+| Reserved bits 6–7 set in the subscription options | `DISCONNECT` `MALFORMED_PACKET` (`0x81`) |
+
+MQTT 3.1.1 has no server-sent `DISCONNECT`, so in every one of these cases the
+connection is simply closed. Each property may appear at most once per packet
+(User Property excepted, which is a list), and an empty topic filter is refused
+per-filter with `TOPIC_FILTER_INVALID` (`0x8f`) rather than failing the whole
+`SUBSCRIBE`.
+
 #### Session takeover
 
 A `CONNECT` with `cleanStart=false` for a client id whose session is still held

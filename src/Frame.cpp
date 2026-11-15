@@ -1,5 +1,6 @@
 
 #include "Frame.h"
+#include <set>
 #include <memory>
 #include <iostream>
 #include "Log.h"
@@ -58,7 +59,7 @@ size_t Frame::feed(const uint8_t *buffer, size_t length) {
             // here, before buffering a single body byte, so the per-connection
             // partial buffer can never grow past the limit plus the header.
             if (remainingLength > maxPacketSize) {
-                throw std::runtime_error("packet exceeds maximum packet size");
+                throw PacketTooLarge("packet exceeds maximum packet size");
             }
         }
     }
@@ -187,11 +188,34 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
     uint32_t subscriptionIdentifier;
     size_t subscriptionIdentifierBytes;
 
+    // Every property except User Property may appear at most once per packet
+    // ("It is a Protocol Error to include ... more than once"), so a repeat is
+    // rejected instead of silently overwriting the earlier value.
+    std::set<PropertyID> seen;
+
     size_t offset = 0;
     while (offset < length) {
         auto [id, idBytes] = decodeVariableByteInteger(buffer+offset, length-offset);
             offset += idBytes;
         PropertyID propertyId = static_cast<PropertyID>(id);
+        if (propertyId != PropertyID::USER_PROPERTY && !seen.insert(propertyId).second) {
+            throw std::runtime_error("Invalid properties: a property appears more than once");
+        }
+        // Payload Format Indicator, Request Response Information, Request
+        // Problem Information, Maximum QoS, Retain Available, Wildcard
+        // Subscription Available, Subscription Identifier Available and Shared
+        // Subscription Available are all booleans: only 0 and 1 are legal.
+        if ((propertyId == PropertyID::PAYLOAD_FORMAT_INDICATOR ||
+             propertyId == PropertyID::REQUEST_RESPONSE_INFORMATION ||
+             propertyId == PropertyID::REQUEST_PROBLEM_INFORMATION ||
+             propertyId == PropertyID::MAXIMUM_QOS ||
+             propertyId == PropertyID::RETAIN_AVAILABLE ||
+             propertyId == PropertyID::WILDCARD_SUBSCRIPTION_AVAILABLE ||
+             propertyId == PropertyID::SUBSCRIPTION_IDENTIFIER_AVAILABLE ||
+             propertyId == PropertyID::SHARED_SUBSCRIPTION_AVAILABLE) &&
+            (offset >= length || buffer[offset] > 1)) {
+            throw std::runtime_error("Invalid properties: a boolean property is neither 0 nor 1");
+        }
         switch (propertyId) {
             case PropertyID::PAYLOAD_FORMAT_INDICATOR:
                 if (offset + 1 > length) {
@@ -665,6 +689,11 @@ SubscribePacket Frame::parseSubscribe(const uint8_t *buffer, size_t length) {
         subOptions.noLocal = (options & 0x04) != 0;
         subOptions.retainAsPublished = (options & 0x08) != 0;
         subOptions.retainHandling = static_cast<RetainHandling>((options >> 4) & 0x03);
+        // MQTT-3.8.4-1: bits 6 and 7 are reserved, and a SUBSCRIBE that sets
+        // either must be treated as malformed rather than quietly accepted.
+        if ((options & 0xC0) != 0) {
+            throw std::runtime_error("Invalid SUBSCRIBE: reserved option bits are set");
+        }
         // The Subscription Identifier is a property of the whole SUBSCRIBE, so
         // it applies to every entry in it (MQTT-3.8.2.1.2).
         auto identifier = subscribe.properties.find(PropertyID::SUBSCRIPTION_IDENTIFIER);
