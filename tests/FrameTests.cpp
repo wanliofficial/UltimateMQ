@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include "../src/Frame.h"
 #include <vector>
+#include <set>
 #include <stdexcept>
 
 namespace MQTT {
@@ -376,6 +377,59 @@ TEST_F(FrameTest, SerializeConnackAdvertisesTopicAliasMaximumWithLengthByte)
     // property id 0x22, length byte 2, then the 2-byte value 0x0010.
     EXPECT_EQ(v5.serialize(connack),
               (std::vector<uint8_t>{0x20, 0x07, 0x00, 0x00, 0x04, 0x22, 0x02, 0x00, 0x10}));
+}
+
+TEST_F(FrameTest, SerializeConnackAdvertisesCapabilityFlags)
+{
+    // The broker tells the client which optional features it implements. The
+    // boolean capabilities (Wildcard / Subscription Identifier / Shared
+    // Subscription / Retain Available) are single bytes, and Maximum QoS is a
+    // byte too (MQTT-3.1.2-4).
+    Frame v5(Version::MQTT5);
+    ConnackPacket connack(false, ReasonCode::SUCCESS);
+    connack.properties[PropertyID::WILDCARD_SUBSCRIPTION_AVAILABLE] = true;
+    connack.properties[PropertyID::SUBSCRIPTION_IDENTIFIER_AVAILABLE] = true;
+    connack.properties[PropertyID::SHARED_SUBSCRIPTION_AVAILABLE] = true;
+    connack.properties[PropertyID::RETAIN_AVAILABLE] = true;
+    connack.properties[PropertyID::MAXIMUM_QOS] = static_cast<uint8_t>(QoS::QOS_2);
+    // Each property is an id byte plus one value byte, so the property section
+    // is 10 bytes long.
+    auto data = v5.serialize(connack);
+    // Header: 0x20, remaining length (4 fixed + 10 props = 14), flags, reason.
+    ASSERT_GE(data.size(), 4u);
+    EXPECT_EQ(data[0], 0x20);
+    // Walk the property section and check every advertised id is present.
+    uint8_t propertyLength = data[4];
+    std::set<uint8_t> ids;
+    size_t i = 5;
+    for (uint8_t n = 0; n < propertyLength; ) {
+        uint8_t id = data[i];
+        ids.insert(id);
+        i += 2;  // id + single value byte
+        n += 2;
+    }
+    EXPECT_EQ(ids.count(static_cast<uint8_t>(PropertyID::WILDCARD_SUBSCRIPTION_AVAILABLE)), 1u);
+    EXPECT_EQ(ids.count(static_cast<uint8_t>(PropertyID::SUBSCRIPTION_IDENTIFIER_AVAILABLE)), 1u);
+    EXPECT_EQ(ids.count(static_cast<uint8_t>(PropertyID::SHARED_SUBSCRIPTION_AVAILABLE)), 1u);
+    EXPECT_EQ(ids.count(static_cast<uint8_t>(PropertyID::RETAIN_AVAILABLE)), 1u);
+    EXPECT_EQ(ids.count(static_cast<uint8_t>(PropertyID::MAXIMUM_QOS)), 1u);
+}
+
+TEST_F(FrameTest, SerializedCapabilityFlagsUseCompactEncoding)
+{
+    // CONNACK is a server-to-client packet the broker never parses back, so the
+    // guarantee is the wire encoding: every capability is exactly an id byte plus
+    // one value byte, with no length prefix.
+    Frame v5(Version::MQTT5);
+    ConnackPacket connack(false, ReasonCode::SUCCESS);
+    connack.properties[PropertyID::RETAIN_AVAILABLE] = true;
+    auto data = v5.serialize(connack);
+    // 0x20, remaining length, flags, reason, property length 2, id 0x25, value 1.
+    ASSERT_GE(data.size(), 7u);
+    EXPECT_EQ(data[0], 0x20);
+    EXPECT_EQ(data[4], 0x02);                 // property length
+    EXPECT_EQ(data[5], 0x25);                 // RETAIN_AVAILABLE id
+    EXPECT_EQ(data[6], 0x01);                 // available
 }
 
 TEST_F(FrameTest, SerializeConnackForMqtt311IgnoresProperties){

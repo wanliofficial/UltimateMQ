@@ -530,6 +530,17 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
         // (MQTT-3.1.2-26). Advertising it is what makes alias-only PUBLISHes
         // legal; the mapping itself is tracked per connection below.
         connack.properties[PropertyID::TOPIC_ALIAS_MAXIMUM] = TOPIC_ALIAS_MAXIMUM;
+        // Advertise the subscription features this broker actually implements
+        // (MQTT-3.1.2-4). They all default to "available" when absent, but
+        // stating them explicitly is friendlier to strict client libraries and
+        // removes any guesswork. The broker supports wildcards and shared
+        // subscriptions, subscription identifiers, retained messages and every
+        // QoS level (Maximum QoS 2).
+        connack.properties[PropertyID::WILDCARD_SUBSCRIPTION_AVAILABLE] = true;
+        connack.properties[PropertyID::SUBSCRIPTION_IDENTIFIER_AVAILABLE] = true;
+        connack.properties[PropertyID::SHARED_SUBSCRIPTION_AVAILABLE] = true;
+        connack.properties[PropertyID::RETAIN_AVAILABLE] = true;
+        connack.properties[PropertyID::MAXIMUM_QOS] = static_cast<uint8_t>(QoS::QOS_2);
         // MQTT-3.1.3-7: when the broker named the client, it must say what it
         // chose, otherwise the client cannot resume that session later.
         if (assignedClientId) {
