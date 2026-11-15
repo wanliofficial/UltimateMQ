@@ -15,7 +15,7 @@
 #include "Auth.h"
 #include "Store.h"
 #include "Frame.h"
-#include "Tls.h"
+#include "TLS.h"
 
 namespace MQTT {
 class Session;
