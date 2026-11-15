@@ -200,6 +200,27 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
                 properties[propertyId] = static_cast<uint8_t>(buffer[offset]);
                 offset += 1;
                 break;
+            case PropertyID::USER_PROPERTY:
+                // MQTT 5 User Property: a UTF-8 key/value pair, and the property may
+                // appear multiple times in one packet. Accumulate every pair into a
+                // single map keyed by the property id so the accessors see them all.
+                {
+                    if (offset + 2 > length) {
+                        throw std::runtime_error("Invalid properties: USER_PROPERTY");
+                    }
+                    std::string key = parseString(buffer + offset, length - offset);
+                    offset += key.length() + 2;
+                    if (offset + 2 > length) {
+                        throw std::runtime_error("Invalid properties: USER_PROPERTY");
+                    }
+                    std::string value = parseString(buffer + offset, length - offset);
+                    offset += value.length() + 2;
+                    if (properties.find(propertyId) == properties.end()) {
+                        properties[propertyId] = UserProperties();
+                    }
+                    std::get<UserProperties>(properties[propertyId])[key] = value;
+                }
+                break;
             case PropertyID::MESSAGE_EXPIRY_INTERVAL:
                 // MQTT 5 four-byte integer: id, length byte (0x04), then the value
                 if (offset + 1 + 4 > length || buffer[offset] != 4) {
@@ -228,6 +249,27 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
                 if (offset + 2 > length) {
                     throw std::runtime_error("Invalid properties: insufficient data");  
                 }  
+                correlationData = parseString(buffer + offset, length - offset);
+                properties[propertyId] = correlationData;
+                offset += correlationData.length() + 2;
+                break;
+            case PropertyID::REASON_STRING:
+                // A human-readable reason string a client may attach to a DISCONNECT
+                // or an acknowledgement; accept and store it. Must not be forwarded
+                // to other clients.
+                if (offset + 2 > length) {
+                    throw std::runtime_error("Invalid properties: insufficient data");
+                }
+                correlationData = parseString(buffer + offset, length - offset);
+                properties[propertyId] = correlationData;
+                offset += correlationData.length() + 2;
+                break;
+            case PropertyID::SERVER_REFERENCE:
+                // A server reference string (server->client in AUTH/CONNACK); accept
+                // it so a peer sending it is not rejected as an unknown property.
+                if (offset + 2 > length) {
+                    throw std::runtime_error("Invalid properties: insufficient data");
+                }
                 correlationData = parseString(buffer + offset, length - offset);
                 properties[propertyId] = correlationData;
                 offset += correlationData.length() + 2;
@@ -1250,34 +1292,39 @@ std::vector<uint8_t> Frame::encodeRemainingLength(size_t length) {
 std::vector<uint8_t> Frame::serializeProperties(const Properties &properties) {
     std::vector<uint8_t> buffer;
     for (const auto &[id, value] : properties) {
-        buffer.push_back(static_cast<uint8_t>(id));
-
-        std::visit([&buffer](auto &&arg) {
+        std::visit([&buffer, id](auto &&arg) {
             using T = std::decay_t<decltype(arg)>;
             if constexpr (std::is_same_v<T, bool>) {
                 // Boolean / byte properties carry no length prefix.
+                buffer.push_back(static_cast<uint8_t>(id));
                 buffer.push_back(arg ? 1 : 0);
             } else if constexpr (std::is_same_v<T, uint8_t>) {
+                buffer.push_back(static_cast<uint8_t>(id));
                 buffer.push_back(arg);
             } else if constexpr (std::is_same_v<T, uint16_t>) {
                 // MQTT 5 two-byte integer: a length byte (0x02) then the value.
+                buffer.push_back(static_cast<uint8_t>(id));
                 buffer.push_back(0x02);
                 buffer.push_back((arg >> 8) & 0xFF);
                 buffer.push_back(arg & 0xFF);
             } else if constexpr (std::is_same_v<T, uint32_t>) {
                 // MQTT 5 four-byte integer: a length byte (0x04) then the value.
+                buffer.push_back(static_cast<uint8_t>(id));
                 buffer.push_back(0x04);
                 buffer.push_back((arg >> 24) & 0xFF);
                 buffer.push_back((arg >> 16) & 0xFF);
                 buffer.push_back((arg >> 8) & 0xFF);
                 buffer.push_back(arg & 0xFF);
             } else if constexpr (std::is_same_v<T, std::string>) {
+                buffer.push_back(static_cast<uint8_t>(id));
                 uint16_t length = static_cast<uint16_t>(arg.length());
                 buffer.push_back((length >> 8) & 0xFF);
                 buffer.push_back(length & 0xFF);
                 buffer.insert(buffer.end(), arg.begin(), arg.end());
             } else if constexpr (std::is_same_v<T, UserProperties>) {
+                // Each User Property pair carries its own property id byte.
                 for (const auto& [key, val] : arg) {
+                    buffer.push_back(static_cast<uint8_t>(id));
                     uint16_t keyLength = static_cast<uint16_t>(key.length());
                     buffer.push_back((keyLength >> 8) & 0xFF);
                     buffer.push_back(keyLength & 0xFF);

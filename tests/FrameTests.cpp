@@ -158,6 +158,70 @@ TEST_F(FrameTest, ParseConnectSessionExpiryProperty)
     EXPECT_EQ(packet.clientId, "cid");
 }
 
+TEST_F(FrameTest, ParseConnectWithUserProperty)
+{
+    // A User Property (0x26) is a UTF-8 key/value pair and must be parsed into
+    // the properties map, not rejected as an unknown property id.
+    std::vector<uint8_t> payload = {
+        0x00, 0x04, 'M', 'Q', 'T', 'T',  // Protocol name
+        0x05,                            // Protocol version
+        0b00000010,                      // Connect flags (clean start)
+        0x00, 0x3c,                      // Keep alive = 60
+        0x10,                            // Properties length (16)
+        0x26, 0x00, 0x06, 'c', 'l', 'i', 'e', 'n', 't',  // 0x26, key "client"
+        0x00, 0x05, 'm', 'y', 'a', 'p', 'p',             // value "myapp"
+        0x00, 0x03, 'c', 'i', 'd'        // Client ID
+    };
+
+    auto packet = frame->parseConnect(payload.data(), payload.size());
+
+    ASSERT_EQ(packet.properties.count(PropertyID::USER_PROPERTY), 1u);
+    const auto &props = std::get<UserProperties>(packet.properties[PropertyID::USER_PROPERTY]);
+    EXPECT_EQ(props.at("client"), "myapp");
+    EXPECT_EQ(packet.clientId, "cid");
+}
+
+TEST_F(FrameTest, ParseConnectWithMultipleUserPropertiesAccumulate)
+{
+    // Distinct-key User Properties accumulate into one map; a later parse must
+    // not crash on the variant already holding a UserProperties value.
+    std::vector<uint8_t> payload = {
+        0x00, 0x04, 'M', 'Q', 'T', 'T',  // Protocol name
+        0x05,                            // Protocol version
+        0b00000010,                      // Connect flags (clean start)
+        0x00, 0x3c,                      // Keep alive = 60
+        0x18,                            // Properties length (24)
+        0x26, 0x00, 0x04, 'r', 'e', 'g', 'i', 0x00, 0x02, 'e', 'u',   // regi -> eu
+        0x26, 0x00, 0x05, 't', 'r', 'a', 'c', 'e', 0x00, 0x03, 'a', 'b', 'c', // trace -> abc
+        0x00, 0x02, 'c', 'd'             // Client ID
+    };
+
+    auto packet = frame->parseConnect(payload.data(), payload.size());
+
+    ASSERT_EQ(packet.properties.count(PropertyID::USER_PROPERTY), 1u);
+    const auto &props = std::get<UserProperties>(packet.properties[PropertyID::USER_PROPERTY]);
+    EXPECT_EQ(props.at("regi"), "eu");
+    EXPECT_EQ(props.at("trace"), "abc");
+    EXPECT_EQ(packet.clientId, "cd");
+}
+
+TEST_F(FrameTest, SerializeUserPropertiesEmitIdPerPair)
+{
+    // Serialization must repeat the property id byte for each User Property
+    // pair, so a round-trip parses back the same set of pairs.
+    Properties props;
+    props[PropertyID::USER_PROPERTY] = UserProperties{{"a", "1"}, {"b", "2"}};
+
+    auto encoded = frame->serializeProperties(props);
+
+    // Expect: id a <len> "1" id b <len> "2"
+    std::vector<uint8_t> expected = {
+        0x26, 0x00, 0x01, 'a', 0x00, 0x01, '1',
+        0x26, 0x00, 0x01, 'b', 0x00, 0x01, '2'
+    };
+    EXPECT_EQ(encoded, expected);
+}
+
 TEST_F(FrameTest, ParseAuthPacket) 
 {
     std::vector<uint8_t> payload = {

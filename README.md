@@ -489,6 +489,16 @@ broker holds it and publishes it only once the interval elapses (MQTT-3.1.4-6 /
   published immediately on an abnormal disconnect and discarded on a graceful one
   or a session takeover.
 
+#### User Properties and other MQTT 5 properties
+
+MQTT 5 lets any packet carry **User Properties** (arbitrary key/value pairs) and
+other broker-directed properties. These are accepted on every packet type —
+CONNECT, PUBLISH, SUBSCRIBE, DISCONNECT and the acknowledgement packets — so a
+client that sets them is not rejected as malformed. User Properties are stored
+per packet and are **not** forwarded to other clients (or written to durable
+state); a human-readable `REASON_STRING` a client attaches to a DISCONNECT or ack
+is likewise accepted and dropped.
+
 ## Contributing
 
 Please read CONTRIBUTING.md for details on our code of conduct and the process for submitting pull requests.
