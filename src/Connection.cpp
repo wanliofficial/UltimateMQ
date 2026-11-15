@@ -432,11 +432,26 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
         willPending = true;
         willMessage = Message(*connect->willTopic, *connect->willMsg, connect->willQos, connect->willRetain);
         willDelay = 0;
-        // MQTT 5 Will Delay Interval (MQTT-3.1.2-12 / 5.4.3.2): a nonzero delay
-        // means the Will must be held on the session and published by the broker
-        // sweeper only after the delay elapses, giving the client a window to
-        // reconnect and cancel it. Parsed here from the will property set.
+        // MQTT 5 Will properties (MQTT-3.1.2-12 / 5.4.3.1): the application
+        // properties a Will carries are forwarded when it is published, exactly
+        // as for an ordinary PUBLISH. Will Delay Interval is handled separately
+        // below (it controls timing, not the published payload).
         if (connect->willProperties) {
+            for (PropertyID forwardable : {PropertyID::PAYLOAD_FORMAT_INDICATOR,
+                                           PropertyID::MESSAGE_EXPIRY_INTERVAL,
+                                           PropertyID::CONTENT_TYPE,
+                                           PropertyID::RESPONSE_TOPIC,
+                                           PropertyID::CORRELATION_DATA,
+                                           PropertyID::USER_PROPERTY}) {
+                auto it = connect->willProperties->find(forwardable);
+                if (it != connect->willProperties->end()) {
+                    willMessage.properties[forwardable] = it->second;
+                }
+            }
+            // MQTT 5 Will Delay Interval (MQTT-3.1.2-12 / 5.4.3.2): a nonzero delay
+            // means the Will must be held on the session and published by the broker
+            // sweeper only after the delay elapses, giving the client a window to
+            // reconnect and cancel it. Parsed here from the will property set.
             auto it = connect->willProperties->find(PropertyID::WILL_DELAY_INTERVAL);
             if (it != connect->willProperties->end() && std::holds_alternative<uint32_t>(it->second)) {
                 willDelay = std::get<uint32_t>(it->second);
