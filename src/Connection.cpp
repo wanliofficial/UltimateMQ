@@ -26,12 +26,12 @@ constexpr int CONNECT_TIMEOUT_SECONDS = 10;
 constexpr int POLL_SLICE_MS = 250;
 }
 
-Connection::Connection(int sockfd, Broker* broker, std::shared_ptr<TlsContext> tls)
+Connection::Connection(int sockfd, Broker* broker, std::shared_ptr<TLSContext> TLS)
     : sockfd(sockfd), state(State::IDLE), broker(broker),
       writeTimeoutMs(broker ? broker->getWriteTimeoutMs()
                             : SecureTransport::WRITE_STALL_TIMEOUT_MS),
       auth(broker ? broker->getAuth() : nullptr),
-      transport(std::make_unique<SecureTransport>(sockfd, std::move(tls), writeTimeoutMs)),
+      transport(std::make_unique<SecureTransport>(sockfd, std::move(TLS), writeTimeoutMs)),
       lastActivity(std::chrono::steady_clock::now()) {
     // Cap the packet size before any byte (including the first CONNECT) is read.
     // The version is fixed later, but the limit does not depend on it.
@@ -53,7 +53,7 @@ void Connection::run() {
         // Complete the TLS handshake before any MQTT bytes are read. A failed
         // handshake (wrong protocol, untrusted client certificate, ...) ends
         // the connection here, before a CONNECT can be forged.
-        if (transport->tlsEnabled()) {
+        if (transport->TLSEnabled()) {
             std::string handshakeError;
             if (!transport->handshake(&handshakeError)) {
                 logInfo("dropping connection: %s", handshakeError.c_str());

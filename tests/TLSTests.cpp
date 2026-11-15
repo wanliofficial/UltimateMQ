@@ -17,54 +17,54 @@ bool fixturesAvailable() {
 }
 } // namespace
 
-TEST(TlsContextTest, DisabledWhenNoCertificateIsConfigured)
+TEST(TLSContextTest, DisabledWhenNoCertificateIsConfigured)
 {
     std::string error;
-    auto context = TlsContext::load(std::string(), std::string(), false, std::string(), &error);
+    auto context = TLSContext::load(std::string(), std::string(), false, std::string(), &error);
     // No certificate: plaintext broker, not an error
     EXPECT_EQ(context, nullptr);
     EXPECT_TRUE(error.empty()) << error;
 }
 
-TEST(TlsContextTest, RejectsAHalfConfiguredSetup)
+TEST(TLSContextTest, RejectsAHalfConfiguredSetup)
 {
     std::string error;
-    auto context = TlsContext::load("/tmp/cert.pem", std::string(), false, std::string(), &error);
+    auto context = TLSContext::load("/tmp/cert.pem", std::string(), false, std::string(), &error);
     EXPECT_EQ(context, nullptr);
     EXPECT_NE(error.find("FLOWMQ_TLS_KEY"), std::string::npos) << error;
 }
 
-TEST(TlsContextTest, VerifyClientsRequiresCA)
+TEST(TLSContextTest, VerifyClientsRequiresCA)
 {
     std::string error;
-    auto context = TlsContext::load("/tmp/cert.pem", "/tmp/key.pem", /*verifyClients=*/true,
+    auto context = TLSContext::load("/tmp/cert.pem", "/tmp/key.pem", /*verifyClients=*/true,
                                     std::string(), &error);
     EXPECT_EQ(context, nullptr);
     EXPECT_NE(error.find("FLOWMQ_TLS_CA"), std::string::npos) << error;
 }
 
-TEST(TlsContextTest, RejectsAMissingCertificateFile)
+TEST(TLSContextTest, RejectsAMissingCertificateFile)
 {
     std::string error;
-    auto context = TlsContext::load("/nonexistent/cert.pem", "/nonexistent/key.pem", false,
+    auto context = TLSContext::load("/nonexistent/cert.pem", "/nonexistent/key.pem", false,
                                     std::string(), &error);
     EXPECT_EQ(context, nullptr);
     EXPECT_FALSE(error.empty());
 }
 
-TEST(TlsContextTest, LoadsARealCertificate)
+TEST(TLSContextTest, LoadsARealCertificate)
 {
     if (!fixturesAvailable()) {
         GTEST_SKIP() << "test certificate not present (TLS wire tests generate it)";
     }
     std::string error;
-    auto context = TlsContext::load(testCert(), testKey(), false, std::string(), &error);
+    auto context = TLSContext::load(testCert(), testKey(), false, std::string(), &error);
     ASSERT_NE(context, nullptr) << error;
     EXPECT_TRUE(context->enabled());
     EXPECT_TRUE(error.empty());
 }
 
-TEST(TlsContextTest, RejectsAKeyThatDoesNotMatchTheCertificate)
+TEST(TLSContextTest, RejectsAKeyThatDoesNotMatchTheCertificate)
 {
     if (!fixturesAvailable()) {
         GTEST_SKIP() << "test certificate not present (TLS wire tests generate it)";
@@ -72,7 +72,7 @@ TEST(TlsContextTest, RejectsAKeyThatDoesNotMatchTheCertificate)
     // Use the certificate's own source as a bogus key file: it parses as PEM
     // but is not a private key, which must be refused
     std::string error;
-    auto context = TlsContext::load(testCert(), testCert(), false, std::string(), &error);
+    auto context = TLSContext::load(testCert(), testCert(), false, std::string(), &error);
     EXPECT_EQ(context, nullptr);
     EXPECT_FALSE(error.empty());
 }

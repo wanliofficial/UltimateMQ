@@ -35,7 +35,7 @@ class Connection : public Client, public std::enable_shared_from_this<Connection
 
 public:
     explicit Connection(int sockfd, Broker* broker,
-                        std::shared_ptr<TlsContext> tls = nullptr);
+                        std::shared_ptr<TLSContext> TLS = nullptr);
     ~Connection();
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;

@@ -11,13 +11,13 @@
 
 namespace MQTT {
 
-TlsContext::~TlsContext() {
+TLSContext::~TLSContext() {
     if (ctx_) {
         SSL_CTX_free(ctx_);
     }
 }
 
-std::shared_ptr<TlsContext> TlsContext::load(const std::string &certPath,
+std::shared_ptr<TLSContext> TLSContext::load(const std::string &certPath,
                                             const std::string &keyPath,
                                             bool verifyClients,
                                             const std::string &caPath,
@@ -84,22 +84,22 @@ std::shared_ptr<TlsContext> TlsContext::load(const std::string &certPath,
         SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
     }
 
-    auto context = std::shared_ptr<TlsContext>(new TlsContext());
+    auto context = std::shared_ptr<TLSContext>(new TLSContext());
     context->ctx_ = ctx;
     return context;
 }
-SSL *TlsContext::createSsl() const {
+SSL *TLSContext::createSsl() const {
     if (!ctx_) {
         return nullptr;
     }
     return SSL_new(ctx_);
 }
 
-SecureTransport::SecureTransport(int fd, std::shared_ptr<TlsContext> tls,
+SecureTransport::SecureTransport(int fd, std::shared_ptr<TLSContext> TLS,
                                  int writeTimeoutMs)
-    : fd_(fd), tls_(std::move(tls)), writeTimeoutMs_(writeTimeoutMs) {
-    if (tls_ && tls_->enabled()) {
-        ssl_ = tls_->createSsl();
+    : fd_(fd), TLS_(std::move(TLS)), writeTimeoutMs_(writeTimeoutMs) {
+    if (TLS_ && TLS_->enabled()) {
+        ssl_ = TLS_->createSsl();
         if (ssl_) {
             SSL_set_fd(ssl_, fd_);
         }

@@ -21,19 +21,19 @@ namespace MQTT {
  * owns no per-connection state. When no certificate is configured the broker
  * stays in plaintext mode and this object is empty.
  */
-class TlsContext {
+class TLSContext {
 public:
     //! Load the certificate/key. Returns an empty context (evaluate with
     //! enabled()) when no certificate path is given. On a real failure returns
     //! nullptr and describes the problem in *error.
-    static std::shared_ptr<TlsContext> load(const std::string &certPath,
+    static std::shared_ptr<TLSContext> load(const std::string &certPath,
                                             const std::string &keyPath,
                                             bool verifyClients = false,
                                             const std::string &caPath = std::string(),
                                             std::string *error = nullptr);
-    ~TlsContext();
-    TlsContext(const TlsContext &) = delete;
-    TlsContext &operator=(const TlsContext &) = delete;
+    ~TLSContext();
+    TLSContext(const TLSContext &) = delete;
+    TLSContext &operator=(const TLSContext &) = delete;
 
     //! True when a certificate was loaded (the listener speaks TLS)
     bool enabled() const { return ctx_ != nullptr; }
@@ -43,7 +43,7 @@ public:
     SSL *createSsl() const;
 
 private:
-    TlsContext() = default;
+    TLSContext() = default;
     SSL_CTX *ctx_ = nullptr;
 };
 
@@ -63,16 +63,16 @@ public:
     //! FLOWMQ_WRITE_TIMEOUT_MS; this is the default.
     static constexpr int WRITE_STALL_TIMEOUT_MS = 5000;
 
-    //! \p tls may be null for a plaintext connection. \p writeTimeoutMs bounds a
+    //! \p TLS may be null for a plaintext connection. \p writeTimeoutMs bounds a
     //! single stalled write before the connection is dropped.
-    SecureTransport(int fd, std::shared_ptr<TlsContext> tls,
+    SecureTransport(int fd, std::shared_ptr<TLSContext> TLS,
                     int writeTimeoutMs = WRITE_STALL_TIMEOUT_MS);
     ~SecureTransport();
     SecureTransport(const SecureTransport &) = delete;
     SecureTransport &operator=(const SecureTransport &) = delete;
 
     int fd() const { return fd_; }
-    bool tlsEnabled() const { return ssl_ != nullptr; }
+    bool TLSEnabled() const { return ssl_ != nullptr; }
 
     //! Perform the TLS handshake (a no-op for a plaintext connection)
     bool handshake(std::string *error = nullptr);
@@ -93,7 +93,7 @@ public:
 
 private:
     int fd_;
-    std::shared_ptr<TlsContext> tls_;
+    std::shared_ptr<TLSContext> TLS_;
     SSL *ssl_ = nullptr;
     //! Per-connection stalled-write bound (milliseconds)
     int writeTimeoutMs_;

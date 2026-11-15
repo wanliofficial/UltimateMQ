@@ -44,7 +44,7 @@ private:
 
     Broker* broker;
     std::unique_ptr<Auth> auth;
-    std::shared_ptr<TlsContext> tls;
+    std::shared_ptr<TLSContext> TLS;
     std::unique_ptr<Store> store;
     std::unique_ptr<Listener> listener;
     std::atomic<bool> running{false};

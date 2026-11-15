@@ -74,13 +74,13 @@ Server::Server(int port, size_t maxConnections)
     bool tlsVerifyClients = getenv("FLOWMQ_TLS_VERIFY_CLIENTS") != nullptr;
     const char* tlsCa = getenv("FLOWMQ_TLS_CA");
     std::string tlsError;
-    tls = TlsContext::load(tlsCert ? tlsCert : "", tlsKey ? tlsKey : "",
+    TLS = TLSContext::load(tlsCert ? tlsCert : "", tlsKey ? tlsKey : "",
                            tlsVerifyClients, tlsCa ? tlsCa : "", &tlsError);
     if (!tlsError.empty()) {
         throw std::runtime_error("failed to configure TLS: " + tlsError);
     }
-    logInfo("transport %s", tls && tls->enabled() ? "TLS" : "plaintext");
-    if (tls && tls->enabled() && !auth->authRequired()) {
+    logInfo("transport %s", TLS && TLS->enabled() ? "TLS" : "plaintext");
+    if (TLS && TLS->enabled() && !auth->authRequired()) {
         logError("TLS is enabled without authentication: the connection is encrypted but the client is anonymous");
     }
 
@@ -319,7 +319,7 @@ void Server::run() {
 
         // The shared_ptr keeps the connection alive for the lifetime of the
         // session callbacks, even if the thread itself has already finished
-        auto connection = std::make_shared<Connection>(clientSocket, broker, tls);
+        auto connection = std::make_shared<Connection>(clientSocket, broker, TLS);
         registerConnection(clientSocket, connection);
 
         std::thread clientThread([this, clientSocket, connection]() {
