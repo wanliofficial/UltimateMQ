@@ -51,6 +51,39 @@ Notes:
   `tlsCa`) may keep lower-case spelling for readability, since they are not
   standalone uses of the initialism as a name.
 
+## Versioning
+
+Releases use the **CoolVer** scheme (syntactically SemVer-compatible), formatted:
+
+```
+REGULAR.HOTFIX[-PRERELEASE]
+```
+
+where `REGULAR = VANITY.RELEASE`:
+
+- **VANITY** — bumped when there are notable or exciting changes. Bumping it
+  **resets RELEASE** back to 0.
+- **RELEASE** — the ordinary feature-release counter; incremented for each
+  regular release, reset to 0 when VANITY is bumped.
+- **HOTFIX** — `0` for a regular release; otherwise a counter that increases
+  monotonically across the whole history (used to fix bugs in an existing
+  release). A backport to an older base `B` of hotfix `H` on release `R` is
+  tagged `V.B.H`.
+- **PRERELEASE** — an optional `CHANNEL.NUMBER` suffix (`alpha`, `beta`, `rc`)
+  for unstable testing builds; dropped for a final release.
+
+Examples: `0.0.0-alpha.0` → `0.1.0` (first stable) → `0.1.2` (hotfix) →
+`0.2.0` (next feature release) → `1.0.0-rc.1` → `1.0.0`.
+
+When cutting a release:
+
+- decide the bump from the changes since the last tag (new features → bump
+  RELEASE and reset HOTFIX to 0; a bug fix to an already-shipped release →
+  bump HOTFIX);
+- tag the release commit with an **annotated** tag (`git tag -a <version> -m ...`)
+  carrying a short changelog, then `git push origin <version>`;
+- the version is a git tag, not a string baked into the source.
+
 ## Backward compatibility
 
 Opt-in behaviour must not change when no new environment variable or config is
