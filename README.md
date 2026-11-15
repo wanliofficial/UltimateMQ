@@ -45,6 +45,7 @@ All configuration is read from environment variables at startup.
 | `FLOWMQ_TLS_KEY` | unset | Private key (PEM) matching `FLOWMQ_TLS_CERT` |
 | `FLOWMQ_TLS_CA` | unset | CA bundle used to verify client certificates |
 | `FLOWMQ_TLS_VERIFY_CLIENTS` | unset | When set, a client certificate signed by `FLOWMQ_TLS_CA` is required |
+| `FLOWMQ_TLS_CERT_AS_USERNAME` | unset | With mutual TLS, authorise a client that sends no MQTT username under its certificate CN |
 
 When neither file is set the broker stays fully open (every client may
 connect and use every topic), which keeps the historical behaviour.#### Users (`FLOWMQ_PASSWORD_FILE`)
@@ -247,6 +248,44 @@ FLOWMQ_PASSWORD_FILE=/etc/flowmq/users.txt \
 * Set `FLOWMQ_TLS_VERIFY_CLIENTS` together with `FLOWMQ_TLS_CA` to also require
   a client certificate signed by that CA (mutual TLS). A client without a valid
   certificate is dropped at the handshake.
+* With mutual TLS in place, `FLOWMQ_TLS_CERT_AS_USERNAME` lets the certificate
+  stand in for the MQTT username (see below).
+
+##### Certificate identity (`FLOWMQ_TLS_CERT_AS_USERNAME`)
+
+A verified client certificate already proves who the client is, so having to
+send a username **and** a password on top of it is redundant. When
+`FLOWMQ_TLS_CERT_AS_USERNAME` is set, a client that presents no MQTT username is
+authorised under its certificate's subject Common Name (CN), and the ACL is
+enforced for that identity exactly as for a username:
+
+```bash
+FLOWMQ_TLS_CERT=/etc/flowmq/server.crt \
+FLOWMQ_TLS_KEY=/etc/flowmq/server.key \
+FLOWMQ_TLS_CA=/etc/flowmq/clients-ca.crt \
+FLOWMQ_TLS_VERIFY_CLIENTS=1 \
+FLOWMQ_TLS_CERT_AS_USERNAME=1 \
+FLOWMQ_PASSWORD_FILE=/etc/flowmq/users.txt \
+FLOWMQ_ACL_FILE=/etc/flowmq/acl.txt \
+./flowmq
+
+# acl.txt: what the holder of CN=telemetry-01 may do
+# telemetry-01,read,sensors/#
+# telemetry-01,write,sensors/telemetry-01
+```
+
+* The identity is taken from the **verified** certificate only: a plaintext
+  connection, a client that presented no certificate, or one whose chain failed
+  to verify yields no identity and is never authorised this way.
+* The CN is used as-is; if the certificate has no CN the whole subject DN is
+  used instead.
+* A client that **does** send a username is still authenticated by
+  username/password, which takes precedence over its certificate.
+* When authentication is enabled and neither a username nor a certificate
+  identity is available, the connection is refused with CONNACK
+  `BAD_USERNAME_OR_PASSWORD` (`0x86`), as before.
+* Unset by default: without it, mutual TLS only proves the client holds a valid
+  certificate, and a username is still required to be authorised.
 
 #### Maximum packet size (`FLOWMQ_MAX_PACKET_SIZE`)
 

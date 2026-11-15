@@ -77,4 +77,29 @@ TEST(TLSContextTest, RejectsAKeyThatDoesNotMatchTheCertificate)
     EXPECT_FALSE(error.empty());
 }
 
+TEST(TLSPeerIdentityTest, APlaintextTransportHasNoPeerIdentity)
+{
+    // A SecureTransport without TLS must never claim a certificate identity:
+    // that is what keeps the certificate-as-username path inert in plaintext.
+    SecureTransport transport(-1, nullptr, 1000);
+    EXPECT_FALSE(transport.TLSEnabled());
+    EXPECT_FALSE(transport.peerVerified());
+    EXPECT_TRUE(transport.peerIdentity().empty());
+}
+
+TEST(TLSPeerIdentityTest, ATLSTransportWithoutAPeerCannotBeVerified)
+{
+    if (!fixturesAvailable()) {
+        GTEST_SKIP() << "test certificate not present (TLS wire tests generate it)";
+    }
+    std::string error;
+    auto context = TLSContext::load(testCert(), testKey(), false, std::string(), &error);
+    ASSERT_NE(context, nullptr) << error;
+    // No peer has been seen yet, so neither the verification flag nor an
+    // identity may be reported before (or without) a completed handshake.
+    SecureTransport transport(-1, context, 1000);
+    EXPECT_FALSE(transport.peerVerified());
+    EXPECT_TRUE(transport.peerIdentity().empty());
+}
+
 } // namespace MQTT

@@ -3,11 +3,14 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 namespace MQTT {
 
@@ -137,6 +140,54 @@ bool SecureTransport::handshake(std::string *error) {
         *error = std::string("TLS handshake failed: ") + buf;
     }
     return false;
+}
+
+bool SecureTransport::peerVerified() const {
+    if (!ssl_) {
+        return false;
+    }
+    // SSL_get_verify_result reports X509_V_OK only when the peer presented a
+    // certificate that chained to our CA; with SSL_VERIFY_NONE an absent
+    // certificate is also reported as OK, so require a certificate too.
+    if (SSL_get_peer_certificate(ssl_) == nullptr) {
+        return false;
+    }
+    return SSL_get_verify_result(ssl_) == X509_V_OK;
+}
+
+std::string SecureTransport::peerIdentity() const {
+    if (!peerVerified()) {
+        return std::string();
+    }
+    // The reference is owned by us and must be freed.
+    X509 *cert = SSL_get_peer_certificate(ssl_);
+    if (!cert) {
+        return std::string();
+    }
+    std::string identity;
+    // Prefer the Common Name (CN) of the subject, the conventional client
+    // identity. Fall back to the whole subject DN if there is no CN.
+    X509_NAME *subject = X509_get_subject_name(cert);
+    if (subject) {
+        int cn = X509_NAME_get_text_by_NID(subject, NID_commonName,
+                                           nullptr, 0);
+        if (cn > 0) {
+            std::vector<char> buf(static_cast<size_t>(cn) + 1);
+            if (X509_NAME_get_text_by_NID(subject, NID_commonName, buf.data(),
+                                          static_cast<int>(buf.size())) > 0) {
+                identity = buf.data();
+            }
+        }
+        if (identity.empty()) {
+            char *dn = X509_NAME_oneline(subject, nullptr, 0);
+            if (dn) {
+                identity = dn;
+                OPENSSL_free(dn);
+            }
+        }
+    }
+    X509_free(cert);
+    return identity;
 }
 
 int SecureTransport::readable(int timeoutMs) {

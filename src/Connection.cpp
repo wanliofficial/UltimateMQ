@@ -306,26 +306,49 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     }
 
     std::string username;
-    if (auth && auth->authRequired()) {
-        if (!connect->username) {
+    // When a verified client certificate is available and the client sends no
+    // MQTT username, the certificate's identity can stand in for the username
+    // (mTLS authorisation). Gated behind FLOWMQ_TLS_CERT_AS_USERNAME so the
+    // default behaviour is unchanged.
+    const bool certAsUsername = getenv("FLOWMQ_TLS_CERT_AS_USERNAME") != nullptr;
+    bool certificateAuthenticated = false;
+    if (certAsUsername && !connect->username) {
+        const std::string identity = transport->peerIdentity();
+        if (!identity.empty()) {
+            username = identity;
+            // The certificate itself is the credential, so this identity is
+            // already authenticated; no password check applies.
+            certificateAuthenticated = true;
+            logInfo("client %s: using verified client-certificate identity %s as the username",
+                    connect->clientId.c_str(), username.c_str());
+        }
+    }
+    if (connect->username) {
+        // A username was supplied: authenticate it with the password as usual.
+        // (This takes precedence over any certificate identity.)
+        username = *connect->username;
+        if (auth && auth->authRequired()) {
+            const std::string password = connect->password ? *connect->password : std::string();
+            if (!auth->authenticate(username, password)) {
+                logInfo("rejecting client %s: bad credentials for user %s",
+                        connect->clientId.c_str(), username.c_str());
+                ConnackPacket connack{false, ReasonCode::BAD_USERNAME_OR_PASSWORD};
+                sendPacket(connack);
+                state = State::DISCONNECTED;
+                return;
+            }
+        }
+    } else if (!certificateAuthenticated) {
+        // No username and no usable certificate identity: a broker that requires
+        // authentication must reject the connection (MQTT-3.1.2-9).
+        if (auth && auth->authRequired()) {
             logInfo("rejecting client %s: username required", connect->clientId.c_str());
             ConnackPacket connack{false, ReasonCode::BAD_USERNAME_OR_PASSWORD};
             sendPacket(connack);
             state = State::DISCONNECTED;
             return;
         }
-        username = *connect->username;
-        const std::string password = connect->password ? *connect->password : std::string();
-        if (!auth->authenticate(username, password)) {
-            logInfo("rejecting client %s: bad credentials for user %s",
-                    connect->clientId.c_str(), username.c_str());
-            ConnackPacket connack{false, ReasonCode::BAD_USERNAME_OR_PASSWORD};
-            sendPacket(connack);
-            state = State::DISCONNECTED;
-            return;
-        }
-    } else if (connect->username) {
-        username = *connect->username;
+        // Authentication not required: leave the client anonymous, as before.
     }
 
     // Keep alive: normally the client's value, but the broker may prefer a

@@ -77,6 +77,17 @@ public:
     //! Perform the TLS handshake (a no-op for a plaintext connection)
     bool handshake(std::string *error = nullptr);
 
+    //! The identity of the verified client certificate, for authorisation when
+    //! the client sends no MQTT username. Returns the certificate's Common
+    //! Name (CN) when the peer presented a certificate that passed verification
+    //! and carries a CN; an empty string for a plaintext connection, a client
+    //! without a certificate, or an unverified certificate. Requires the
+    //! handshake to have completed.
+    std::string peerIdentity() const;
+    //! Whether the peer's certificate was presented and verified (X509_V_OK).
+    //! Always false for a plaintext connection.
+    bool peerVerified() const;
+
     //! Wait until the peer has data ready (or timeoutMs elapses).
     //! Returns 1 when data is ready, 0 on timeout, -1 to retry (EINTR).
     int readable(int timeoutMs);
