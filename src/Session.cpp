@@ -67,6 +67,10 @@ void Session::restore(const Snapshot &snapshot) {
         packetId = snapshot.nextPacketId == 0 ? 1 : snapshot.nextPacketId;
         subscriptions = snapshot.subscriptions;
         inflightMessages.clear();
+        // The subscription identifier is not part of the durable snapshot, so a
+        // restored session starts with none recorded; a retransmission after the
+        // next resume simply omits it.
+        inflightIdentifiers.clear();
         for (const auto &entry : snapshot.inflight) {
             inflightMessages[entry.first] = std::make_shared<Message>(entry.second);
         }
@@ -223,6 +227,7 @@ ReasonCode Session::publish(uint16_t packetId, const Message &message) {
 void Session::puback(uint16_t packetId) {
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
     if (inflightMessages.erase(packetId) > 0) {
+        inflightIdentifiers.erase(packetId);
         notifyMutation();
         releaseBlocked();
     }
@@ -231,6 +236,7 @@ void Session::puback(uint16_t packetId) {
 ReasonCode Session::pubrec(uint16_t packetId) {
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
     if (inflightMessages.erase(packetId) > 0) {
+        inflightIdentifiers.erase(packetId);
         notifyMutation();
         releaseBlocked();
         return ReasonCode::SUCCESS;
@@ -255,6 +261,7 @@ ReasonCode Session::pubrel(uint16_t packetId) {
 void Session::pubcomp(uint16_t packetId) {
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
     if (inflightMessages.erase(packetId) > 0) {
+        inflightIdentifiers.erase(packetId);
         notifyMutation();
         releaseBlocked();
     }
@@ -334,7 +341,14 @@ void Session::resume(const std::shared_ptr<Client>& client, Version protocolVers
         for (const auto& [id, stored] : inflightMessages) {
             Message outgoing = *stored;
             outgoing.dup = true;
-            pendingDeliveries.emplace_back(std::move(outgoing), id, stored->qos);
+            // Echo the original subscription identifier on the retransmitted
+            // PUBLISH (MQTT-3.3.2-5 applies to retransmissions too).
+            uint32_t identifier = 0;
+            auto idIt = inflightIdentifiers.find(id);
+            if (idIt != inflightIdentifiers.end()) {
+                identifier = idIt->second;
+            }
+            pendingDeliveries.emplace_back(std::move(outgoing), id, stored->qos, identifier);
         }
         // Now that the unacked inflight messages have been re-queued (still
         // occupying their window slots), promote any blocked messages that fit.
@@ -479,6 +493,11 @@ void Session::pushDelivery(const Message &message, QoS qos, uint32_t subscriptio
     if (qos != QoS::QOS_0) {
         id = nextPacketId();
         inflightMessages[id] = std::make_shared<Message>(outgoing);
+        // Remember the subscription identifier so a later retransmission of this
+        // inflight message still echoes it (MQTT-3.3.2-5).
+        if (subscriptionIdentifier != 0) {
+            inflightIdentifiers[id] = subscriptionIdentifier;
+        }
         notifyMutation();
     }
     // Only queue while the broker lock is held (Broker::publish) or while this
@@ -500,6 +519,9 @@ void Session::releaseBlocked() {
         uint16_t id = nextPacketId();
         blocked.packetId = id;
         inflightMessages[id] = std::make_shared<Message>(blocked.message);
+        if (blocked.subscriptionIdentifier != 0) {
+            inflightIdentifiers[id] = blocked.subscriptionIdentifier;
+        }
         notifyMutation();
         pendingDeliveries.emplace_back(std::move(blocked.message), id, blocked.qos,
                                         blocked.subscriptionIdentifier);

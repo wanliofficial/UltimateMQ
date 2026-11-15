@@ -176,6 +176,10 @@ private:
     std::set<uint16_t> awaitingPubrel;
     std::map<std::string, SubscriptionOptions> subscriptions;
     std::map<uint16_t, std::shared_ptr<Message>> inflightMessages;
+    //! The MQTT 5 Subscription Identifier carried by each inflight delivery, so
+    //! a retransmitted QoS 1/2 PUBLISH still echoes it (MQTT-3.3.2-5 applies to
+    //! retransmissions too). Keyed by the same packet id as inflightMessages.
+    std::map<uint16_t, uint32_t> inflightIdentifiers;
     std::vector<Delivery> pendingDeliveries;
     //! QoS>0 messages waiting for an inflight slot to free up under the client's
     //! MQTT 5 Receive Maximum. They have no packet id yet and are not inflight,
