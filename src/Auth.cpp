@@ -271,4 +271,28 @@ bool Auth::isForbidden(const std::string& username, const std::string& topic, bo
     return !checkAcl(username, topic, write);
 }
 
+bool Auth::isForbiddenSubscribe(const std::string& username, const std::string& filter) const {
+    if (!aclEnabled_) {
+        return false;
+    }
+    // Authorise a shared subscription by its real filter: "$share/group/" is
+    // routing metadata, and an ACL rule names a topic, never that prefix.
+    const std::string realFilter =
+        Topic::isShared(filter) ? Topic::splitShared(filter).second : filter;
+    for (const std::string& key : {username, std::string("*")}) {
+        auto it = acl_.find(key);
+        if (it == acl_.end()) continue;
+        for (const auto& [rule, canWrite] : it->second) {
+            if (canWrite) continue;
+            // The subscription is useful when it can match at least one topic
+            // the rule grants. Delivering anything else stays denied per
+            // message in isForbidden(), so a broad filter cannot leak.
+            if (Topic::filtersOverlap(realFilter, rule)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace MQTT

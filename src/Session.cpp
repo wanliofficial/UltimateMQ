@@ -360,13 +360,14 @@ void Session::setDisconnectCallback(std::function<void()> callback) {
     onDisconnect = std::move(callback);
 }
 
-void Session::deliver(const std::string &topic, const Message &message) {
+void Session::deliver(const std::string &filter, const Message &message) {
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
 
-    // Enforce read access before anything else: an unauthorized client must not
-    // learn that a message exists on a topic it can read via subscription
-    if (auth && auth->isForbidden(username, topic, /*write=*/false)) {
-        logDebug("session %s: denied read on %s (acl)", clientId.c_str(), topic.c_str());
+    // Enforce read access on the concrete topic, never on the filter: a filter
+    // can be broader than the ACL rule that grants it ("#" under
+    // "sensors/#"), and checking the filter would deny every such delivery.
+    if (auth && auth->isForbidden(username, message.topic, /*write=*/false)) {
+        logDebug("session %s: denied read on %s (acl)", clientId.c_str(), message.topic.c_str());
         return;
     }
 
@@ -374,12 +375,13 @@ void Session::deliver(const std::string &topic, const Message &message) {
     // subscriber (the fan-out queue is full of live subscribers, so this drops
     // only this one stale copy).
     if (message.isExpired(std::chrono::steady_clock::now())) {
-        logDebug("session %s: dropping expired message on %s", clientId.c_str(), topic.c_str());
+        logDebug("session %s: dropping expired message on %s", clientId.c_str(),
+                 message.topic.c_str());
         return;
     }
 
     QoS qos = message.qos;
-    auto it = subscriptions.find(topic);
+    auto it = subscriptions.find(filter);
     if (it != subscriptions.end() && it->second.maximumQos < qos) {
         // The delivered QoS is the minimum of the published QoS and the granted QoS
         qos = it->second.maximumQos;
@@ -496,18 +498,6 @@ void Session::releaseBlocked() {
         notifyMutation();
         pendingDeliveries.emplace_back(std::move(blocked.message), id, blocked.qos);
     }
-}
-
-std::string Session::matchingFilter(const std::string &topic) {
-    std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
-    // The trie only returns filters that actually match, but a session may
-    // hold the same filter under a different client; return the first hit.
-    for (const auto &[filter, options] : subscriptions) {
-        if (Topic::match(topic, filter)) {
-            return filter;
-        }
-    }
-    return topic;
 }
 
 void Session::flush() {

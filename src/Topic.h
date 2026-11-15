@@ -27,6 +27,12 @@ bool isShared(const std::string& topic);
 
 std::pair<std::string, std::string> splitShared(const std::string& topic);
 
+//! Whether two topic filters can ever match the same topic name. Used to decide
+//! whether a subscription can reach anything an ACL rule grants: a filter that
+//! cannot overlap any granted rule is refused outright, while a broader one is
+//! granted and filtered per message.
+bool filtersOverlap(const std::string& a, const std::string& b);
+
 } 
 }
 

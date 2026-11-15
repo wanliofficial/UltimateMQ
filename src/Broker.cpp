@@ -321,32 +321,45 @@ std::shared_ptr<Session> Broker::nextSharedMember(const std::string &topicFilter
 }
 
 void Broker::publish(const Message &message) {
-    std::vector<std::shared_ptr<Session>> targets;
+    std::vector<std::pair<std::shared_ptr<Session>, std::string>> targets;
     {
         std::lock_guard<std::recursive_mutex> lock(mutex);
         collectTargets(message, targets);
     }
-    // A session may match through several subscription filters (e.g. "a/#" and
-    // "a/b"): deliver a single copy per session
-    std::vector<std::shared_ptr<Session>> unique;
-    std::set<Session *> seen;
+    // A session reachable through several ordinary subscriptions (e.g. "a/#"
+    // and "a/b") receives a single copy, while every share group is its own
+    // subscription and keeps its own copy. Key the dedup on the session for
+    // ordinary deliveries and on the group's filter for shared ones.
+    std::vector<std::pair<std::shared_ptr<Session>, std::string>> unique;
+    std::set<std::pair<Session *, std::string>> seen;
     unique.reserve(targets.size());
-    for (const auto &session : targets) {
-        if (seen.insert(session.get()).second) {
-            unique.push_back(session);
+    for (auto &target : targets) {
+        // A shared subscription is identified by its full "$share/group/filter"
+        // name; an ordinary filter (even a "$SYS/..." one) shares one identity
+        // per session.
+        const bool shared = Topic::isShared(target.second);
+        std::pair<Session *, std::string> key{target.first.get(),
+                                              shared ? target.second : std::string()};
+        if (seen.insert(key).second) {
+            unique.push_back(std::move(target));
         }
     }
     // Deliveries are queued on the sessions here; the sockets are only written
     // by Session::flush() so that no client write is done while a lock is held
-    for (const auto &session : unique) {
-        session->deliver(session->matchingFilter(message.topic), message);
+    for (const auto &[session, filter] : unique) {
+        session->deliver(filter, message);
     }
-    for (const auto &session : unique) {
-        session->flush();
+    std::set<Session *> flushed;
+    for (const auto &[session, filter] : unique) {
+        if (flushed.insert(session.get()).second) {
+            session->flush();
+        }
     }
 }
 
-void Broker::collectTargets(const Message &message, std::vector<std::shared_ptr<Session>> &targets) {
+void Broker::collectTargets(
+    const Message &message,
+    std::vector<std::pair<std::shared_ptr<Session>, std::string>> &targets) {
     if (message.retain) {
         if (message.payload.empty()) {
             // An empty retained payload removes the retained message for that topic
@@ -365,7 +378,7 @@ void Broker::collectTargets(const Message &message, std::vector<std::shared_ptr<
             for (const auto &clientId : it->second) {
                 auto sessionIt = sessions.find(clientId);
                 if (sessionIt != sessions.end() && sessionIt->second) {
-                    targets.push_back(sessionIt->second);
+                    targets.emplace_back(sessionIt->second, topicFilter);
                 }
             }
         }
@@ -377,7 +390,10 @@ void Broker::collectTargets(const Message &message, std::vector<std::shared_ptr<
             for (auto &[group, members] : sharedIt->second) {
                 auto session = nextSharedMember(topicFilter, group, members);
                 if (session) {
-                    targets.push_back(std::move(session));
+                    // The full "$share/group/filter" name is what the session
+                    // stores, so it is what carries that subscription's options.
+                    targets.emplace_back(std::move(session),
+                                         "$share/" + group + "/" + topicFilter);
                 }
             }
         }

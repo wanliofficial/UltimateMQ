@@ -63,6 +63,13 @@ public:
     //! requested access. When ACL enforcement is off, this is always false.
     bool isForbidden(const std::string& username, const std::string& topic, bool write) const;
 
+    //! True when a SUBSCRIBE for \p filter must be refused. A filter is granted
+    //! when it can match at least one topic a read rule grants; anything it
+    //! matches beyond that is still withheld per message by isForbidden(). A
+    //! shared subscription is judged by its real filter, since the
+    //! "$share/group/" prefix is routing metadata and not part of the topic.
+    bool isForbiddenSubscribe(const std::string& username, const std::string& filter) const;
+
     //! Resolve the reason code to send back for a failed authenticate() call
     static ReasonCode badCredentialsReason() { return ReasonCode::BAD_USERNAME_OR_PASSWORD; }
     //! Resolve the reason code to send back for a denied ACL check

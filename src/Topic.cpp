@@ -135,4 +135,33 @@ std::pair<std::string, std::string> Topic::splitShared(const std::string& topic)
     return {groupName, actualTopic};
 }
 
+bool Topic::filtersOverlap(const std::string& a, const std::string& b) {
+    const std::vector<std::string> aLevels = split(a);
+    const std::vector<std::string> bLevels = split(b);
+    size_t i = 0;
+    size_t j = 0;
+    while (true) {
+        // '#' matches any number of levels (including none), so it can consume
+        // the whole remainder of the other filter: the two always overlap.
+        if (i < aLevels.size() && aLevels[i] == "#") {
+            return true;
+        }
+        if (j < bLevels.size() && bLevels[j] == "#") {
+            return true;
+        }
+        if (i == aLevels.size() && j == bLevels.size()) {
+            return true;  // Both ended together: the filters are the same
+        }
+        if (i == aLevels.size() || j == bLevels.size()) {
+            return false;  // One filter has more levels than the other
+        }
+        // '+' stands for exactly one level, so it overlaps anything.
+        if (aLevels[i] != "+" && bLevels[j] != "+" && aLevels[i] != bLevels[j]) {
+            return false;
+        }
+        ++i;
+        ++j;
+    }
+}
+
 }

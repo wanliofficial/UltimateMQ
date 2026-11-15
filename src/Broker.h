@@ -98,8 +98,11 @@ class Broker {
     //! Server Keep Alive property, so dead connections are always reaped.
     uint16_t serverKeepAlive = 0;
 
-    //! Resolve the target sessions; called with the broker lock held
-    void collectTargets(const Message &message, std::vector<std::shared_ptr<Session>> &targets);
+    //! Resolve the target sessions; called with the broker lock held.
+    //! Each entry pairs the session with the subscription the delivery comes
+    //! through, so the session can apply that subscription's options.
+    void collectTargets(const Message &message,
+                        std::vector<std::pair<std::shared_ptr<Session>, std::string>> &targets);
     //! Pick the member of one share group that receives the next message,
     //! advancing that group's round-robin cursor. Called with the lock held.
     std::shared_ptr<Session> nextSharedMember(const std::string &topicFilter,

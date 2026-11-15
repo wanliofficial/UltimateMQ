@@ -109,14 +109,15 @@ public:
     //! broker afterwards. Does not touch the broker.
     void restore(const Snapshot& snapshot);
 
-    //! Queue a message for this session (thread safe)
-    void deliver(const std::string& topic, const Message& message);
+    //! Queue a message for this session (thread safe). \p filter is the
+    //! subscription the delivery comes through; its options (Maximum QoS,
+    //! Retain As Published, No Local) are applied, while read access is checked
+    //! against the concrete message topic.
+    void deliver(const std::string& filter, const Message& message);
     //! Queue the retained messages matching a topic filter (honours the retain handling option)
     void deliverRetained(const std::string& topicFilter, const SubscriptionOptions& options);
     //! Hand the queued deliveries to the bound client; must be called without holding any lock
     void flush();
-    //! The subscription filter of this session that matches \p topic (or the topic itself)
-    std::string matchingFilter(const std::string &topic);
     bool isPersistent() const { return persistent; }
 
     //! Whether this session already holds the exact topic filter

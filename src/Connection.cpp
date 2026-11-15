@@ -714,8 +714,7 @@ void Connection::handleSubscribe(std::shared_ptr<SubscribePacket> subscribe) {
             rejected[i] = isV5 ? static_cast<int>(ReasonCode::TOPIC_FILTER_INVALID) : 0x80;
             continue;
         }
-        if (auth && auth->isForbidden(session->getUsername(), subscription.first,
-                                      /*write=*/false)) {
+        if (auth && auth->isForbiddenSubscribe(session->getUsername(), subscription.first)) {
             logDebug("client %s: denied subscribe to %s (acl)", session->getClientId().c_str(),
                      subscription.first.c_str());
             rejected[i] = isV5 ? static_cast<int>(ReasonCode::NOT_AUTHORIZED) : 0x80;

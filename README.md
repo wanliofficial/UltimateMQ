@@ -81,6 +81,16 @@ bob,read,#
   denied SUBSCRIBE returns SUBACK `0x87` (MQTT 5) or `0x80` (3.1.1); a denied
   PUBLISH returns PUBACK/PUBREC `0x87` and the message is not routed; a denied
   QoS 0 PUBLISH disconnects an MQTT 5 client and is dropped for 3.1.1.
+* **A subscription is granted when it can reach *some* granted topic**, and each
+  delivery is then checked against the concrete topic. With the rules above,
+  `alice` subscribing to `sensors/+` receives `sensors/temp` but not
+  `private/secret`; she may also subscribe to `#` and still only receive
+  `sensors/...`. A filter that can reach nothing she may read (e.g. `other/#`)
+  is refused with `0x87`.
+* **Shared subscriptions are judged by their real filter**: `$share/g/sensors/#`
+  is authorised as `sensors/#`, since the `$share/group/` prefix is routing
+  metadata and never part of a topic. Without this a shared subscription could
+  not be used under an ACL at all.
 * A session is bound to the user that created it: connecting with the same
   client id as a different user discards the old session instead of handing
   over its subscriptions and buffered messages.

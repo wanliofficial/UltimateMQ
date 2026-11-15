@@ -96,6 +96,44 @@ TEST(TopicTest, SplitShared)
     EXPECT_EQ(result4.second, "");
 }
 
+TEST(TopicOverlapTest, IdenticalFiltersOverlap)
+{
+    EXPECT_TRUE(Topic::filtersOverlap("a/b", "a/b"));
+    EXPECT_TRUE(Topic::filtersOverlap("#", "#"));
+    EXPECT_TRUE(Topic::filtersOverlap("a/+/c", "a/+/c"));
+}
+
+TEST(TopicOverlapTest, DifferentFirstLevelsNeverOverlap)
+{
+    EXPECT_FALSE(Topic::filtersOverlap("sensors/#", "private/#"));
+    EXPECT_FALSE(Topic::filtersOverlap("a/b", "c/b"));
+    EXPECT_FALSE(Topic::filtersOverlap("sensors/+", "private/+"));
+}
+
+TEST(TopicOverlapTest, HashOverlapsEverything)
+{
+    EXPECT_TRUE(Topic::filtersOverlap("#", "sensors/temp"));
+    EXPECT_TRUE(Topic::filtersOverlap("sensors/#", "#"));
+    // "a/#" also matches "a" (zero further levels)
+    EXPECT_TRUE(Topic::filtersOverlap("a/#", "a"));
+    EXPECT_TRUE(Topic::filtersOverlap("a", "a/#"));
+}
+
+TEST(TopicOverlapTest, PlusMatchesExactlyOneLevel)
+{
+    EXPECT_TRUE(Topic::filtersOverlap("sensors/+", "sensors/temp"));
+    EXPECT_TRUE(Topic::filtersOverlap("+/temp", "sensors/+"));
+    // "sensors/+" cannot match the two-level "sensors/a/b"
+    EXPECT_FALSE(Topic::filtersOverlap("sensors/+", "sensors/a/b"));
+    // ... nor the single-level "sensors"
+    EXPECT_FALSE(Topic::filtersOverlap("sensors/+", "sensors"));
+}
+
+TEST(TopicOverlapTest, PrefixesOfDifferentLengthDoNotOverlap)
+{
+    EXPECT_FALSE(Topic::filtersOverlap("a/b", "a/b/c"));
+    EXPECT_FALSE(Topic::filtersOverlap("a/b/c", "a/b"));
+}
 
 } // namespace MQTT
 

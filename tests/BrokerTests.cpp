@@ -2,6 +2,8 @@
 #include "Broker.h"
 #include "Session.h"
 #include "TestClient.h"
+#include <cstdio>
+#include <fstream>
 
 class BrokerTest : public ::testing::Test
 {
@@ -298,4 +300,175 @@ TEST_F(BrokerTest, SharedRoundRobinSkipsDeletedMembers)
 
     EXPECT_EQ(a.client->size(), 2u) << "every message must still reach the live member";
     EXPECT_EQ(b.client->size(), 0u) << "a removed session must not receive anything";
+}
+
+namespace {
+//! A broker with an ACL loaded, plus the Auth object that owns it
+struct AclBroker {
+    MQTT::Auth auth;
+    MQTT::Broker broker;
+
+    explicit AclBroker(const std::string &acl)
+    {
+        const std::string path = "/tmp/flowmq_broker_acl_" + std::to_string(::getpid());
+        std::ofstream out(path, std::ios::binary);
+        out << acl;
+        out.close();
+        std::string error;
+        EXPECT_TRUE(auth.loadAcl(path, &error)) << error;
+        std::remove(path.c_str());
+        broker.setAuth(&auth);
+    }
+};
+
+//! A session that authenticated as \p username, with a recording client
+std::shared_ptr<MQTT::RecordingClient> aclSubscriber(MQTT::Broker &broker,
+                                                     const std::string &clientId,
+                                                     const std::string &username,
+                                                     const std::string &filter,
+                                                     MQTT::SubscriptionOptions options)
+{
+    auto session = std::make_shared<MQTT::Session>(&broker, clientId);
+    session->connect(session, /*persistent=*/false);
+    session->setUsername(username);
+    auto client = MQTT::test::attach(*session);
+    session->subscribe(filter, options);
+    return client;
+}
+
+MQTT::SubscriptionOptions opts(MQTT::QoS qos, bool noLocal = false,
+                               bool retainAsPublished = false)
+{
+    return MQTT::SubscriptionOptions{qos, noLocal, retainAsPublished,
+                                     MQTT::RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES};
+}
+} // namespace
+
+TEST(BrokerAclTest, AWildcardSubscriptionSeesEveryTopicTheAclGrants)
+{
+    // The ACL grants "sensors/#". A subscriber to "#" must receive a matching
+    // message: the read check is about the concrete topic, never the filter the
+    // client happened to use.
+    AclBroker env("alice,read,sensors/#\n");
+    auto client = aclSubscriber(env.broker, "wild", "alice", "#", opts(MQTT::QoS::QOS_0));
+
+    env.broker.publish(MQTT::Message("sensors/temp", "21"));
+
+    EXPECT_EQ(client->size(), 1u)
+        << "a wildcard subscription was denied a topic its ACL grants";
+}
+
+TEST(BrokerAclTest, ASharedGroupSeesEveryTopicTheAclGrants)
+{
+    // Same rule through the shared-subscription path.
+    AclBroker env("alice,read,sensors/#\n");
+    auto client = aclSubscriber(env.broker, "shared-wild", "alice", "$share/g/#",
+                                opts(MQTT::QoS::QOS_0));
+
+    env.broker.publish(MQTT::Message("sensors/temp", "21"));
+
+    EXPECT_EQ(client->size(), 1u)
+        << "a shared subscription was denied a topic its ACL grants";
+}
+
+TEST(BrokerAclTest, ADeniedTopicIsStillWithheldFromAWildcardSubscription)
+{
+    // The mirror case: a topic the ACL does not grant must not be delivered.
+    AclBroker env("alice,read,sensors/#\n");
+    auto client = aclSubscriber(env.broker, "wild-deny", "alice", "#", opts(MQTT::QoS::QOS_0));
+
+    env.broker.publish(MQTT::Message("private/secret", "x"));
+
+    EXPECT_EQ(client->size(), 0u) << "a topic outside the ACL was delivered";
+}
+
+TEST(BrokerSharedOptionsTest, SharedSubscriptionAppliesMaximumQos)
+{
+    // A shared subscription granted QoS 1 must downgrade a QoS 2 publish.
+    auto broker = std::make_shared<MQTT::Broker>();
+    auto member = makeSharedMember(broker.get(), "qos-member", "$share/g/qos/x");
+    // Re-subscribe with the QoS we want to exercise
+    member.session->subscribe("$share/g/qos/x", opts(MQTT::QoS::QOS_1));
+
+    broker->publish(MQTT::Message("qos/x", "hi", MQTT::QoS::QOS_2));
+
+    ASSERT_EQ(member.client->size(), 1u);
+    EXPECT_EQ(member.client->qosValues[0], MQTT::QoS::QOS_1)
+        << "the granted Maximum QoS must cap the delivered QoS";
+}
+
+TEST(BrokerSharedOptionsTest, SharedSubscriptionHonoursNoLocal)
+{
+    // A member that publishes to its own shared subscription must not receive
+    // the message back (the session is the originator).
+    auto broker = std::make_shared<MQTT::Broker>();
+    auto member = makeSharedMember(broker.get(), "nolocal", "$share/g/nl/x");
+    member.session->subscribe("$share/g/nl/x", opts(MQTT::QoS::QOS_0, /*noLocal=*/true));
+
+    MQTT::Message message("nl/x", "self");
+    message.originSession = member.session.get();
+    broker->publish(message);
+
+    EXPECT_EQ(member.client->size(), 0u)
+        << "No Local must suppress the client's own message";
+}
+
+TEST(BrokerSharedOptionsTest, SharedSubscriptionClearsTheRetainFlagByDefault)
+{
+    // Forwarding a live retained publish keeps RETAIN clear unless the
+    // subscription asked for Retain As Published.
+    auto broker = std::make_shared<MQTT::Broker>();
+    auto member = makeSharedMember(broker.get(), "rap", "$share/g/rap/x");
+    member.session->subscribe("$share/g/rap/x", opts(MQTT::QoS::QOS_0));
+
+    broker->publish(MQTT::Message("rap/x", "hi", MQTT::QoS::QOS_0, /*retain=*/true));
+
+    ASSERT_EQ(member.client->size(), 1u);
+    EXPECT_FALSE(member.client->delivered[0].retain)
+        << "a live forward must clear RETAIN unless Retain As Published is set";
+}
+
+TEST(BrokerSharedOptionsTest, SharedSubscriptionHonoursRetainAsPublished)
+{
+    // With Retain As Published the flag travels with the message.
+    auto broker = std::make_shared<MQTT::Broker>();
+    auto member = makeSharedMember(broker.get(), "rap-on", "$share/g/rap2/x");
+    member.session->subscribe("$share/g/rap2/x", opts(MQTT::QoS::QOS_0, false, /*rap=*/true));
+
+    broker->publish(MQTT::Message("rap2/x", "hi", MQTT::QoS::QOS_0, /*retain=*/true));
+
+    ASSERT_EQ(member.client->size(), 1u);
+    EXPECT_TRUE(member.client->delivered[0].retain)
+        << "Retain As Published must forward the RETAIN flag";
+}
+
+TEST_F(BrokerTest, ADollarTopicSubscriptionIsNotMistakenForASharedOne)
+{
+    // "$SYS/#" begins with '$' but is an ordinary subscription. A session
+    // holding it plus an overlapping filter must still receive a single copy,
+    // exactly like any other pair of overlapping ordinary subscriptions.
+    auto session = std::make_shared<MQTT::Session>(broker, "sys-sub");
+    session->connect(session, /*persistent=*/false);
+    auto client = MQTT::test::attach(*session);
+    session->subscribe("$SYS/#", opts(MQTT::QoS::QOS_0));
+    session->subscribe("$SYS/broker/uptime", opts(MQTT::QoS::QOS_0));
+
+    broker->publish(MQTT::Message("$SYS/broker/uptime", "42"));
+
+    EXPECT_EQ(client->size(), 1u) << "overlapping ordinary subscriptions must deliver once";
+}
+
+TEST_F(BrokerTest, AnOrdinaryAndASharedSubscriptionOnTheSameTopicEachDeliver)
+{
+    // The two are independent subscriptions, so the client gets two copies.
+    auto session = std::make_shared<MQTT::Session>(broker, "both-sub");
+    session->connect(session, /*persistent=*/false);
+    auto client = MQTT::test::attach(*session);
+    session->subscribe("both/x", opts(MQTT::QoS::QOS_0));
+    session->subscribe("$share/g/both/x", opts(MQTT::QoS::QOS_0));
+
+    broker->publish(MQTT::Message("both/x", "hi"));
+
+    EXPECT_EQ(client->size(), 2u)
+        << "an ordinary and a shared subscription must each deliver a copy";
 }
