@@ -61,12 +61,14 @@ public:
     void handleAuth(std::shared_ptr<AuthPacket> packet);
 
     //! Client interface: write a delivery to the socket (called without any broker/session lock)
-    void deliver(const Message& message, uint16_t packetId, QoS qos) override;
+    void deliver(const Message& message, uint16_t packetId, QoS qos,
+                 uint32_t subscriptionIdentifier = 0) override;
     //! Client interface: resend a PUBREC for an inbound QoS 2 flow awaiting PUBREL
     void sendPubrec(uint16_t packetId) override;
     //! Client interface: a newer connection has taken over this session; stop using it
     void onSuperseded(Version version) override;
-    void handleDeliver(const Message& message, uint16_t packetId, QoS qos);
+    void handleDeliver(const Message& message, uint16_t packetId, QoS qos,
+                       uint32_t subscriptionIdentifier = 0);
     void sendPacket(Packet &packet);
 
 private:
@@ -104,7 +106,13 @@ private:
     //! one with a topic name registers/updates the mapping, one without a topic
     //! resolves through it.
     static constexpr uint16_t TOPIC_ALIAS_MAXIMUM = 16;
-    std::map<uint16_t, std::string> topicAliases;    //! Expand an inbound PUBLISH's Topic Alias into its topic name. Returns false
+    std::map<uint16_t, std::string> topicAliases;
+    //! Largest packet the client accepts (MQTT 5 Maximum Packet Size,
+    //! MQTT-3.1.2-24). 0 means "no limit" (the property was absent). A packet
+    //! larger than this is dropped instead of written, since sending it would
+    //! break the connection.
+    size_t clientMaxPacketSize = 0;
+    //! Expand an inbound PUBLISH's Topic Alias into its topic name. Returns false
     //! (after signalling the error to the client) when the alias is invalid, as
     //! MQTT-3.3.2-9 requires the connection to be closed in that case.
     bool resolveTopicAlias(const std::shared_ptr<PublishPacket>& publish);

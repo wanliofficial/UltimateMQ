@@ -472,3 +472,65 @@ TEST_F(BrokerTest, AnOrdinaryAndASharedSubscriptionOnTheSameTopicEachDeliver)
     EXPECT_EQ(client->size(), 2u)
         << "an ordinary and a shared subscription must each deliver a copy";
 }
+
+TEST_F(BrokerTest, LiveDeliveryCarriesTheSubscriptionIdentifier)
+{
+    auto session = std::make_shared<MQTT::Session>(broker, "sid-sub");
+    MQTT::SubscriptionOptions options{MQTT::QoS::QOS_0, false, false,
+                                      MQTT::RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES};
+    options.subscriptionIdentifier = 42;
+    auto client = MQTT::test::attach(*session);
+    session->connect(session);
+    session->subscribe("sid/#", options);
+
+    broker->publish(MQTT::Message("sid/x", "hi"));
+
+    ASSERT_EQ(client->size(), 1u);
+    ASSERT_EQ(client->subscriptionIdentifiers.size(), 1u);
+    EXPECT_EQ(client->subscriptionIdentifiers[0], 42u);
+    // The identifier belongs to the subscription, not the message
+    EXPECT_TRUE(client->delivered[0].properties.empty());
+}
+
+TEST_F(BrokerTest, LiveDeliveryForwardsApplicationProperties)
+{
+    // MQTT-3.3.2-4: Content Type and friends belong to the application message
+    // and must reach every subscriber.
+    auto session = std::make_shared<MQTT::Session>(broker, "prop-sub");
+    MQTT::SubscriptionOptions options{MQTT::QoS::QOS_0, false, false,
+                                      MQTT::RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES};
+    auto client = MQTT::test::attach(*session);
+    session->connect(session);
+    session->subscribe("prop/#", options);
+
+    MQTT::Message message("prop/x", "hi");
+    message.properties[MQTT::PropertyID::CONTENT_TYPE] = std::string("text/plain");
+    message.properties[MQTT::PropertyID::USER_PROPERTY] =
+        MQTT::UserProperties{{"trace", "abc"}};
+    broker->publish(message);
+
+    ASSERT_EQ(client->size(), 1u);
+    const auto &delivered = client->delivered[0];
+    ASSERT_EQ(delivered.properties.size(), 2u);
+    EXPECT_EQ(std::get<std::string>(delivered.properties.at(MQTT::PropertyID::CONTENT_TYPE)),
+              "text/plain");
+    const auto &pairs =
+        std::get<MQTT::UserProperties>(delivered.properties.at(MQTT::PropertyID::USER_PROPERTY));
+    EXPECT_EQ(pairs.at("trace"), "abc");
+}
+
+TEST_F(BrokerTest, ASubscriptionWithoutAnIdentifierDeliversNone)
+{
+    auto session = std::make_shared<MQTT::Session>(broker, "plain-sub");
+    MQTT::SubscriptionOptions options{MQTT::QoS::QOS_0, false, false,
+                                      MQTT::RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES};
+    auto client = MQTT::test::attach(*session);
+    session->connect(session);
+    session->subscribe("plain/#", options);
+
+    broker->publish(MQTT::Message("plain/x", "hi"));
+
+    ASSERT_EQ(client->size(), 1u);
+    ASSERT_EQ(client->subscriptionIdentifiers.size(), 1u);
+    EXPECT_EQ(client->subscriptionIdentifiers[0], 0u);
+}

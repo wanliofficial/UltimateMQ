@@ -35,7 +35,8 @@ class Broker;
 class Client {
 public:
     virtual ~Client() = default;
-    virtual void deliver(const Message& message, uint16_t packetId, QoS qos) = 0;
+    virtual void deliver(const Message& message, uint16_t packetId, QoS qos,
+                         uint32_t subscriptionIdentifier = 0) = 0;
     //! Resend a PUBREC for an inbound QoS 2 flow that is still awaiting its PUBREL.
     //! Called on resume so a client whose PUBREL was lost can complete the
     //! handshake instead of starting the QoS 2 flow over.
@@ -149,9 +150,13 @@ private:
         Message message;
         uint16_t packetId;
         QoS qos;
+        //! MQTT 5 Subscription Identifier of the subscription that caused this
+        //! delivery (0 for none); echoed on the PUBLISH (MQTT-3.3.2-5).
+        uint32_t subscriptionIdentifier;
 
-        Delivery(Message message, uint16_t packetId, QoS qos)
-            : message(std::move(message)), packetId(packetId), qos(qos) {}
+        Delivery(Message message, uint16_t packetId, QoS qos, uint32_t subscriptionIdentifier = 0)
+            : message(std::move(message)), packetId(packetId), qos(qos),
+              subscriptionIdentifier(subscriptionIdentifier) {}
     };
 
     std::string clientId;
@@ -191,7 +196,7 @@ private:
     //! Called with deliveryMutex held; never takes any other lock
     void notifyMutation();
 
-    void pushDelivery(const Message& message, QoS qos);
+    void pushDelivery(const Message& message, QoS qos, uint32_t subscriptionIdentifier = 0);
     void removeSubscriptions(const std::map<std::string, SubscriptionOptions>& filters);
     uint16_t nextPacketId();
     //! Move blocked QoS>0 messages into the inflight set / send queue while the

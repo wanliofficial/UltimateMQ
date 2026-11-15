@@ -485,4 +485,123 @@ TEST_F(FrameTest, SerializePubackFailureCarriesReasonCodeOnMqtt5)
               (std::vector<uint8_t>{0x40, 0x04, 0x00, 0x07, 0x91, 0x00}));
 }
 
+TEST_F(FrameTest, SerializePublishEmitsItsPropertiesOnMqtt5)
+{
+    // Every MQTT 5 PUBLISH carries a property length; properties that are set
+    // must actually reach the wire. Emitting an empty section silently dropped
+    // Subscription Identifier, Message Expiry, User Properties and friends.
+    Frame mqtt5(Version::MQTT5);
+    PublishPacket packet;
+    packet.type = PacketType::PUBLISH;
+    packet.qos = QoS::QOS_0;
+    packet.topicName = "a/b";
+    packet.payload = {'h', 'i'};
+    packet.properties[PropertyID::SUBSCRIPTION_IDENTIFIER] = static_cast<uint32_t>(7);
+
+    auto serialized = mqtt5.serializePublish(packet);
+
+    // Fixed header (1) + remaining length (1) + topic (2 + 3) + property
+    // length (1) + property (0x0B, 0x07) + payload (2)
+    ASSERT_EQ(serialized.size(), 2 + 5 + 1 + 2 + 2);
+    EXPECT_EQ(serialized[0], 0x30);
+    EXPECT_EQ(serialized[1], 10);   // remaining length
+    EXPECT_EQ(serialized[2], 0x00); // topic length hi
+    EXPECT_EQ(serialized[3], 0x03); // topic length lo
+    EXPECT_EQ(serialized[7], 2);    // property length = 2 bytes
+    EXPECT_EQ(serialized[8], 0x0B); // SUBSCRIPTION_IDENTIFIER
+    EXPECT_EQ(serialized[9], 0x07); // value 7
+    EXPECT_EQ(serialized[10], 'h');
+    EXPECT_EQ(serialized[11], 'i');
+}
+
+TEST_F(FrameTest, SerializePublishWithNoPropertiesEmitsAZeroLength)
+{
+    // A properties-free MQTT 5 PUBLISH still needs its (zero) property length.
+    Frame mqtt5(Version::MQTT5);
+    PublishPacket packet;
+    packet.type = PacketType::PUBLISH;
+    packet.qos = QoS::QOS_0;
+    packet.topicName = "a";
+    packet.payload = {'x'};
+
+    auto serialized = mqtt5.serializePublish(packet);
+
+    ASSERT_EQ(serialized.size(), 2 + 3 + 1 + 1);
+    EXPECT_EQ(serialized[1], 5);  // remaining length
+    EXPECT_EQ(serialized[5], 0);  // property length
+    EXPECT_EQ(serialized[6], 'x');
+}
+
+TEST_F(FrameTest, SerializePublishOmitsPropertiesOnMqtt311)
+{
+    // MQTT 3.1.1 has no property section at all.
+    Frame mqtt311(Version::MQTT311);
+    PublishPacket packet;
+    packet.type = PacketType::PUBLISH;
+    packet.qos = QoS::QOS_0;
+    packet.topicName = "a";
+    packet.payload = {'x'};
+    packet.properties[PropertyID::SUBSCRIPTION_IDENTIFIER] = static_cast<uint32_t>(7);
+
+    auto serialized = mqtt311.serializePublish(packet);
+
+    ASSERT_EQ(serialized.size(), 2 + 3 + 1);
+    EXPECT_EQ(serialized[1], 4);  // remaining length: no property section
+    EXPECT_EQ(serialized[5], 'x');
+}
+
+TEST_F(FrameTest, SubscriptionIdentifierUsesAVariableByteInteger)
+{
+    // Larger identifiers take more than one byte, with the continuation bit set.
+    Frame mqtt5(Version::MQTT5);
+    PublishPacket packet;
+    packet.type = PacketType::PUBLISH;
+    packet.qos = QoS::QOS_0;
+    packet.topicName = "a";
+    packet.properties[PropertyID::SUBSCRIPTION_IDENTIFIER] = static_cast<uint32_t>(300);
+
+    auto serialized = mqtt5.serializePublish(packet);
+
+    // 300 = 0b1_0010_1100 -> two 7-bit groups: 0xAC (continuation), 0x02
+    ASSERT_EQ(serialized.size(), 2 + 3 + 1 + 3);
+    EXPECT_EQ(serialized[1], 7);     // remaining length
+    EXPECT_EQ(serialized[5], 3);     // property length = 3 bytes
+    EXPECT_EQ(serialized[6], 0x0B);  // SUBSCRIPTION_IDENTIFIER
+    EXPECT_EQ(serialized[7], 0xAC);
+    EXPECT_EQ(serialized[8], 0x02);
+}
+
+TEST_F(FrameTest, ParsesSubscriptionIdentifierFromASubscribe)
+{
+    // The SUBSCRIBE property is a Variable Byte Integer with no length byte.
+    Frame mqtt5(Version::MQTT5);
+    std::vector<uint8_t> payload = {
+        0x00, 0x01,                          // packet id
+        0x02,                                // property length
+        0x0B, 0x07,                          // SUBSCRIPTION_IDENTIFIER = 7
+        0x00, 0x03, 'a', '/', 'b',           // filter
+        0x01,                                // options: QoS 1
+    };
+    auto subscribe = mqtt5.parseSubscribe(payload.data(), payload.size());
+
+    ASSERT_EQ(subscribe.subscriptions.size(), 1u);
+    EXPECT_EQ(subscribe.subscriptions[0].first, "a/b");
+    EXPECT_EQ(subscribe.subscriptions[0].second.maximumQos, QoS::QOS_1);
+    EXPECT_EQ(subscribe.subscriptions[0].second.subscriptionIdentifier, 7u);
+}
+
+TEST_F(FrameTest, RejectsASubscriptionIdentifierOfZero)
+{
+    // MQTT-3.8.2-16: the value 0 is a protocol error.
+    Frame mqtt5(Version::MQTT5);
+    std::vector<uint8_t> payload = {
+        0x00, 0x01,
+        0x02,
+        0x0B, 0x00,        // SUBSCRIPTION_IDENTIFIER = 0
+        0x00, 0x01, 'a',
+        0x00,
+    };
+    EXPECT_THROW(mqtt5.parseSubscribe(payload.data(), payload.size()), std::runtime_error);
+}
+
 } // namespace MQTT

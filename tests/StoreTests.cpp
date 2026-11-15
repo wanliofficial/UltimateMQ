@@ -307,3 +307,105 @@ TEST(BrokerStoreTest, RestoredSharedGroupsStillRoute)
     ASSERT_EQ(subscriber->size(), 1U)
         << "the restored share group did not route a matching publish";
 }
+
+namespace MQTT {
+
+TEST(StoreTest, RoundTripsForwardedMessageProperties)
+{
+    // MQTT 5 properties travel with the publication, so a restored retained or
+    // queued message must still carry them to the subscriber.
+    const std::string path = tempPath("props.dat");
+    Store store(path, std::chrono::milliseconds(10));
+
+    PersistedState state;
+    Message retained = messageFor("p/q", "kept", QoS::QOS_0, /*retain=*/true);
+    retained.properties[PropertyID::CONTENT_TYPE] = std::string("text/plain");
+    retained.properties[PropertyID::RESPONSE_TOPIC] = std::string("p/reply");
+    retained.properties[PropertyID::PAYLOAD_FORMAT_INDICATOR] = static_cast<uint8_t>(1);
+    retained.properties[PropertyID::USER_PROPERTY] = UserProperties{{"k1", "v1"}, {"k2", "v2"}};
+    state.retained["p/q"] = retained;
+
+    PersistedSession session;
+    session.clientId = "prop-client";
+    session.nextPacketId = 4;
+    session.inflight.emplace_back(2, retained);
+    session.blocked.push_back(retained);
+    state.sessions.push_back(session);
+
+    ASSERT_TRUE(store.flushNow([&state] { return state; }));
+
+    PersistedState loaded;
+    std::string error;
+    ASSERT_TRUE(store.load(loaded, &error)) << error;
+    ASSERT_EQ(loaded.retained.size(), 1U);
+    const Message &back = loaded.retained.at("p/q");
+    ASSERT_EQ(back.properties.size(), 4U);
+    EXPECT_EQ(std::get<std::string>(back.properties.at(PropertyID::CONTENT_TYPE)), "text/plain");
+    EXPECT_EQ(std::get<std::string>(back.properties.at(PropertyID::RESPONSE_TOPIC)), "p/reply");
+    EXPECT_EQ(std::get<uint8_t>(back.properties.at(PropertyID::PAYLOAD_FORMAT_INDICATOR)), 1);
+    const auto &pairs = std::get<UserProperties>(back.properties.at(PropertyID::USER_PROPERTY));
+    ASSERT_EQ(pairs.size(), 2U);
+    EXPECT_EQ(pairs.at("k1"), "v1");
+    EXPECT_EQ(pairs.at("k2"), "v2");
+
+    ASSERT_EQ(loaded.sessions.size(), 1U);
+    ASSERT_EQ(loaded.sessions[0].inflight.size(), 1U);
+    ASSERT_EQ(loaded.sessions[0].blocked.size(), 1U);
+    EXPECT_EQ(loaded.sessions[0].inflight[0].second.properties.size(), 4U);
+    EXPECT_EQ(loaded.sessions[0].blocked[0].properties.size(), 4U);
+
+    ::remove(path.c_str());
+}
+
+TEST(StoreTest, LoadsAStateFileWithoutMessagePropertyColumns)
+{
+    // Backward compatibility: records written before the property column
+    // existed must still load, just with no properties.
+    const std::string path = tempPath("legacy.dat");
+    writeRaw(path,
+             "FLOWMQ-STATE-1\n"
+             "retained 742f6f6c64 0 1 6b657074\n"
+             "session 6c6567616379 2d 3\n"
+             "sub 76 1 0 0 2\n"
+             "end\n");
+    Store store(path, std::chrono::milliseconds(10));
+
+    PersistedState state;
+    std::string error;
+    ASSERT_TRUE(store.load(state, &error)) << error;
+    ASSERT_EQ(state.retained.size(), 1U);
+    EXPECT_EQ(state.retained.at("t/old").payload.size(), 4U);
+    EXPECT_TRUE(state.retained.at("t/old").properties.empty());
+    ASSERT_EQ(state.sessions.size(), 1U);
+    EXPECT_EQ(state.sessions[0].subscriptions.count("v"), 1U);
+
+    ::remove(path.c_str());
+}
+
+TEST(StoreTest, RoundTripsSubscriptionIdentifier)
+{
+    const std::string path = tempPath("subid.dat");
+    Store store(path, std::chrono::milliseconds(10));
+
+    PersistedState state;
+    PersistedSession session;
+    session.clientId = "sid-client";
+    session.nextPacketId = 2;
+    SubscriptionOptions options = optionsFor(QoS::QOS_1);
+    options.subscriptionIdentifier = 300;
+    session.subscriptions["s/t"] = options;
+    state.sessions.push_back(session);
+
+    ASSERT_TRUE(store.flushNow([&state] { return state; }));
+
+    PersistedState loaded;
+    std::string error;
+    ASSERT_TRUE(store.load(loaded, &error)) << error;
+    ASSERT_EQ(loaded.sessions.size(), 1U);
+    ASSERT_EQ(loaded.sessions[0].subscriptions.count("s/t"), 1U);
+    EXPECT_EQ(loaded.sessions[0].subscriptions.at("s/t").subscriptionIdentifier, 300U);
+
+    ::remove(path.c_str());
+}
+
+} // namespace MQTT

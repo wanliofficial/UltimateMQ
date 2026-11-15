@@ -9,12 +9,14 @@ namespace MQTT {
 //! Records everything the session hands to its client
 class RecordingClient : public Client {
 public:
-    void deliver(const Message &message, uint16_t packetId, QoS qos) override {
+    void deliver(const Message &message, uint16_t packetId, QoS qos,
+                 uint32_t subscriptionIdentifier = 0) override {
         // Deliveries can come from any publishing thread
         std::lock_guard<std::mutex> lock(mutex);
         delivered.push_back(message);
         packetIds.push_back(packetId);
         qosValues.push_back(qos);
+        subscriptionIdentifiers.push_back(subscriptionIdentifier);
     }
 
     void sendPubrec(uint16_t packetId) override {
@@ -37,6 +39,7 @@ public:
     std::vector<Message> delivered;
     std::vector<uint16_t> packetIds;
     std::vector<QoS> qosValues;
+    std::vector<uint32_t> subscriptionIdentifiers;
     std::vector<uint16_t> resentPubrecs;
     std::atomic<int> superseded{0};
 

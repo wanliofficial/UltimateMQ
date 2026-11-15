@@ -403,7 +403,9 @@ void Session::deliver(const std::string &filter, const Message &message) {
                  clientId.c_str(), message.topic.c_str());
         return;
     }
-    pushDelivery(outgoing, qos);
+    const uint32_t identifier =
+        it != subscriptions.end() ? it->second.subscriptionIdentifier : 0;
+    pushDelivery(outgoing, qos, identifier);
 }
 
 void Session::deliverRetained(const std::string &topicFilter, const SubscriptionOptions &options) {
@@ -443,11 +445,13 @@ void Session::deliverRetained(const std::string &topicFilter, const Subscription
         // MQTT-3.3.1-8: messages sent because of a subscription keep the retain flag
         outgoing.retain = true;
         QoS qos = message.qos < options.maximumQos ? message.qos : options.maximumQos;
-        pushDelivery(outgoing, qos);
+        // A retained delivery caused by this subscription also carries its
+        // identifier (MQTT-3.3.2-5 covers every publish the subscription causes).
+        pushDelivery(outgoing, qos, options.subscriptionIdentifier);
     }
 }
 
-void Session::pushDelivery(const Message &message, QoS qos) {
+void Session::pushDelivery(const Message &message, QoS qos, uint32_t subscriptionIdentifier) {
     // Bound the per-session queue: a persistent session that stays offline
     // would otherwise grow without limit. Once the cap is reached new messages
     // are dropped rather than buffered forever. Blocked messages count toward
@@ -467,7 +471,8 @@ void Session::pushDelivery(const Message &message, QoS qos) {
     if (qos != QoS::QOS_0 && inflightMessages.size() >= receiveMaximum) {
         logDebug("session %s: receive maximum reached (%u), blocking message on %s",
                  clientId.c_str(), receiveMaximum, message.topic.c_str());
-        blockedDeliveries.emplace_back(std::move(outgoing), /*packetId=*/0, qos);
+        blockedDeliveries.emplace_back(std::move(outgoing), /*packetId=*/0, qos,
+                                        subscriptionIdentifier);
         return;
     }
     uint16_t id = 0;
@@ -478,7 +483,7 @@ void Session::pushDelivery(const Message &message, QoS qos) {
     }
     // Only queue while the broker lock is held (Broker::publish) or while this
     // session lock is held: flush() is then called outside of both.
-    pendingDeliveries.emplace_back(std::move(outgoing), id, qos);
+    pendingDeliveries.emplace_back(std::move(outgoing), id, qos, subscriptionIdentifier);
 }
 
 void Session::releaseBlocked() {
@@ -496,7 +501,8 @@ void Session::releaseBlocked() {
         blocked.packetId = id;
         inflightMessages[id] = std::make_shared<Message>(blocked.message);
         notifyMutation();
-        pendingDeliveries.emplace_back(std::move(blocked.message), id, blocked.qos);
+        pendingDeliveries.emplace_back(std::move(blocked.message), id, blocked.qos,
+                                        blocked.subscriptionIdentifier);
     }
 }
 
@@ -520,7 +526,8 @@ void Session::flush() {
             logDebug("session %s: dropping expired queued message", clientId.c_str());
             continue;
         }
-        target->deliver(delivery.message, delivery.packetId, delivery.qos);
+        target->deliver(delivery.message, delivery.packetId, delivery.qos,
+                        delivery.subscriptionIdentifier);
     }
 }
 

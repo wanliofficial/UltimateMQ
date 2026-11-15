@@ -369,6 +369,9 @@ struct SubscriptionOptions {
     bool noLocal;
     bool retainAsPublished;
     RetainHandling retainHandling;
+    //! MQTT 5 Subscription Identifier (MQTT-3.8.2.1.2): 0 when the client set
+    //! none. It travels back on every PUBLISH this subscription causes.
+    uint32_t subscriptionIdentifier = 0;
 };
 
 struct SubscribePacket : Packet {

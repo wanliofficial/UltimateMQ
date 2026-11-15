@@ -1,4 +1,5 @@
 #include "Store.h"
+#include <type_traits>
 #include "Log.h"
 #include <cerrno>
 #include <cstdio>
@@ -64,6 +65,146 @@ Message decodeMessage(const std::string &topicHex, int qos, bool retain, const s
     message.qos = static_cast<QoS>(qos);
     message.retain = retain;
     return message;
+}
+
+//! Encode the forwardable MQTT 5 properties of a message as a single
+//! whitespace-free trail field: "<id>:<tag><body>" entries joined by commas.
+//! "-" means "no properties". The tag keeps the variant alternative exact so a
+//! round trip restores the same type.
+std::string encodeMessageProperties(const Properties &properties) {
+    if (properties.empty()) {
+        return "-";
+    }
+    std::string out;
+    for (const auto &[id, value] : properties) {
+        if (!out.empty()) {
+            out.push_back(',');
+        }
+        out += std::to_string(static_cast<int>(id));
+        out.push_back(':');
+        std::visit([&out](auto &&arg) {
+            using T = std::decay_t<decltype(arg)>;
+            if constexpr (std::is_same_v<T, bool>) {
+                out += "B";
+                out += arg ? "1" : "0";
+            } else if constexpr (std::is_same_v<T, uint8_t>) {
+                out += "b";
+                out += std::to_string(static_cast<int>(arg));
+            } else if constexpr (std::is_same_v<T, uint16_t>) {
+                out += "w";
+                out += std::to_string(arg);
+            } else if constexpr (std::is_same_v<T, uint32_t>) {
+                out += "u";
+                out += std::to_string(arg);
+            } else if constexpr (std::is_same_v<T, std::string>) {
+                out += "s";
+                out += toHex(arg);
+            } else if constexpr (std::is_same_v<T, UserProperties>) {
+                // A list of pairs, each key and value hex encoded so any byte
+                // survives; '.' separates pairs and '=' separates key/value.
+                out += "p";
+                bool first = true;
+                for (const auto &[key, val] : arg) {
+                    if (!first) {
+                        out.push_back('.');
+                    }
+                    first = false;
+                    out += toHex(key);
+                    out.push_back('=');
+                    out += toHex(val);
+                }
+            }
+        }, value);
+    }
+    return out;
+}
+
+//! Parse one non-negative decimal itself, so a corrupt state file reports an
+//! error instead of throwing out of load().
+bool parseUnsigned(const std::string &text, unsigned long long &out) {
+    if (text.empty()) {
+        return false;
+    }
+    out = 0;
+    for (char c : text) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        out = out * 10 + static_cast<unsigned long long>(c - '0');
+        if (out > 0xFFFFFFFFull) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool decodeMessageProperties(const std::string &encoded, Properties &out) {
+    if (encoded == "-" || encoded.empty()) {
+        return true;
+    }
+    std::stringstream entries(encoded);
+    std::string entry;
+    while (std::getline(entries, entry, ',')) {
+        const auto colon = entry.find(':');
+        if (colon == std::string::npos || colon + 1 >= entry.size()) {
+            return false;
+        }
+        unsigned long long id = 0;
+        if (!parseUnsigned(entry.substr(0, colon), id)) {
+            return false;
+        }
+        const char kind = entry[colon + 1];
+        const std::string body = entry.substr(colon + 2);
+        switch (kind) {
+        case 'B':
+            out[static_cast<PropertyID>(id)] = (body == "1");
+            break;
+        case 'b':
+        case 'w':
+        case 'u': {
+            unsigned long long value = 0;
+            if (!parseUnsigned(body, value)) {
+                return false;
+            }
+            if (kind == 'b') {
+                out[static_cast<PropertyID>(id)] = static_cast<uint8_t>(value);
+            } else if (kind == 'w') {
+                out[static_cast<PropertyID>(id)] = static_cast<uint16_t>(value);
+            } else {
+                out[static_cast<PropertyID>(id)] = static_cast<uint32_t>(value);
+            }
+            break;
+        }
+        case 's': {
+            std::string text;
+            if (!fromHex(body, text)) {
+                return false;
+            }
+            out[static_cast<PropertyID>(id)] = text;
+            break;
+        }
+        case 'p': {
+            UserProperties pairs;
+            std::stringstream list(body);
+            std::string pair;
+            while (std::getline(list, pair, '.')) {
+                const auto equals = pair.find('=');
+                if (equals == std::string::npos) {
+                    return false;
+                }
+                std::string key, value;
+                if (!fromHex(pair.substr(0, equals), key)) return false;
+                if (!fromHex(pair.substr(equals + 1), value)) return false;
+                pairs[key] = value;
+            }
+            out[static_cast<PropertyID>(id)] = pairs;
+            break;
+        }
+        default:
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace
@@ -137,7 +278,8 @@ bool Store::write(const PersistedState &state) {
     for (const auto &entry : state.retained) {
         const Message &m = entry.second;
         out += "retained " + toHex(m.topic) + " " + std::to_string(static_cast<int>(m.qos)) + " " +
-               (m.retain ? "1" : "0") + " " + toHex(m.payload) + "\n";
+               (m.retain ? "1" : "0") + " " + toHex(m.payload) + " " +
+               encodeMessageProperties(m.properties) + "\n";
     }
     for (const auto &session : state.sessions) {
         // An empty username must still occupy its column, otherwise the fixed
@@ -150,19 +292,20 @@ bool Store::write(const PersistedState &state) {
             const SubscriptionOptions &opt = sub.second;
             out += "sub " + toHex(sub.first) + " " + std::to_string(static_cast<int>(opt.maximumQos)) +
                    " " + (opt.noLocal ? "1" : "0") + " " + (opt.retainAsPublished ? "1" : "0") + " " +
-                   std::to_string(static_cast<int>(opt.retainHandling)) + "\n";
+                   std::to_string(static_cast<int>(opt.retainHandling)) + " " +
+                   std::to_string(opt.subscriptionIdentifier) + "\n";
         }
         for (const auto &inflight : session.inflight) {
             const Message &m = inflight.second;
             out += "inflight " + std::to_string(inflight.first) + " " + toHex(m.topic) + " " +
                    std::to_string(static_cast<int>(m.qos)) + " " + (m.retain ? "1" : "0") + " " +
-                   toHex(m.payload) + "\n";
+                   toHex(m.payload) + " " + encodeMessageProperties(m.properties) + "\n";
         }
         for (const auto &blocked : session.blocked) {
             const Message &m = blocked;
             out += "blocked 0 " + toHex(m.topic) + " " +
                    std::to_string(static_cast<int>(m.qos)) + " " + (m.retain ? "1" : "0") + " " +
-                   toHex(m.payload) + "\n";
+                   toHex(m.payload) + " " + encodeMessageProperties(m.properties) + "\n";
         }
         for (uint16_t id : session.awaitingPubrel) {
             out += "pubrel " + std::to_string(id) + "\n";
@@ -240,6 +383,13 @@ bool Store::load(PersistedState &out, std::string *error) const {
                 return false;
             }
             Message m = decodeMessage(topicHex, qos, retain != 0, payloadHex);
+            // The property trail field is optional: state written by an older
+            // build has no such column and simply carries no properties.
+            std::string encodedProperties;
+            if (ss >> encodedProperties && !decodeMessageProperties(encodedProperties, m.properties)) {
+                if (error) *error = "bad properties in retained record at line " + std::to_string(lineNo);
+                return false;
+            }
             out.retained[m.topic] = m;
         } else if (kind == "session") {
             std::string clientHex, userHex;
@@ -278,6 +428,12 @@ bool Store::load(PersistedState &out, std::string *error) const {
                     if (error) *error = "bad sub record at line " + std::to_string(lineNo);
                     return false;
                 }
+                // The Subscription Identifier trail field is optional so that a
+                // state file written by an older build still loads.
+                unsigned long long subscriptionIdentifier = 0;
+                if (!(ss >> subscriptionIdentifier)) {
+                    subscriptionIdentifier = 0;
+                }
                 std::string filter;
                 if (!fromHex(filterHex, filter)) {
                     if (error) *error = "bad hex in sub record at line " + std::to_string(lineNo);
@@ -288,6 +444,7 @@ bool Store::load(PersistedState &out, std::string *error) const {
                 opt.noLocal = noLocal != 0;
                 opt.retainAsPublished = rap != 0;
                 opt.retainHandling = static_cast<RetainHandling>(handling);
+                opt.subscriptionIdentifier = subscriptionIdentifier;
                 current->subscriptions[filter] = opt;
             } else if (kind == "inflight") {
                 unsigned id = 0;
@@ -298,6 +455,11 @@ bool Store::load(PersistedState &out, std::string *error) const {
                     return false;
                 }
                 Message m = decodeMessage(topicHex, qos, retain != 0, payloadHex);
+                std::string encodedProperties;
+                if (ss >> encodedProperties && !decodeMessageProperties(encodedProperties, m.properties)) {
+                    if (error) *error = "bad properties in inflight record at line " + std::to_string(lineNo);
+                    return false;
+                }
                 current->inflight.emplace_back(static_cast<uint16_t>(id), std::move(m));
             } else if (kind == "blocked") {
                 unsigned id = 0;
@@ -308,6 +470,11 @@ bool Store::load(PersistedState &out, std::string *error) const {
                     return false;
                 }
                 Message m = decodeMessage(topicHex, qos, retain != 0, payloadHex);
+                std::string encodedProperties;
+                if (ss >> encodedProperties && !decodeMessageProperties(encodedProperties, m.properties)) {
+                    if (error) *error = "bad properties in blocked record at line " + std::to_string(lineNo);
+                    return false;
+                }
                 current->blocked.push_back(std::move(m));
             } else {
                 unsigned id = 0;

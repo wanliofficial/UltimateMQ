@@ -274,11 +274,20 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
                 properties[propertyId] = correlationData;
                 offset += correlationData.length() + 2;
                 break;
-            // case PropertyID::SUBSCRIPTION_IDENTIFIER:
-            //     auto [subscriptionIdentifier, subscriptionIdentifierBytes] = decodeVariableByteInteger(buffer+offset, length-offset);
-            //     properties[propertyId] = static_cast<uint32_t>(subscriptionIdentifier);
-            //     offset += subscriptionIdentifierBytes;
-            //     break;
+            case PropertyID::SUBSCRIPTION_IDENTIFIER:
+                // MQTT 5 Variable Byte Integer (MQTT-3.8.2.1.2): unlike the
+                // fixed-width integer properties it has no length byte. A value
+                // of 0 is a protocol error (MQTT-3.8.2-16).
+                {
+                    auto [identifier, identifierBytes] =
+                        decodeVariableByteInteger(buffer + offset, length - offset);
+                    if (identifier == 0) {
+                        throw std::runtime_error("Invalid properties: SUBSCRIPTION_IDENTIFIER of 0");
+                    }
+                    properties[propertyId] = static_cast<uint32_t>(identifier);
+                    offset += identifierBytes;
+                }
+                break;
             case PropertyID::SESSION_EXPIRY_INTERVAL:
                 // MQTT 5 four-byte integer: id, length byte (0x04), then the value
                 if (offset + 1 + 4 > length || buffer[offset] != 4) {
@@ -656,6 +665,13 @@ SubscribePacket Frame::parseSubscribe(const uint8_t *buffer, size_t length) {
         subOptions.noLocal = (options & 0x04) != 0;
         subOptions.retainAsPublished = (options & 0x08) != 0;
         subOptions.retainHandling = static_cast<RetainHandling>((options >> 4) & 0x03);
+        // The Subscription Identifier is a property of the whole SUBSCRIBE, so
+        // it applies to every entry in it (MQTT-3.8.2.1.2).
+        auto identifier = subscribe.properties.find(PropertyID::SUBSCRIPTION_IDENTIFIER);
+        if (identifier != subscribe.properties.end() &&
+            std::holds_alternative<uint32_t>(identifier->second)) {
+            subOptions.subscriptionIdentifier = std::get<uint32_t>(identifier->second);
+        }
 
         subscribe.subscriptions.emplace_back(std::move(topicFilter), subOptions);
         offset += 1;
@@ -927,7 +943,10 @@ std::vector<uint8_t> Frame::serializePublish(const PublishPacket &packet) {
         remainingLength += 2; // Packet Identifier (2 bytes)
     }
     if (version == Version::MQTT5) {
-        remainingLength += 1; // Property Length (no properties are emitted)
+        // Property Length is a Variable Byte Integer, so account for its width
+        remainingLength += static_cast<uint32_t>(
+            encodeRemainingLength(static_cast<uint32_t>(propertiesBuffer.size())).size());
+        remainingLength += static_cast<uint32_t>(propertiesBuffer.size());
     }
     remainingLength += packet.payload.size(); // Payload
 
@@ -945,7 +964,10 @@ std::vector<uint8_t> Frame::serializePublish(const PublishPacket &packet) {
     }
     // Serialize properties (MQTT 5 only)
     if (version == Version::MQTT5) {
-        buffer.push_back(0);
+        auto propertyLength =
+            encodeRemainingLength(static_cast<uint32_t>(propertiesBuffer.size()));
+        buffer.insert(buffer.end(), propertyLength.begin(), propertyLength.end());
+        buffer.insert(buffer.end(), propertiesBuffer.begin(), propertiesBuffer.end());
     }
     // Serialize Payload
     buffer.insert(buffer.end(), packet.payload.begin(), packet.payload.end());
@@ -1308,6 +1330,21 @@ std::vector<uint8_t> Frame::serializeProperties(const Properties &properties) {
                 buffer.push_back((arg >> 8) & 0xFF);
                 buffer.push_back(arg & 0xFF);
             } else if constexpr (std::is_same_v<T, uint32_t>) {
+                if (id == PropertyID::SUBSCRIPTION_IDENTIFIER) {
+                    // A Variable Byte Integer: no length byte, least significant
+                    // 7-bit group first with the continuation bit set (MQTT-1.5.5).
+                    buffer.push_back(static_cast<uint8_t>(id));
+                    size_t remaining = arg;
+                    do {
+                        uint8_t encoded = remaining & 0x7F;
+                        remaining >>= 7;
+                        if (remaining != 0) {
+                            encoded |= 0x80;
+                        }
+                        buffer.push_back(encoded);
+                    } while (remaining != 0);
+                    return;
+                }
                 // MQTT 5 four-byte integer: a length byte (0x04) then the value.
                 buffer.push_back(static_cast<uint8_t>(id));
                 buffer.push_back(0x04);

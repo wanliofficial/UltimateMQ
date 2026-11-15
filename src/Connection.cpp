@@ -451,6 +451,23 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
         const size_t limit = broker ? broker->getMaxPacketSize() : Frame::DEFAULT_MAX_PACKET_SIZE;
         // MAXIMUM_PACKET_SIZE is a 4-byte field; the limit fits comfortably.
         connack.properties[PropertyID::MAXIMUM_PACKET_SIZE] = static_cast<uint32_t>(limit);
+        // Remember the largest packet this client accepts (MQTT-3.1.2-24). Every
+        // outbound packet is measured against it in sendPacket(); the property
+        // must not be 0, and an over-long packet is dropped rather than sent.
+        auto maxPacket = connect->properties.find(PropertyID::MAXIMUM_PACKET_SIZE);
+        if (maxPacket != connect->properties.end() &&
+            std::holds_alternative<uint32_t>(maxPacket->second)) {
+            const uint32_t clientLimit = std::get<uint32_t>(maxPacket->second);
+            if (clientLimit == 0) {
+                logInfo("rejecting client %s: Maximum Packet Size must not be 0",
+                        connect->clientId.c_str());
+                ConnackPacket rejectConnack{false, ReasonCode::PROTOCOL_ERROR};
+                sendPacket(rejectConnack);
+                state = State::DISCONNECTED;
+                return;
+            }
+            clientMaxPacketSize = clientLimit;
+        }
         // Tell the client how many Topic Aliases it may use on this connection
         // (MQTT-3.1.2-26). Advertising it is what makes alias-only PUBLISHes
         // legal; the mapping itself is tracked per connection below.
@@ -639,6 +656,20 @@ void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
             message.hasExpiry = true;
             message.expiryDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(interval);
         }
+        // MQTT-3.3.2-4: these properties belong to the application message and
+        // are forwarded unchanged to every subscriber. Message Expiry is
+        // excluded above (it becomes a deadline), and Topic Alias /
+        // Subscription Identifier are per-connection, never forwarded.
+        for (PropertyID forwardable : {PropertyID::PAYLOAD_FORMAT_INDICATOR,
+                                       PropertyID::CONTENT_TYPE,
+                                       PropertyID::RESPONSE_TOPIC,
+                                       PropertyID::CORRELATION_DATA,
+                                       PropertyID::USER_PROPERTY}) {
+            auto it = publish->properties.find(forwardable);
+            if (it != publish->properties.end()) {
+                message.properties[forwardable] = it->second;
+            }
+        }
     }
     ReasonCode reason = session->publish(publish->packetId, message);
     if (publish->qos == QoS::QOS_1) {
@@ -821,17 +852,44 @@ void Connection::handleAuth(std::shared_ptr<AuthPacket> auth) {
     state = State::DISCONNECTED;
 }
 
-void Connection::deliver(const Message &message, uint16_t packetId, QoS qos) {
-    handleDeliver(message, packetId, qos);
+void Connection::deliver(const Message &message, uint16_t packetId, QoS qos,
+                         uint32_t subscriptionIdentifier) {
+    handleDeliver(message, packetId, qos, subscriptionIdentifier);
 }
 
-void Connection::handleDeliver(const Message &message, uint16_t packetId, QoS qos) {
+void Connection::handleDeliver(const Message &message, uint16_t packetId, QoS qos,
+                               uint32_t subscriptionIdentifier) {
     if (state != State::CONNECTED) {
         return;
     }
     PublishPacket publish{message.topic, message.payload, qos, message.retain};
     publish.packetId = packetId;
     publish.dup = message.dup;
+    // MQTT 3.1.1 has no property section, so 3.1.1 deliveries carry none.
+    if (frame.getVersion() == Version::MQTT5) {
+        // MQTT-3.3.2-4: repeat the properties the publisher attached.
+        for (const auto &[id, value] : message.properties) {
+            publish.properties[id] = value;
+        }
+        // MQTT-3.3.2-9: the expiry interval is forwarded as the time that is
+        // still left, not as the value the publisher wrote.
+        if (message.hasExpiry) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= message.expiryDeadline) {
+                logDebug("dropping an expired delivery on %s", message.topic.c_str());
+                return;
+            }
+            const auto left = std::chrono::duration_cast<std::chrono::seconds>(
+                                  message.expiryDeadline - now).count();
+            publish.properties[PropertyID::MESSAGE_EXPIRY_INTERVAL] =
+                static_cast<uint32_t>(left);
+        }
+        // MQTT-3.3.2-5: echo the identifier of the subscription that caused
+        // this delivery.
+        if (subscriptionIdentifier != 0) {
+            publish.properties[PropertyID::SUBSCRIPTION_IDENTIFIER] = subscriptionIdentifier;
+        }
+    }
     logDebug("deliver %s qos=%d packetId=%u dup=%d", message.topic.c_str(), (int)qos, packetId,
              (int)message.dup);
     sendPacket(publish);
@@ -854,6 +912,14 @@ void Connection::sendPacket(Packet &packet) {
         return;
     }
     auto data = frame.serialize(packet);
+    // MQTT-3.1.2-24: never exceed the client's Maximum Packet Size. A packet
+    // that would is dropped here; sending it would make the client close the
+    // connection, losing every later delivery as well.
+    if (clientMaxPacketSize != 0 && data.size() > clientMaxPacketSize) {
+        logDebug("dropping a %zu-byte packet: the client accepts at most %zu bytes",
+                 data.size(), clientMaxPacketSize);
+        return;
+    }
     if (!transport->writeAll(data.data(), data.size())) {
         // The peer is gone; stop the connection on the next loop iteration
         state = State::DISCONNECTED;

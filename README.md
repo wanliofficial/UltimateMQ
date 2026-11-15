@@ -235,6 +235,71 @@ Alias mappings are scoped to a single **network connection**, not to the session
 a reconnect with the same client id starts with an empty table, as MQTT requires.
 MQTT 3.1.1 has no property section, so aliases are simply never present there.
 
+#### Subscription identifiers (MQTT 5)
+
+An MQTT 5 client may tag a `SUBSCRIBE` with a **Subscription Identifier**. The
+identifier is stored with every filter in that request, survives a persistent
+session and a broker restart, and is echoed on each `PUBLISH` the subscription
+causes (MQTT-3.3.2-5), including retained deliveries and messages replayed for an
+offline session. A subscriber can therefore tell *which* of its subscriptions
+matched without inspecting the topic.
+
+* The identifier is a Variable Byte Integer with no length prefix
+  (MQTT-3.8.2.1.2); values up to 268 435 455 are accepted.
+* A value of `0` is a protocol error: the broker answers with a
+  `PROTOCOL_ERROR` `DISCONNECT` and closes the connection (MQTT-3.8.2-16).
+* Subscribing without the property clears any identifier previously stored for
+  that filter, so a re-subscribe always reflects the latest request.
+* Shared subscriptions carry the identifier too, so each member of a share group
+  sees it on the copy it receives.
+
+MQTT 3.1.1 has no property section, so no identifier is ever stored or emitted.
+
+#### Client-declared `Maximum Packet Size` (MQTT 5)
+
+The `FLOWMQ_MAX_PACKET_SIZE` knob below bounds what the broker **reads**. The
+matching knob in the other direction is the client's own `Maximum Packet Size`
+CONNECT property (MQTT-3.1.2-24): it is the largest packet the client is willing
+to receive. The broker honours it on every outbound packet, `PUBLISH` included.
+
+* A packet that would exceed the declared limit is **dropped** rather than sent.
+  Sending it would make a conforming client close the connection and lose every
+  later delivery as well, so withholding the oversized message keeps the rest of
+  the session alive.
+* A declared value of `0` is a protocol error: the broker answers with a
+  `PROTOCOL_ERROR` CONNACK and closes the connection.
+* Clients that declare nothing keep receiving packets of any size (up to the
+  broker's own limit), so behaviour is unchanged for them.
+
+#### Application properties on delivery (MQTT 5)
+
+Properties an MQTT 5 publisher attaches to a message belong to the
+**application message**, not to the connection, so the broker forwards them
+unchanged to every subscriber (MQTT-3.3.2-4):
+
+* `Payload Format Indicator`, `Content Type`, `Response Topic`,
+  `Correlation Data` and `User Properties` are carried verbatim.
+* `Message Expiry Interval` is forwarded as the time that is **left**, not the
+  value the publisher wrote (MQTT-3.3.2-9). A message that expired while it
+  waited is dropped instead of delivered.
+* `Topic Alias` and `Subscription Identifier` are per-connection and are never
+  copied from the publisher: the alias table is local to each link, and the
+  identifier comes from the subscription that caused the delivery.
+
+These properties are part of the durable session too, so a queue that is
+restored after a restart still forwards them.
+
+MQTT 3.1.1 has no property section, so 3.1.1 deliveries carry none and a
+3.1.1 publisher's messages simply arrive without them.
+
+#### Outbound `PUBLISH` properties (MQTT 5)
+
+Every property the broker attaches to a delivery — `Subscription Identifier`,
+`Message Expiry Interval`, `Payload Format Indicator`, `Content Type`,
+`Response Topic`, `Correlation Data`, `Topic Alias` and `User Properties` — is
+serialised into the `PUBLISH` property section, whose length is a Variable Byte
+Integer. MQTT 3.1.1 deliveries carry no property section at all.
+
 #### Transport security (`FLOWMQ_TLS_CERT` / `FLOWMQ_TLS_KEY`)
 
 By default the listener speaks plaintext, so with authentication enabled the

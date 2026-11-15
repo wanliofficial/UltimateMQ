@@ -28,6 +28,13 @@ struct Message {
     //! asked for it must not receive its own publications. Never written to the
     //! durable state, so a restored message has no originator.
     void* originSession = nullptr;
+    //! MQTT 5 properties that travel with the publication and must be repeated on
+    //! every delivery it causes (MQTT-3.3.2-4): Payload Format Indicator,
+    //! Content Type, Response Topic, Correlation Data and User Properties.
+    //! Message Expiry is tracked separately in hasExpiry/expiryDeadline because
+    //! the remaining interval shrinks while the message waits; Topic Alias and
+    //! Subscription Identifier are per-connection and never stored here.
+    Properties properties;
 
     Message() = default;
 
