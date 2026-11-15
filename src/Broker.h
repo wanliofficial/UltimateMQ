@@ -9,6 +9,8 @@
 #include <unordered_map>
 #include <memory>
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include "Trie.h"
 #include "Message.h"
 #include "Subscription.h"
@@ -72,10 +74,14 @@ class Broker {
     //! clients and enforced per connection. Defaults to Frame::DEFAULT_MAX_PACKET_SIZE.
     size_t maxPacketSize = Frame::DEFAULT_MAX_PACKET_SIZE;
 
+    //! Publish the optional $SYS/broker monitoring tree. Off by default; the
+    //! broker exposes no $SYS topic and treats $SYS traffic as ordinary traffic
+    //! (a client publish to it is stored as a retained message like any other).
+    bool sysTopicsEnabled = false;
+
     //! How long a stalled write may block before the connection is dropped,
     //! freeing its thread. Bounds a slow reader's hold on a connection thread.
     int writeTimeoutMs = SecureTransport::WRITE_STALL_TIMEOUT_MS;
-
     //! Upper bound on the number of subscriptions a single session may hold,
     //! so one client cannot exhaust memory by registering unbounded filters.
     size_t maxSubscriptions = DEFAULT_MAX_SUBSCRIPTIONS;
@@ -199,7 +205,15 @@ public:
     //! Fan out a message. Safe to call from any thread: the actual writes to
     //! the clients happen after the broker lock has been released.
     void publish(const Message &message);
-
+    //! Refresh the retained $SYS/broker messages with the current counters.
+    //! Called by the sweeper on its normal interval.
+    void refreshSysTopics();
+    //! Turn the $SYS/broker monitoring tree on or off and (re)start its clock.
+    void setSysTopics(bool enabled);
+    //! Count an inbound client PUBLISH accepted for delivery ($SYS counter)
+    void incrementMessagesReceived();
+    //! Count messages the broker delivered to subscribers ($SYS counter)
+    void incrementMessagesSent(uint64_t count = 1);
     //! All retained messages, keyed by topic name (returns a snapshot; thread safe)
     std::map<std::string, Message> snapshotRetained() const;
     size_t getRetainedCount() const;
@@ -207,6 +221,13 @@ public:
     int getConnectedClients() const;
     bool isSubscribed(const std::string& clientId, const std::string& topicFilter) const;
     std::set<std::string> getSubscriptions(const std::string &topicFilter);
+
+    //! $SYS/broker monitoring tree (opt-in via FLOWMQ_SYS_TOPICS; empty when off)
+    std::map<std::string, std::string> sysTopicValues() const;
+    //! Whether a client may PUBLISH into the $SYS tree
+    bool sysPublishAllowed() const { return sysTopicsEnabled; }
+    //! Whether the $SYS/broker tree is enabled
+    bool sysTopicsOn() const { return sysTopicsEnabled; }
 };
 }
 

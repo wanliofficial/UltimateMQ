@@ -3,6 +3,7 @@
 #include "Topic.h"
 #include "Session.h"
 #include "Broker.h"
+#include "SysTopics.h"
 #include "Auth.h"
 #include "TLS.h"
 #include <unistd.h>
@@ -732,6 +733,29 @@ void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
                 message.properties[forwardable] = it->second;
             }
         }
+    }
+    // $SYS/broker tree (MQTT-4.1.2-2): while the monitoring tree is enabled a
+    // client publish to a $SYS topic is refused, so only the broker can write
+    // it. With the feature off this is ordinary traffic and is stored/forwarded
+    // as before.
+    if (broker && broker->sysTopicsOn() && SysTopics::isSysTopic(publish->topicName)) {
+        logDebug("client %s: refused publish to $SYS topic %s", session->getClientId().c_str(),
+                 publish->topicName.c_str());
+        if (publish->qos == QoS::QOS_1) {
+            PubackPacket puback{publish->packetId, ReasonCode::NOT_AUTHORIZED};
+            sendPacket(puback);
+        } else if (publish->qos == QoS::QOS_2) {
+            PubrecPacket pubrec{publish->packetId, ReasonCode::NOT_AUTHORIZED};
+            sendPacket(pubrec);
+        } else if (frame.getVersion() == Version::MQTT5) {
+            DisconnectPacket disconnect{ReasonCode::NOT_AUTHORIZED};
+            sendPacket(disconnect);
+            state = State::DISCONNECTED;
+        }
+        return;
+    }
+    if (broker) {
+        broker->incrementMessagesReceived();
     }
     ReasonCode reason = session->publish(publish->packetId, message);
     if (publish->qos == QoS::QOS_1) {

@@ -201,6 +201,18 @@ Server::Server(int port, size_t maxConnections)
         logInfo("server keep alive: %u s", broker->getServerKeepAlive());
     }
 
+    // Optional $SYS/broker monitoring tree (opt-in). Off by default: with it off
+    // the broker exposes no $SYS topic and a client publish to "$SYS/..." is just
+    // ordinary traffic. When on, the broker publishes its own counters as
+    // retained QoS 0 messages and refuses client writes to the tree
+    // (MQTT-4.1.2-2).
+    const char* sysTopics = getenv("FLOWMQ_SYS_TOPICS");
+    if (sysTopics && *sysTopics && std::string(sysTopics) != "0" && std::string(sysTopics) != "false") {
+        broker->setSysTopics(true);
+        broker->refreshSysTopics();
+        logInfo("$SYS/broker monitoring tree enabled");
+    }
+
     if (store->enabled()) {
         PersistedState persisted;
         std::string loadError;

@@ -40,6 +40,7 @@ All configuration is read from environment variables at startup.
 | `FLOWMQ_MAX_SHARED_SUBSCRIPTIONS` | `FLOWMQ_MAX_SUBSCRIPTIONS` | Maximum number of shared (`$share/...`) subscriptions a single session may hold |
 | `FLOWMQ_MAX_PUBLISH_RATE` | unlimited | Per-client inbound `PUBLISH` rate in messages/second; a publisher that exceeds it is disconnected |
 | `FLOWMQ_SERVER_KEEP_ALIVE` | unset | Preferred keep alive in seconds; MQTT 5 clients asking for more (or for none) are told this value in CONNACK |
+| `FLOWMQ_SYS_TOPICS` | unset | Publish the optional `$SYS/broker` monitoring tree (see below); off by default |
 | `FLOWMQ_MAX_CONNECTIONS` | `1024` | Maximum number of simultaneous client connections; further connections are accepted then closed |
 | `FLOWMQ_TLS_CERT` | unset | Server certificate (PEM); enables TLS when set together with `FLOWMQ_TLS_KEY` |
 | `FLOWMQ_TLS_KEY` | unset | Private key (PEM) matching `FLOWMQ_TLS_CERT` |
@@ -666,6 +667,39 @@ client that sets them is not rejected as malformed. User Properties are stored
 per packet and are **not** forwarded to other clients (or written to durable
 state); a human-readable `REASON_STRING` a client attaches to a DISCONNECT or ack
 is likewise accepted and dropped.
+
+#### System monitoring topics (`$SYS/broker`)
+
+Setting `FLOWMQ_SYS_TOPICS` (to any value other than `0`/`false`) makes the
+broker publish its own counters as a **monitoring topic tree** (MQTT-4.1.2).
+This is opt-in: with the variable unset the broker exposes no `$SYS` topic and
+`$SYS/...` traffic is treated as ordinary, user-defined traffic.
+
+When enabled, the broker publishes the following **retained QoS 0** messages and
+keeps them current on the normal sweep interval:
+
+| Topic | Payload |
+| --- | --- |
+| `$SYS/broker/clients/connected` | number of currently connected clients |
+| `$SYS/broker/clients/total` | number of sessions the broker holds |
+| `$SYS/broker/messages/sent` | total `PUBLISH`es delivered to subscribers |
+| `$SYS/broker/messages/received` | total `PUBLISH`es accepted from clients |
+| `$SYS/broker/retaineds/count` | number of retained messages held |
+| `$SYS/broker/uptime` | seconds since the broker started |
+| `$SYS/broker/load` | 1-minute load average |
+
+A client reads them by subscribing to a `$SYS` filter, e.g. `$SYS/#`:
+
+```
+mosquitto_sub -t '$SYS/#' -v
+```
+
+Two rules apply (MQTT-4.7.2-1 / 4.1.2-2): a leading-level wildcard (`#`,
+`+`) never matches a `$SYS` topic, so only an explicit `$SYS/...` subscription
+reaches the tree; and while the feature is on, a client **publish** into the
+tree is refused (QoS 1/2 get `NOT_AUTHORIZED`, QoS 0 a `DISCONNECT`), so only
+the broker can write it. The counters are informational snapshots and are not
+fanned out live — a subscriber receives the current value on its next subscribe.
 
 ## Contributing
 

@@ -12,6 +12,7 @@ add_library(flowmq_lib STATIC
     src/Trie.cpp
     src/Topic.cpp
     src/Message.cpp
+    src/SysTopics.cpp
     src/Broker.cpp
     src/Server.cpp  
     src/Listener.cpp

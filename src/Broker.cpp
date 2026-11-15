@@ -1,6 +1,7 @@
 #include "Broker.h"
 #include "Topic.h"
 #include "Session.h"
+#include "SysTopics.h"
 #include "Log.h"
 #include <algorithm>
 #include <chrono>
@@ -9,6 +10,22 @@
 #include <vector>
 
 namespace MQTT {
+
+// Process-wide counters behind the $SYS/broker/messages/* topics. They live at
+// namespace scope (not as Broker members) so the free helper functions in this
+// file can read them without a back-reference to a Broker instance. Relaxed
+// atomics: they are informational snapshots only, never used for correctness.
+std::atomic<uint64_t> totalMessagesSent{0};
+std::atomic<uint64_t> totalMessagesReceived{0};
+std::chrono::steady_clock::time_point sysStartedAt{std::chrono::steady_clock::now()};
+
+// Free helpers backing the $SYS/broker/messages/* and uptime/load topics. They
+// read only process state, so no broker lock is involved; the broker forwards
+// its own locked counters into the parts that need them.
+size_t sysGetTotalSent();
+size_t sysGetTotalReceived();
+double sysUptimeSeconds();
+size_t sysGetRetainedCount();
 
 Broker::Broker(Auth* auth, Store* store) : trie(std::make_unique<Trie>()), auth(auth), store(store) {}
 
@@ -132,6 +149,9 @@ void Broker::sweepExpiredSessions() {
     // sweep, so a delayed Will fires even for a non-persistent session that was
     // torn down at disconnect.
     publishDueWills();
+    // Refresh the $SYS/broker monitoring messages with the current counters.
+    // A no-op unless FLOWMQ_SYS_TOPICS is set.
+    refreshSysTopics();
     // Discard outside the broker lock: discard() takes the broker lock itself
     // (to remove subscriptions) and would deadlock otherwise.
     for (auto &session : victims) {
@@ -355,6 +375,10 @@ void Broker::publish(const Message &message) {
             session->flush();
         }
     }
+    // Count what actually reached a subscriber: one increment per delivery the
+    // broker handed to a session (live fan-out or retained). This backs the
+    // $SYS/broker/messages/sent topic.
+    incrementMessagesSent(static_cast<uint64_t>(unique.size()));
 }
 
 void Broker::collectTargets(
@@ -397,6 +421,85 @@ void Broker::collectTargets(
                 }
             }
         }
+    }
+}
+
+void Broker::setSysTopics(bool enabled) {
+    sysTopicsEnabled = enabled;
+    sysStartedAt = std::chrono::steady_clock::now();
+}
+
+void Broker::incrementMessagesReceived() {
+    ++totalMessagesReceived;
+}
+
+void Broker::incrementMessagesSent(uint64_t count) {
+    totalMessagesSent += count;
+}
+
+size_t sysGetTotalSent() {
+    return totalMessagesSent.load(std::memory_order_relaxed);
+}
+
+size_t sysGetTotalReceived() {
+    return totalMessagesReceived.load(std::memory_order_relaxed);
+}
+
+double sysUptimeSeconds() {
+    const auto elapsed = std::chrono::steady_clock::now() - sysStartedAt;
+    return std::chrono::duration_cast<std::chrono::duration<double>>(elapsed).count();
+}
+
+std::map<std::string, std::string> Broker::sysTopicValues() const {
+    std::map<std::string, std::string> values;
+    if (!sysTopicsEnabled) {
+        return values;
+    }
+    size_t connected = 0;
+    size_t sessionCount = 0;
+    size_t retainedCount = 0;
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        for (const auto &[clientId, session] : sessions) {
+            if (session && session->isConnected()) {
+                ++connected;
+            }
+        }
+        sessionCount = sessions.size();
+        retainedCount = retainedMessages.size();
+    }
+    for (const std::string &topic : SysTopics::allTopics()) {
+        const std::string value = SysTopics::payload(topic, connected, sessionCount, retainedCount);
+        if (!value.empty()) {
+            values[topic] = value;
+        }
+    }
+    return values;
+}
+
+void Broker::refreshSysTopics() {
+    // Only the counts move on their own; a snapshot refresh keeps the retained
+    // $SYS messages current so a client that subscribes with "send on subscribe"
+    // sees live values. Called by the sweeper on its normal interval.
+    //
+    // $SYS values are informational and refreshed every sweep, so a topic whose
+    // value did not change is left untouched: only a real change is written and
+    // reported to the persistence layer, keeping a steady-state broker from
+    // rewriting its state file every second. Updates are never fanned out live
+    // (a $SYS subscription receives them on the next subscribe, like any
+    // retained message).
+    if (!sysTopicsEnabled) {
+        return;
+    }
+    for (const auto &[topic, value] : sysTopicValues()) {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        auto it = retainedMessages.find(topic);
+        if (it != retainedMessages.end() && it->second.payload ==
+                                              std::vector<uint8_t>(value.begin(), value.end())) {
+            continue;
+        }
+        retainedMessages[topic] = Message(topic, value, QoS::QOS_0, /*retain=*/true);
+        notifyStateChanged();
     }
 }
 
