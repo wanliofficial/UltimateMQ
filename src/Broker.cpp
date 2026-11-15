@@ -6,7 +6,6 @@
 #include <chrono>
 #include <iostream>
 #include <thread>
-#include <random>
 #include <vector>
 
 namespace MQTT {
@@ -48,9 +47,12 @@ void Broker::restoreState(const PersistedState &state) {
                 const std::string &filter = entry.first;
                 if (Topic::isShared(filter)) {
                     auto [group, realFilter] = Topic::splitShared(filter);
-                    sharedSubscriptions[realFilter].push_back(
+                    sharedSubscriptions[realFilter][group].push_back(
                         SharedSubscription(persisted.clientId, realFilter, group));
-                    trie->insert(filter);
+                    // The routing table is keyed by the real filter: a publish
+                    // carries a topic name, never a "$share/..." string, so the
+                    // group would never match if the prefix were kept.
+                    trie->insert(realFilter);
                 } else {
                     subscriptions[filter].insert(persisted.clientId);
                     trie->insert(filter);
@@ -261,9 +263,9 @@ void Broker::unsubscribe(const std::string &clientId, const std::string &topicFi
 void Broker::sharedSubscribe(const std::string &clientId, const std::string &topicFilter, const std::string &group) {
     std::lock_guard<std::recursive_mutex> lock(mutex);
     SharedSubscription sharedSubscription(clientId, topicFilter, group);
-    auto &sharedSubs = sharedSubscriptions[topicFilter];
-    if (std::find(sharedSubs.begin(), sharedSubs.end(), sharedSubscription) == sharedSubs.end()) {
-        sharedSubs.push_back(sharedSubscription);
+    auto &members = sharedSubscriptions[topicFilter][group];
+    if (std::find(members.begin(), members.end(), sharedSubscription) == members.end()) {
+        members.push_back(sharedSubscription);
     }
     trie->insert(topicFilter);
 }
@@ -271,24 +273,51 @@ void Broker::sharedSubscribe(const std::string &clientId, const std::string &top
 void Broker::sharedUnsubscribe(const std::string &clientId, const std::string &topicFilter, const std::string &group) {
     std::lock_guard<std::recursive_mutex> lock(mutex);
     SharedSubscription sharedSubscription(clientId, topicFilter, group);
-    auto it = sharedSubscriptions.find(topicFilter);
-    if (it == sharedSubscriptions.end()) {
+    auto filterIt = sharedSubscriptions.find(topicFilter);
+    if (filterIt == sharedSubscriptions.end()) {
         return;
     }
-    auto &sharedSubs = it->second;
-    auto position = std::find(sharedSubs.begin(), sharedSubs.end(), sharedSubscription);
-    if (position != sharedSubs.end()) {
-        sharedSubs.erase(position);
+    auto groupIt = filterIt->second.find(group);
+    if (groupIt == filterIt->second.end()) {
+        return;
     }
-    if (sharedSubs.empty()) {
-        sharedSubscriptions.erase(it);
+    auto &members = groupIt->second;
+    auto position = std::find(members.begin(), members.end(), sharedSubscription);
+    if (position != members.end()) {
+        members.erase(position);
+    }
+    if (members.empty()) {
+        filterIt->second.erase(groupIt);
+        sharedRoundRobin.erase({topicFilter, group});
+    }
+    if (filterIt->second.empty()) {
+        sharedSubscriptions.erase(filterIt);
+        // Plain subscriptions live in the trie under the same filter string, so
+        // only drop the entry when no ordinary subscription still needs it.
+        if (subscriptions.find(topicFilter) == subscriptions.end()) {
+            trie->remove(topicFilter);
+        }
     }
 }
 
-static int randIdx(int size) {
-    static thread_local std::mt19937 gen(std::random_device{}());
-    std::uniform_int_distribution<> dis(0, size - 1);
-    return dis(gen);
+std::shared_ptr<Session> Broker::nextSharedMember(const std::string &topicFilter,
+                                                  const std::string &group,
+                                                  std::vector<SharedSubscription> &members) {
+    if (members.empty()) {
+        return nullptr;
+    }
+    auto &cursor = sharedRoundRobin[{topicFilter, group}];
+    // Walk at most one full lap: members may name sessions that have since been
+    // torn down, and those must not consume a turn.
+    for (size_t attempt = 0; attempt < members.size(); ++attempt) {
+        const size_t index = cursor % members.size();
+        cursor = (index + 1) % members.size();
+        auto sessionIt = sessions.find(members[index].clientId);
+        if (sessionIt != sessions.end() && sessionIt->second) {
+            return sessionIt->second;
+        }
+    }
+    return nullptr;
 }
 
 void Broker::publish(const Message &message) {
@@ -341,12 +370,15 @@ void Broker::collectTargets(const Message &message, std::vector<std::shared_ptr<
             }
         }
         auto sharedIt = sharedSubscriptions.find(topicFilter);
-        if (sharedIt != sharedSubscriptions.end() && !sharedIt->second.empty()) {
-            auto idx = randIdx(static_cast<int>(sharedIt->second.size()));
-            const SharedSubscription &sharedSubscription = sharedIt->second.at(idx);
-            auto sessionIt = sessions.find(sharedSubscription.clientId);
-            if (sessionIt != sessions.end() && sessionIt->second) {
-                targets.push_back(sessionIt->second);
+        if (sharedIt != sharedSubscriptions.end()) {
+            // Every share group on this filter receives one copy; the members
+            // of a group take turns (MQTT-4.8.2: a shared subscription behaves
+            // like a single ordinary subscription per group).
+            for (auto &[group, members] : sharedIt->second) {
+                auto session = nextSharedMember(topicFilter, group, members);
+                if (session) {
+                    targets.push_back(std::move(session));
+                }
             }
         }
     }

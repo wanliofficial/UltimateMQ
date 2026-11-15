@@ -277,3 +277,33 @@ TEST(BrokerStoreTest, EveryMutationMarksTheStoreDirty)
 }
 
 } // namespace MQTT
+
+TEST(BrokerStoreTest, RestoredSharedGroupsStillRoute)
+{
+    using namespace MQTT;
+    // A shared subscription is stored under its full "$share/group/filter" name
+    // but routed by the real filter. Restoring it must register the routing
+    // entry under the real filter, or the group would never match again.
+    MQTT::Broker source;
+    MQTT::PersistedSession sharedSnapshot;
+    sharedSnapshot.clientId = "grp";
+    sharedSnapshot.subscriptions["$share/g/topic"] = optionsFor(MQTT::QoS::QOS_0);
+    auto session = std::make_shared<MQTT::Session>(&source, "grp", /*cleanStart=*/false);
+    session->restore(sharedSnapshot);
+    source.insertSession("grp", session);
+
+    const MQTT::PersistedState snapshot = source.snapshotState();
+    ASSERT_EQ(snapshot.sessions.size(), 1U);
+
+    MQTT::Broker restored;
+    restored.restoreState(snapshot);
+    auto restoredSession = restored.findSession("grp");
+    ASSERT_NE(restoredSession, nullptr);
+
+    auto subscriber = MQTT::test::attach(*restoredSession);
+    restored.publish(messageFor("topic", "after-restart", MQTT::QoS::QOS_0));
+    restoredSession->flush();
+
+    ASSERT_EQ(subscriber->size(), 1U)
+        << "the restored share group did not route a matching publish";
+}

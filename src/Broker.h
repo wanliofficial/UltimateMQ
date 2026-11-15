@@ -32,7 +32,15 @@ class Broker {
     // the TCP connection that drives it and be resumed by a later connect.
     std::unordered_map<std::string, std::shared_ptr<Session>> sessions;
     std::unordered_map<std::string, std::set<std::string>> subscriptions;
-    std::map<std::string, std::vector<SharedSubscription>> sharedSubscriptions;
+    //! Shared subscriptions, keyed first by the real topic filter and then by
+    //! the share group name. Different groups on the same filter are
+    //! independent: each one delivers one copy of every matching message
+    //! (MQTT-4.8.2), so they must never share a member pool.
+    std::map<std::string, std::map<std::string, std::vector<SharedSubscription>>> sharedSubscriptions;
+    //! Round-robin cursor per (topic filter, group): the index of the member
+    //! that receives the next message. Distribution inside a group is even, so
+    //! no member starves. Keyed by the same pair as sharedSubscriptions.
+    std::map<std::pair<std::string, std::string>, size_t> sharedRoundRobin;
     // Retained messages, keyed by their exact topic name
     std::map<std::string, Message> retainedMessages;
 
@@ -92,6 +100,11 @@ class Broker {
 
     //! Resolve the target sessions; called with the broker lock held
     void collectTargets(const Message &message, std::vector<std::shared_ptr<Session>> &targets);
+    //! Pick the member of one share group that receives the next message,
+    //! advancing that group's round-robin cursor. Called with the lock held.
+    std::shared_ptr<Session> nextSharedMember(const std::string &topicFilter,
+                                              const std::string &group,
+                                              std::vector<SharedSubscription> &members);
 
 public:
     explicit Broker(Auth* auth = nullptr, Store* store = nullptr);

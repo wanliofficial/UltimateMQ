@@ -389,6 +389,26 @@ delivery path:
 * **Maximum QoS**: the delivered QoS is the minimum of the published QoS and the
   granted QoS.
 
+#### Shared subscriptions (`$share/group/filter`)
+
+A shared subscription splits the messages for a topic filter across a group of
+sessions, so a pool of workers can share one queue. Groups are independent of
+each other and of ordinary subscriptions:
+
+* **Each group receives one copy.** `$share/g1/topic` and `$share/g2/topic` are
+  two different groups on the same topic, so a publish reaches one member of
+  `g1` *and* one member of `g2` — two deliveries in total (MQTT-4.8.2).
+* **A plain subscription is a group of its own.** A client subscribed to
+  `topic` and a group subscribed to `$share/g/topic` each get a copy.
+* **Distribution inside a group is round-robin** (MQTT-4.8.1). Members take
+  turns, so a pool splits traffic evenly instead of one member receiving most of
+  it. A member whose session is gone is skipped rather than consuming a turn.
+* **The filter keeps its wildcards**: `$share/g/sensors/+` matches
+  `sensors/a` but not `sensors/a/b`. The `$share/group` prefix is only routing
+  metadata and is never part of the matched topic.
+* **Group membership is part of a persistent session**, so it survives a
+  restart together with its subscriptions.
+
 #### Publish rate limit (`FLOWMQ_MAX_PUBLISH_RATE`)
 
 Every inbound `PUBLISH` is fanned out to all matching subscribers, so one fast
