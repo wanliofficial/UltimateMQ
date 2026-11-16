@@ -9,8 +9,34 @@ namespace MQTT {
 
 class Frame {
     Version version = Version::MQTT5;
+
+public:
+    //! Which packet a property block belongs to. §2.2.2.2 defines every property
+    //! for a fixed set of packet types; a property outside that set makes the
+    //! packet Malformed (MQTT-2.2.2-1). The Will block of a CONNECT has its own
+    //! set, hence WILL rather than CONNECT.
+    enum class PropertyContext {
+        NONE,  //!< no applicability check (used by tests and unknown callers)
+        CONNECT,
+        WILL,
+        CONNACK,
+        PUBLISH,
+        PUBACK,
+        PUBREC,
+        PUBREL,
+        PUBCOMP,
+        SUBSCRIBE,
+        SUBACK,
+        UNSUBSCRIBE,
+        UNSUBACK,
+        DISCONNECT,
+        AUTH,
+    };
+
+private:
     Properties doParseProperties(const uint8_t *buffer, size_t length,
-                                 SubscriptionIdentifiers *identifiers = nullptr);
+                                 SubscriptionIdentifiers *identifiers = nullptr,
+                                 PropertyContext context = PropertyContext::NONE);
 
     // Streaming parser state: a TCP segment may contain a partial packet, more
     // than one packet, or a packet split across several segments
@@ -100,9 +126,11 @@ public:
     // Parse properties
     //! Parse a property block. \p identifiers, when given, collects every
     //! Subscription Identifier instead of rejecting a repeat: a PUBLISH may
-    //! carry one per subscription that caused it (MQTT-3.3.4-4).
+    //! carry one per subscription that caused it (MQTT-3.3.4-4). \p context
+    //! selects the §2.2.2.2 applicability table to enforce.
     std::pair<Properties, size_t> parseProperties(const uint8_t *buffer, size_t length,
-                                                  SubscriptionIdentifiers *identifiers = nullptr);
+                                                  SubscriptionIdentifiers *identifiers = nullptr,
+                                                  PropertyContext context = PropertyContext::NONE);
 
     // Serialize MQTT packets
     std::vector<uint8_t> serialize(const Packet &packet);

@@ -42,6 +42,84 @@ std::vector<uint8_t> variableByteInteger(uint32_t value) {
     appendVariableByteInteger(encoded, value);
     return encoded;
 }
+
+//! Which properties a packet type may carry (MQTT 5 §2.2.2.2, Table 2-4). The
+//! table is the normative one; MQTT-2.2.2-1 makes a property outside it a
+//! Malformed Packet rather than something to ignore silently.
+bool isPropertyAllowed(Frame::PropertyContext context, PropertyID id) {
+    if (context == Frame::PropertyContext::NONE) {
+        return true;
+    }
+    // User Property is legal in every packet that has a property block.
+    if (id == PropertyID::USER_PROPERTY) {
+        return true;
+    }
+    switch (context) {
+    case Frame::PropertyContext::CONNECT:
+        return id == PropertyID::SESSION_EXPIRY_INTERVAL ||
+               id == PropertyID::RECEIVE_MAXIMUM ||
+               id == PropertyID::MAXIMUM_PACKET_SIZE ||
+               id == PropertyID::TOPIC_ALIAS_MAXIMUM ||
+               id == PropertyID::REQUEST_RESPONSE_INFORMATION ||
+               id == PropertyID::REQUEST_PROBLEM_INFORMATION ||
+               id == PropertyID::AUTHENTICATION_METHOD ||
+               id == PropertyID::AUTHENTICATION_DATA;
+    case Frame::PropertyContext::WILL:
+        return id == PropertyID::WILL_DELAY_INTERVAL ||
+               id == PropertyID::PAYLOAD_FORMAT_INDICATOR ||
+               id == PropertyID::MESSAGE_EXPIRY_INTERVAL ||
+               id == PropertyID::CONTENT_TYPE ||
+               id == PropertyID::RESPONSE_TOPIC ||
+               id == PropertyID::CORRELATION_DATA;
+    case Frame::PropertyContext::CONNACK:
+        return id == PropertyID::SESSION_EXPIRY_INTERVAL ||
+               id == PropertyID::RECEIVE_MAXIMUM ||
+               id == PropertyID::MAXIMUM_QOS ||
+               id == PropertyID::RETAIN_AVAILABLE ||
+               id == PropertyID::MAXIMUM_PACKET_SIZE ||
+               id == PropertyID::ASSIGNED_CLIENT_IDENTIFIER ||
+               id == PropertyID::TOPIC_ALIAS_MAXIMUM ||
+               id == PropertyID::REASON_STRING ||
+               id == PropertyID::WILDCARD_SUBSCRIPTION_AVAILABLE ||
+               id == PropertyID::SUBSCRIPTION_IDENTIFIER_AVAILABLE ||
+               id == PropertyID::SHARED_SUBSCRIPTION_AVAILABLE ||
+               id == PropertyID::SERVER_KEEP_ALIVE ||
+               id == PropertyID::RESPONSE_INFORMATION ||
+               id == PropertyID::SERVER_REFERENCE ||
+               id == PropertyID::AUTHENTICATION_METHOD ||
+               id == PropertyID::AUTHENTICATION_DATA;
+    case Frame::PropertyContext::PUBLISH:
+        return id == PropertyID::PAYLOAD_FORMAT_INDICATOR ||
+               id == PropertyID::MESSAGE_EXPIRY_INTERVAL ||
+               id == PropertyID::TOPIC_ALIAS ||
+               id == PropertyID::RESPONSE_TOPIC ||
+               id == PropertyID::CORRELATION_DATA ||
+               id == PropertyID::SUBSCRIPTION_IDENTIFIER ||
+               id == PropertyID::CONTENT_TYPE;
+    case Frame::PropertyContext::PUBACK:
+    case Frame::PropertyContext::PUBREC:
+    case Frame::PropertyContext::PUBREL:
+    case Frame::PropertyContext::PUBCOMP:
+    case Frame::PropertyContext::SUBACK:
+    case Frame::PropertyContext::UNSUBACK:
+        return id == PropertyID::REASON_STRING;
+    case Frame::PropertyContext::SUBSCRIBE:
+        return id == PropertyID::SUBSCRIPTION_IDENTIFIER;
+    case Frame::PropertyContext::UNSUBSCRIBE:
+        return false;
+    case Frame::PropertyContext::DISCONNECT:
+        return id == PropertyID::SESSION_EXPIRY_INTERVAL ||
+               id == PropertyID::REASON_STRING ||
+               id == PropertyID::SERVER_REFERENCE;
+    case Frame::PropertyContext::AUTH:
+        return id == PropertyID::AUTHENTICATION_METHOD ||
+               id == PropertyID::AUTHENTICATION_DATA ||
+               id == PropertyID::REASON_STRING;
+    case Frame::PropertyContext::NONE:
+        return true;
+    }
+    return false;
+}
 } // namespace
 
 size_t Frame::feed(const uint8_t *buffer, size_t length) {
@@ -218,7 +296,8 @@ uint16_t Frame::parsePacketId(const uint8_t* buffer, size_t length) {
 }
 
 Properties Frame::doParseProperties(const uint8_t *buffer, size_t length,
-                                    SubscriptionIdentifiers *identifiers) {
+                                    SubscriptionIdentifiers *identifiers,
+                                    PropertyContext context) {
     Properties properties;
     std::string contentType;
     std::string responseTopic;
@@ -239,6 +318,14 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length,
         auto [id, idBytes] = decodeVariableByteInteger(buffer+offset, length-offset);
             offset += idBytes;
         PropertyID propertyId = static_cast<PropertyID>(id);
+        // MQTT-2.2.2-1: a property that the packet type does not define makes
+        // the packet Malformed. Checked before the value is decoded, so a
+        // property that belongs elsewhere cannot be half-applied.
+        if (!isPropertyAllowed(context, propertyId)) {
+            throw std::runtime_error("Invalid properties: property " +
+                                     std::to_string(id) +
+                                     " is not allowed in this packet (MQTT-2.2.2-1)");
+        }
         // MQTT-3.3.4-4: a PUBLISH may carry the Subscription Identifier once for
         // every subscription that caused it, so that one property is collected
         // in a list. A SUBSCRIBE still carries at most one (MQTT-3.8.2-16) and
@@ -408,10 +495,20 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length,
                 offset += authenticationData.length() + 2;
                 break;          
             case PropertyID::REQUEST_PROBLEM_INFORMATION:
+                // A boolean (MQTT-3.1.2.11.8): no length byte, just the value.
                 if (offset + 1 > length) {
                     throw std::runtime_error("Invalid REQUEST_PROBLEM_INFORMATION property: insufficient data");  
                 }   
-                properties[propertyId] = static_cast<bool>(buffer[offset]);
+                properties[propertyId] = static_cast<bool>(buffer[offset] != 0);
+                offset += 1;
+                break;
+            case PropertyID::REQUEST_RESPONSE_INFORMATION:
+                // A boolean (MQTT-3.1.2.11.7) that was not decoded at all, so a
+                // CONNECT carrying it failed with "Invalid property ID".
+                if (offset + 1 > length) {
+                    throw std::runtime_error("Invalid REQUEST_RESPONSE_INFORMATION property: insufficient data");
+                }
+                properties[propertyId] = static_cast<bool>(buffer[offset] != 0);
                 offset += 1;
                 break;
             case PropertyID::RECEIVE_MAXIMUM:
@@ -490,7 +587,8 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length,
 }
 
 std::pair<Properties, size_t> Frame::parseProperties(const uint8_t *buffer, size_t length,
-                                                     SubscriptionIdentifiers *identifiers) {
+                                                     SubscriptionIdentifiers *identifiers,
+                                                     PropertyContext context) {
     if (length == 0) {
         throw std::runtime_error("Properties: no property length present");
     }
@@ -502,7 +600,7 @@ std::pair<Properties, size_t> Frame::parseProperties(const uint8_t *buffer, size
         throw std::runtime_error("Not enough data for properperties");
     }     
     const uint8_t *propertyBuffer = buffer + propertyBytes;
-    Properties properties = doParseProperties(propertyBuffer, propertyLength, identifiers);
+    Properties properties = doParseProperties(propertyBuffer, propertyLength, identifiers, context);
     return std::make_pair(properties, propertyBytes + propertyLength);
 }   
 
@@ -539,7 +637,8 @@ ConnectPacket Frame::parseConnect(const uint8_t *buffer, size_t length) {
 
     // Parse properties (MQTT 5 only - for MQTT 3.1.1 the payload starts right after the keep alive)
     if (protoVersion == Version::MQTT5) {
-        auto [properties, propLength] = parseProperties(buffer+offset, length-offset);
+        auto [properties, propLength] = parseProperties(buffer+offset, length-offset, nullptr,
+                                                        PropertyContext::CONNECT);
         connect.properties = properties;
         offset += propLength;
     }
@@ -554,7 +653,8 @@ ConnectPacket Frame::parseConnect(const uint8_t *buffer, size_t length) {
     if (connect.willFlag) {
         // Parse will properties
         if(protoVersion == Version::MQTT5) {
-            auto [willProperties, willPropertyLength] = parseProperties(buffer+offset, length-offset);
+            auto [willProperties, willPropertyLength] =
+                parseProperties(buffer+offset, length-offset, nullptr, PropertyContext::WILL);
             connect.willProperties = willProperties;
             offset += willPropertyLength;
         }   
@@ -610,7 +710,8 @@ PublishPacket Frame::parsePublish(const FixedHeader &header, const uint8_t *buff
         // (MQTT-3.3.4-6); parse it so the caller can reject the packet rather
         // than route it as if the identifier had never been there.
         auto [properties, propLength] = parseProperties(buffer+offset, length - offset,
-                                                       &publish.subscriptionIdentifiers);
+                                                       &publish.subscriptionIdentifiers,
+                                                       PropertyContext::PUBLISH);
         publish.properties = properties;
         offset += propLength;
     }
@@ -634,7 +735,8 @@ PubackPacket Frame::parsePuback(const uint8_t *buffer, size_t length) {
 
     // Parse properties
     if(version == Version::MQTT5) {
-        auto [properties, propLength] = parseProperties(buffer+offset, length - offset);
+        auto [properties, propLength] = parseProperties(buffer+offset, length - offset, nullptr,
+                                                        PropertyContext::PUBACK);
         puback.properties = properties;
         offset += propLength;
     }
@@ -660,7 +762,8 @@ PubrecPacket Frame::parsePubrec(const uint8_t *buffer, size_t length) {
     }
     // Parse properties
     if(version == Version::MQTT5) {
-        auto [properties, propLength] = parseProperties(buffer+offset, length - offset);
+        auto [properties, propLength] = parseProperties(buffer+offset, length - offset, nullptr,
+                                                        PropertyContext::PUBREC);
         pubrec.properties = properties;
         offset += propLength;
     }
@@ -684,7 +787,8 @@ PubrelPacket Frame::parsePubrel(const uint8_t *buffer, size_t length) {
     }
     // Parse properties
     if(version == Version::MQTT5) {
-        auto [properties, propLength] = parseProperties(buffer+offset, length - offset);
+        auto [properties, propLength] = parseProperties(buffer+offset, length - offset, nullptr,
+                                                        PropertyContext::PUBREL);
         pubrel.properties = properties;
         offset += propLength;
     }
@@ -709,7 +813,8 @@ PubcompPacket Frame::parsePubcomp(const uint8_t *buffer, size_t length) {
     
     // Parse properties
     if(version == Version::MQTT5) {
-        auto [properties, propLength] = parseProperties(buffer+offset, length - offset);
+        auto [properties, propLength] = parseProperties(buffer+offset, length - offset, nullptr,
+                                                        PropertyContext::PUBCOMP);
         pubcomp.properties = properties;
         offset += propLength;
     }
@@ -732,7 +837,8 @@ SubscribePacket Frame::parseSubscribe(const uint8_t *buffer, size_t length) {
 
     // Parse properties
     if(version == Version::MQTT5) {
-        auto [properties, propLength] = parseProperties(buffer+offset, length - offset);
+        auto [properties, propLength] = parseProperties(buffer+offset, length - offset, nullptr,
+                                                        PropertyContext::SUBSCRIBE);
         subscribe.properties = properties;
         offset += propLength;
     }
@@ -779,7 +885,8 @@ UnsubscribePacket Frame::parseUnsubscribe(const uint8_t *buffer, size_t length) 
     
     // Parse properties
     if(version == Version::MQTT5) {
-        auto [properties, propLength] = parseProperties(buffer+offset, length - offset);
+        auto [properties, propLength] = parseProperties(buffer+offset, length - offset, nullptr,
+                                                        PropertyContext::UNSUBSCRIBE);
         unsubscribe.properties = properties;
         offset += propLength;
     }
@@ -813,7 +920,8 @@ DisconnectPacket Frame::parseDisconnect(const uint8_t *buffer, size_t length) {
     size_t offset = 1;
     // Remaining bytes are the property length followed by the properties
     if (length - offset > 0) {
-        auto [properties, propLength] = parseProperties(buffer + offset, length - offset);
+        auto [properties, propLength] = parseProperties(buffer + offset, length - offset, nullptr,
+                                                        PropertyContext::DISCONNECT);
         disconnect.properties = properties;
     }
     return disconnect;

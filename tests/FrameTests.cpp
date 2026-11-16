@@ -206,6 +206,162 @@ TEST_F(FrameTest, ParseConnectWithMultipleUserPropertiesAccumulate)
     EXPECT_EQ(packet.clientId, "cd");
 }
 
+//! Append a Variable Byte Integer (the property-block length prefix).
+static void appendVBI(std::vector<uint8_t>& out, size_t value) {
+    do {
+        uint8_t d = static_cast<uint8_t>(value % 128);
+        value /= 128;
+        if (value) d |= 0x80;
+        out.push_back(d);
+    } while (value);
+}
+
+//! Build a complete CONNECT payload: fixed header, one property block, client id.
+static std::vector<uint8_t> connectPayload(const std::vector<uint8_t>& props,
+                                           const std::string& clientId,
+                                           bool will = false) {
+    auto lengthBytes = std::vector<uint8_t>();
+    appendVBI(lengthBytes, props.size());
+    std::vector<uint8_t> p = {
+        0x00, 0x04, 'M', 'Q', 'T', 'T',  // Protocol name
+        0x05,                            // Protocol version
+        static_cast<uint8_t>(0b00000010 | (will ? 0b00000100 : 0)),
+        0x00, 0x3c,                      // Keep alive = 60
+    };
+    p.insert(p.end(), lengthBytes.begin(), lengthBytes.end());
+    p.insert(p.end(), props.begin(), props.end());
+    p.push_back(static_cast<uint8_t>(clientId.size() >> 8));
+    p.push_back(static_cast<uint8_t>(clientId.size() & 0xFF));
+    p.insert(p.end(), clientId.begin(), clientId.end());
+    return p;
+}
+
+TEST_F(FrameTest, ParseConnectRejectsForeignProperty)
+{
+    // §2.2.2.2 (MQTT-2.2.2-1): a property that is not defined for CONNECT makes
+    // the packet Malformed. These ids are all defined for some other packet.
+    const std::vector<uint8_t> foreign[] = {
+        {0x23, 0x02, 0x00, 0x01},                    // Topic Alias (PUBLISH)
+        {0x0B, 0x07},                                // Subscription Identifier
+        {0x18, 0x04, 0x00, 0x00, 0x00, 0x05},        // Will Delay Interval
+        {0x01, 0x01},                                // Payload Format Indicator
+        {0x03, 0x00, 0x04, 't', 'e', 'x', 't'},      // Content Type
+        {0x08, 0x00, 0x03, 'a', '/', 'b'},           // Response Topic
+        {0x12, 0x00, 0x02, 'x', 'x'},                // Assigned Client Identifier
+        {0x13, 0x02, 0x00, 0x1E},                    // Server Keep Alive
+        {0x1F, 0x00, 0x02, 'n', 'o'},                // Reason String
+        {0x24, 0x02},                                // Maximum QoS
+    };
+    for (const auto& prop : foreign) {
+        auto payload = connectPayload(prop, "cid");
+        EXPECT_THROW(frame->parseConnect(payload.data(), payload.size()),
+                     std::runtime_error);
+    }
+}
+
+TEST_F(FrameTest, ParseConnectRejectsForeignPropertyInWill)
+{
+    // The Will property block has its own set (§3.1.2.12). A Subscription
+    // Identifier, which only PUBLISH and SUBSCRIBE may carry, makes the packet
+    // that carries the Will Malformed.
+    auto payload = connectPayload({0x0B, 0x07}, "cid", true);
+    // Will topic, Will payload (each with a two-byte length prefix).
+    const std::vector<uint8_t> will = {0x00, 0x02, 't', 'p', 0x00, 0x03, 'd', 'a', 't'};
+    payload.insert(payload.end(), will.begin(), will.end());
+
+    EXPECT_THROW(frame->parseConnect(payload.data(), payload.size()), std::runtime_error);
+}
+
+TEST_F(FrameTest, ParseConnectAcceptsRequestResponseInformation)
+{
+    // Regression guard: Request Response Information (0x19) is a one-byte
+    // boolean (§3.1.2.11.7) that used to be unknown to the parser, so any
+    // CONNECT carrying it was dropped as "Invalid property ID".
+    const std::vector<uint8_t> props = {
+        0x11, 0x04, 0x00, 0x00, 0x0e, 0x10,              // Session Expiry = 3600
+        0x19, 0x01,                                      // Request Response Information
+        0x17, 0x01,                                      // Request Problem Information
+        0x26, 0x00, 0x01, 'a', 0x00, 0x01, 'b',          // User Property a=b
+    };
+    auto payload = connectPayload(props, "cid");
+
+    auto packet = frame->parseConnect(payload.data(), payload.size());
+
+    ASSERT_EQ(packet.properties.count(PropertyID::REQUEST_RESPONSE_INFORMATION), 1u);
+    EXPECT_TRUE(std::get<bool>(packet.properties[PropertyID::REQUEST_RESPONSE_INFORMATION]));
+    ASSERT_EQ(packet.properties.count(PropertyID::REQUEST_PROBLEM_INFORMATION), 1u);
+    EXPECT_TRUE(std::get<bool>(packet.properties[PropertyID::REQUEST_PROBLEM_INFORMATION]));
+    ASSERT_EQ(packet.properties.count(PropertyID::SESSION_EXPIRY_INTERVAL), 1u);
+    EXPECT_EQ(std::get<uint32_t>(packet.properties[PropertyID::SESSION_EXPIRY_INTERVAL]), 3600u);
+    EXPECT_EQ(packet.properties.count(PropertyID::USER_PROPERTY), 1u);
+    EXPECT_EQ(packet.clientId, "cid");
+}
+
+TEST_F(FrameTest, ParsePublishRejectsForeignProperty)
+{
+    // §3.3.2.3: Session Expiry Interval, Receive Maximum and Topic Alias Maximum
+    // are CONNECT/CONNACK properties; a PUBLISH carrying one is Malformed.
+    const std::vector<uint8_t> foreign[] = {
+        {0x11, 0x04, 0x00, 0x00, 0x00, 0x3c},  // Session Expiry Interval
+        {0x21, 0x02, 0x00, 0x0a},              // Receive Maximum
+        {0x22, 0x02, 0x00, 0x05},              // Topic Alias Maximum
+    };
+    for (const auto& prop : foreign) {
+        std::vector<uint8_t> payload = {'t', 'p'};
+        appendVBI(payload, prop.size());
+        payload.insert(payload.end(), prop.begin(), prop.end());
+        payload.insert(payload.end(), {'h', 'i'});
+        EXPECT_THROW(frame->parsePublish(0x30, payload.data(), payload.size()),
+                     std::runtime_error);
+    }
+}
+
+TEST_F(FrameTest, ParsePublishStillAcceptsItsOwnProperties)
+{
+    // Control: the properties PUBLISH does define keep parsing.
+    std::vector<uint8_t> payload = {0x00, 0x04, 't', 'p', '/', 'a'};
+    const std::vector<uint8_t> props = {
+        0x23, 0x02, 0x00, 0x01,                    // Topic Alias
+        0x03, 0x00, 0x04, 't', 'e', 'x', 't',      // Content Type
+        0x01, 0x01,                                // Payload Format Indicator
+    };
+    appendVBI(payload, props.size());
+    payload.insert(payload.end(), props.begin(), props.end());
+    payload.insert(payload.end(), {'h', 'i'});
+
+    auto publish = frame->parsePublish(0x30, payload.data(), payload.size());
+    EXPECT_EQ(publish.properties.count(PropertyID::TOPIC_ALIAS), 1u);
+    EXPECT_EQ(publish.properties.count(PropertyID::CONTENT_TYPE), 1u);
+}
+
+TEST_F(FrameTest, ParseSubscribeRejectsForeignProperty)
+{
+    // §3.8.2.1.2: only Subscription Identifier and User Property are allowed
+    // in SUBSCRIBE properties.
+    const std::vector<uint8_t> foreign[] = {
+        {0x23, 0x02, 0x00, 0x01},              // Topic Alias (PUBLISH only)
+        {0x11, 0x04, 0x00, 0x00, 0x00, 0x3c},  // Session Expiry Interval
+    };
+    for (const auto& prop : foreign) {
+        std::vector<uint8_t> payload = {0x00, 0x02};  // Packet ID
+        appendVBI(payload, prop.size());
+        payload.insert(payload.end(), prop.begin(), prop.end());
+        payload.insert(payload.end(), {'f', '/'});
+        payload.push_back(0x00);                       // Options
+        EXPECT_THROW(frame->parseSubscribe(payload.data(), payload.size()),
+                     std::runtime_error);
+    }
+}
+
+TEST_F(FrameTest, ParseDisconnectRejectsForeignProperty)
+{
+    // §3.14.2.2.2: DISCONNECT properties are limited to Session Expiry Interval,
+    // Reason String and Server Reference.
+    std::vector<uint8_t> payload = {0x00, 0x02, 0x23, 0x02, 0x00, 0x01};
+    EXPECT_THROW(frame->parseDisconnect(payload.data(), payload.size()),
+                 std::runtime_error);
+}
+
 TEST_F(FrameTest, SerializeUserPropertiesEmitIdPerPair)
 {
     // Serialization must repeat the property id byte for each User Property
