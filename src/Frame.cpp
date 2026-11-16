@@ -104,6 +104,11 @@ bool isPropertyAllowed(Frame::PropertyContext context, PropertyID id) {
     case Frame::PropertyContext::UNSUBACK:
         return id == PropertyID::REASON_STRING;
     case Frame::PropertyContext::SUBSCRIBE:
+        // §3.8.2.1 defines only the Subscription Identifier and User Property
+        // for SUBSCRIBE (the User Property is handled above). Topic Alias is
+        // defined solely for PUBLISH (§3.3.2.3.4, Table 2-4), so a SUBSCRIBE
+        // carrying one is a Malformed Packet and must be rejected with 0x81
+        // (MQTT-2.2.2-1) rather than parsed.
         return id == PropertyID::SUBSCRIPTION_IDENTIFIER;
     case Frame::PropertyContext::UNSUBSCRIBE:
         return false;
@@ -396,12 +401,14 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length,
                 }
                 break;
             case PropertyID::MESSAGE_EXPIRY_INTERVAL:
-                // MQTT 5 four-byte integer: id, length byte (0x04), then the value
-                if (offset + 1 + 4 > length || buffer[offset] != 4) {
+                // MQTT 5 Four Byte Integer (§1.5.3): exactly four bytes follow
+                // the identifier. Properties have no length prefix of their own
+                // (§2.2.2.2), so anything else is a Malformed Packet.
+                if (offset + 4 > length) {
                     throw std::runtime_error("Invalid properties: MESSAGE_EXPIRY_INTERVAL");
                 }
-                properties[propertyId] = readU32BE(buffer + offset + 1);
-                offset += 1 + 4;
+                properties[propertyId] = readU32BE(buffer + offset);
+                offset += 4;
                 break;
             case PropertyID::CONTENT_TYPE:
                 if (offset + 2 > length) {
@@ -470,12 +477,14 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length,
                 }
                 break;
             case PropertyID::SESSION_EXPIRY_INTERVAL:
-                // MQTT 5 four-byte integer: id, length byte (0x04), then the value
-                if (offset + 1 + 4 > length || buffer[offset] != 4) {
+                // MQTT 5 Four Byte Integer (§1.5.3): exactly four bytes follow
+                // the identifier. Properties have no length prefix of their own
+                // (§2.2.2.2), so anything else is a Malformed Packet.
+                if (offset + 4 > length) {
                     throw std::runtime_error("Invalid properties: SESSION_EXPIRY_INTERVAL");
                 }
-                properties[propertyId] = readU32BE(buffer + offset + 1);
-                offset += 1 + 4;
+                properties[propertyId] = readU32BE(buffer + offset);
+                offset += 4;
                 break;
             case PropertyID::ASSIGNED_CLIENT_IDENTIFIER:
                 if (offset + 2 > length) {
@@ -486,12 +495,13 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length,
                 offset += assignedClientId.length() + 2;
                 break;
             case PropertyID::SERVER_KEEP_ALIVE:
-                // MQTT 5 two-byte integer: id, length byte (0x02), then the value
-                if (offset + 1 + 2 > length || buffer[offset] != 2) {
+                // MQTT 5 Two Byte Integer (§1.5.2): exactly two bytes follow
+                // the identifier, with no length prefix of their own.
+                if (offset + 2 > length) {
                     throw std::runtime_error("Invalid properties: SERVER_KEEP_ALIVE");
                 }
-                properties[propertyId] = readU16BE(buffer + offset + 1);
-                offset += 1 + 2;
+                properties[propertyId] = readU16BE(buffer + offset);
+                offset += 2;
                 break;
             case PropertyID::AUTHENTICATION_METHOD:
                 if (offset + 2 > length) {
@@ -529,28 +539,31 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length,
                 offset += 1;
                 break;
             case PropertyID::RECEIVE_MAXIMUM:
-                // MQTT 5 two-byte integer: id, length byte (0x02), then the value
-                if (offset + 1 + 2 > length || buffer[offset] != 2) {
+                // MQTT 5 Two Byte Integer (§1.5.2): exactly two bytes follow
+                // the identifier, with no length prefix of their own.
+                if (offset + 2 > length) {
                     throw std::runtime_error("Invalid properties: RECEIVE_MAXIMUM");
                 }
-                properties[propertyId] = readU16BE(buffer + offset + 1);
-                offset += 1 + 2;
+                properties[propertyId] = readU16BE(buffer + offset);
+                offset += 2;
                 break;
             case PropertyID::TOPIC_ALIAS_MAXIMUM:
-                // MQTT 5 two-byte integer: id, length byte (0x02), then the value
-                if (offset + 1 + 2 > length || buffer[offset] != 2) {
+                // MQTT 5 Two Byte Integer (§1.5.2): exactly two bytes follow
+                // the identifier, with no length prefix of their own.
+                if (offset + 2 > length) {
                     throw std::runtime_error("Invalid properties: TOPIC_ALIAS_MAXIMUM");
                 }
-                properties[propertyId] = readU16BE(buffer + offset + 1);
-                offset += 1 + 2;
+                properties[propertyId] = readU16BE(buffer + offset);
+                offset += 2;
                 break;
             case PropertyID::TOPIC_ALIAS:
-                // MQTT 5 two-byte integer: id, length byte (0x02), then the value
-                if (offset + 1 + 2 > length || buffer[offset] != 2) {
+                // MQTT 5 Two Byte Integer (§1.5.2): exactly two bytes follow
+                // the identifier, with no length prefix of their own.
+                if (offset + 2 > length) {
                     throw std::runtime_error("Invalid properties: TOPIC_ALIAS");
                 }
-                properties[propertyId] = readU16BE(buffer + offset + 1);
-                offset += 1 + 2;
+                properties[propertyId] = readU16BE(buffer + offset);
+                offset += 2;
                 break;
             case PropertyID::MAXIMUM_QOS:
                 if (offset + 1 > length) {
@@ -560,20 +573,24 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length,
                 offset += 1;
                 break;
             case PropertyID::MAXIMUM_PACKET_SIZE:
-                // MQTT 5 four-byte integer: id, length byte (0x04), then the value
-                if (offset + 1 + 4 > length || buffer[offset] != 4) {
+                // MQTT 5 Four Byte Integer (§1.5.3): exactly four bytes follow
+                // the identifier. Properties have no length prefix of their own
+                // (§2.2.2.2), so anything else is a Malformed Packet.
+                if (offset + 4 > length) {
                     throw std::runtime_error("Invalid properties: MAXIMUM_PACKET_SIZE");
                 }
-                properties[propertyId] = readU32BE(buffer + offset + 1);
-                offset += 1 + 4;
+                properties[propertyId] = readU32BE(buffer + offset);
+                offset += 4;
                 break;
             case PropertyID::WILL_DELAY_INTERVAL:
-                // MQTT 5 four-byte integer: id, length byte (0x04), then the value
-                if (offset + 1 + 4 > length || buffer[offset] != 4) {
+                // MQTT 5 Four Byte Integer (§1.5.3): exactly four bytes follow
+                // the identifier. Properties have no length prefix of their own
+                // (§2.2.2.2), so anything else is a Malformed Packet.
+                if (offset + 4 > length) {
                     throw std::runtime_error("Invalid properties: WILL_DELAY_INTERVAL");
                 }
-                properties[propertyId] = readU32BE(buffer + offset + 1);
-                offset += 1 + 4;
+                properties[propertyId] = readU32BE(buffer + offset);
+                offset += 4;
                 break;
             case PropertyID::WILDCARD_SUBSCRIPTION_AVAILABLE:
                 if (offset + 1 > length) {
@@ -1548,9 +1565,9 @@ std::vector<uint8_t> Frame::serializeProperties(const Properties &properties) {
                 buffer.push_back(static_cast<uint8_t>(id));
                 buffer.push_back(arg);
             } else if constexpr (std::is_same_v<T, uint16_t>) {
-                // MQTT 5 two-byte integer: a length byte (0x02) then the value.
+                // MQTT 5 Two Byte Integer (§1.5.2): the value follows the
+                // identifier directly, big-endian, with no length byte.
                 buffer.push_back(static_cast<uint8_t>(id));
-                buffer.push_back(0x02);
                 buffer.push_back((arg >> 8) & 0xFF);
                 buffer.push_back(arg & 0xFF);
             } else if constexpr (std::is_same_v<T, uint32_t>) {
@@ -1561,9 +1578,9 @@ std::vector<uint8_t> Frame::serializeProperties(const Properties &properties) {
                     appendVariableByteInteger(buffer, arg);
                     return;
                 }
-                // MQTT 5 four-byte integer: a length byte (0x04) then the value.
+                // MQTT 5 Four Byte Integer (§1.5.3): the value follows the
+                // identifier directly, big-endian, with no length byte.
                 buffer.push_back(static_cast<uint8_t>(id));
-                buffer.push_back(0x04);
                 buffer.push_back((arg >> 24) & 0xFF);
                 buffer.push_back((arg >> 16) & 0xFF);
                 buffer.push_back((arg >> 8) & 0xFF);

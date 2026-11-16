@@ -121,11 +121,12 @@ TEST_F(FrameTest, ParseDisconnectPacket)
 TEST_F(FrameTest, ParseDisconnectWithSessionExpiry)
 {
     // DISCONNECT carrying a Session Expiry Interval property: reason code, then
-    // a property length (0x06), then the property (id 0x11, length 0x04, 4 bytes).
+    // a property length (0x05), then the property (id 0x11 followed by four
+    // big-endian bytes; a Four Byte Integer has no length of its own, §1.5.3).
     std::vector<uint8_t> payload = {
         0x00,                   // Reason Code (Normal disconnection)
-        0x06,                   // Properties length
-        0x11, 0x04, 0x00, 0x00, 0x0e, 0x10   // Session Expiry Interval = 3600
+        0x05,                   // Properties length
+        0x11, 0x00, 0x00, 0x0e, 0x10   // Session Expiry Interval = 3600
     };
 
     auto packet = frame->parseDisconnect(payload.data(), payload.size());
@@ -138,16 +139,16 @@ TEST_F(FrameTest, ParseDisconnectWithSessionExpiry)
 
 TEST_F(FrameTest, ParseConnectSessionExpiryProperty)
 {
-    // Regression guard: a four-byte integer property in CONNECT properties must
-    // consume its length byte. Previously the parser skipped the length byte and
-    // mis-read the value, throwing "Invalid property ID" on well-formed packets.
+    // Regression guard: a Four Byte Integer property is the identifier followed
+    // by exactly four big-endian bytes (§1.5.3, §2.2.2.2). There is no length
+    // byte of its own, so a spec-correct CONNECT must parse.
     std::vector<uint8_t> payload = {
         0x00, 0x04, 'M', 'Q', 'T', 'T',  // Protocol name
         0x05,                            // Protocol version
         0b00000010,                      // Connect flags (clean start)
         0x00, 0x3c,                      // Keep alive = 60
-        0x06,                            // Properties length
-        0x11, 0x04, 0x00, 0x00, 0x0e, 0x10,  // Session Expiry Interval = 3600
+        0x05,                            // Properties length
+        0x11, 0x00, 0x00, 0x0e, 0x10,    // Session Expiry Interval = 3600
         0x00, 0x03, 'c', 'i', 'd'        // Client ID
     };
 
@@ -278,7 +279,7 @@ TEST_F(FrameTest, ParseConnectAcceptsRequestResponseInformation)
     // boolean (§3.1.2.11.7) that used to be unknown to the parser, so any
     // CONNECT carrying it was dropped as "Invalid property ID".
     const std::vector<uint8_t> props = {
-        0x11, 0x04, 0x00, 0x00, 0x0e, 0x10,              // Session Expiry = 3600
+        0x11, 0x00, 0x00, 0x0e, 0x10,                    // Session Expiry = 3600
         0x19, 0x01,                                      // Request Response Information
         0x17, 0x01,                                      // Request Problem Information
         0x26, 0x00, 0x01, 'a', 0x00, 0x01, 'b',          // User Property a=b
@@ -321,7 +322,7 @@ TEST_F(FrameTest, ParsePublishStillAcceptsItsOwnProperties)
     // Control: the properties PUBLISH does define keep parsing.
     std::vector<uint8_t> payload = {0x00, 0x04, 't', 'p', '/', 'a'};
     const std::vector<uint8_t> props = {
-        0x23, 0x02, 0x00, 0x01,                    // Topic Alias
+        0x23, 0x00, 0x01,                          // Topic Alias
         0x03, 0x00, 0x04, 't', 'e', 'x', 't',      // Content Type
         0x01, 0x01,                                // Payload Format Indicator
     };
@@ -334,13 +335,78 @@ TEST_F(FrameTest, ParsePublishStillAcceptsItsOwnProperties)
     EXPECT_EQ(publish.properties.count(PropertyID::CONTENT_TYPE), 1u);
 }
 
+TEST_F(FrameTest, FixedWidthIntegerPropertiesHaveNoLengthPrefix)
+{
+    // §1.5.2 / §1.5.3: a Two Byte Integer is exactly two bytes and a Four Byte
+    // Integer exactly four, big-endian. §2.2.2.2 makes a Property an identifier
+    // followed by its value, so there is no length byte in between. Any client
+    // that sends the spec encoding must be understood.
+    const std::vector<uint8_t> props = {
+        0x11, 0x00, 0x00, 0x00, 0x3c,        // Session Expiry Interval = 60
+        0x21, 0x00, 0x0a,                    // Receive Maximum = 10
+        0x27, 0x00, 0x00, 0x04, 0x00,        // Maximum Packet Size = 1024
+        0x22, 0x00, 0x05,                    // Topic Alias Maximum = 5
+    };
+    auto payload = connectPayload(props, "cid");
+
+    auto packet = frame->parseConnect(payload.data(), payload.size());
+
+    EXPECT_EQ(packet.clientId, "cid");
+    EXPECT_EQ(std::get<uint32_t>(packet.properties[PropertyID::SESSION_EXPIRY_INTERVAL]), 60u);
+    EXPECT_EQ(std::get<uint16_t>(packet.properties[PropertyID::RECEIVE_MAXIMUM]), 10);
+    EXPECT_EQ(std::get<uint32_t>(packet.properties[PropertyID::MAXIMUM_PACKET_SIZE]), 1024u);
+    EXPECT_EQ(std::get<uint16_t>(packet.properties[PropertyID::TOPIC_ALIAS_MAXIMUM]), 5);
+}
+
+TEST_F(FrameTest, ParsePublishMessageExpiryAndTopicAliasWithoutLengthPrefix)
+{
+    // §3.3.2.3.3 (Message Expiry Interval, Four Byte Integer) and §3.3.2.3.4
+    // (Topic Alias, Two Byte Integer) in one spec-correct property block.
+    std::vector<uint8_t> payload = {0x00, 0x01, 'a'};
+    const std::vector<uint8_t> props = {
+        0x02, 0x00, 0x00, 0x00, 0x1e,        // Message Expiry Interval = 30
+        0x23, 0x00, 0x07,                    // Topic Alias = 7
+    };
+    appendVBI(payload, props.size());
+    payload.insert(payload.end(), props.begin(), props.end());
+    payload.insert(payload.end(), {'h', 'i'});
+
+    auto publish = frame->parsePublish(0x30, payload.data(), payload.size());
+
+    EXPECT_EQ(std::get<uint32_t>(publish.properties[PropertyID::MESSAGE_EXPIRY_INTERVAL]), 30u);
+    EXPECT_EQ(std::get<uint16_t>(publish.properties[PropertyID::TOPIC_ALIAS]), 7);
+}
+
+TEST_F(FrameTest, SerializeThenParseFixedWidthIntegersRoundTrips)
+{
+    // The encoder and the decoder must agree with the spec and with each other.
+    Frame v5(Version::MQTT5);
+    ConnackPacket connack(false, ReasonCode::SUCCESS);
+    connack.properties[PropertyID::SERVER_KEEP_ALIVE] = static_cast<uint16_t>(30);
+    connack.properties[PropertyID::MAXIMUM_PACKET_SIZE] = static_cast<uint32_t>(4096);
+    const auto wire = v5.serialize(connack);
+
+    // fixed header (2) + flags/reason (2) + property length (1) +
+    // 0x13 + 2 + 0x27 + 4 = 5 + 8 bytes of body.
+    ASSERT_EQ(wire.size(), 2u + 2u + 1u + 8u);
+    EXPECT_EQ(wire[4], 0x08);  // property length
+    EXPECT_EQ(wire[5], 0x13);  // Server Keep Alive, no length byte
+    EXPECT_EQ(wire[6], 0x00);
+    EXPECT_EQ(wire[7], 0x1e);
+    EXPECT_EQ(wire[8], 0x27);  // Maximum Packet Size, no length byte
+    EXPECT_EQ(wire[9], 0x00);
+    EXPECT_EQ(wire[10], 0x00);
+    EXPECT_EQ(wire[11], 0x10);
+    EXPECT_EQ(wire[12], 0x00);
+}
+
 TEST_F(FrameTest, ParseSubscribeRejectsForeignProperty)
 {
     // §3.8.2.1.2: only Subscription Identifier and User Property are allowed
     // in SUBSCRIBE properties.
     const std::vector<uint8_t> foreign[] = {
-        {0x23, 0x02, 0x00, 0x01},              // Topic Alias (PUBLISH only)
-        {0x11, 0x04, 0x00, 0x00, 0x00, 0x3c},  // Session Expiry Interval
+        {0x23, 0x00, 0x01},                    // Topic Alias (PUBLISH only)
+        {0x11, 0x00, 0x00, 0x00, 0x3c},        // Session Expiry Interval
     };
     for (const auto& prop : foreign) {
         std::vector<uint8_t> payload = {0x00, 0x02};  // Packet ID
@@ -634,23 +700,24 @@ TEST_F(FrameTest, SerializeConnackForMqtt5AdvertisesMaximumPacketSize)
     Frame v5(Version::MQTT5);
     ConnackPacket connack(false, ReasonCode::SUCCESS);
     connack.properties[PropertyID::MAXIMUM_PACKET_SIZE] = static_cast<uint32_t>(1024 * 1024);
-    // 0x20, remaining length 9, flags 0, reason 0, property length 6,
-    // property id 0x27, length byte 4, then the 4-byte big-endian value
-    // 0x00100000.
+    // 0x20, remaining length 8, flags 0, reason 0, property length 5,
+    // property id 0x27, then the 4-byte big-endian value 0x00100000.
+    // §1.5.3: a Four Byte Integer has no length prefix of its own.
     EXPECT_EQ(v5.serialize(connack),
-              (std::vector<uint8_t>{0x20, 0x09, 0x00, 0x00, 0x06, 0x27, 0x04,
+              (std::vector<uint8_t>{0x20, 0x08, 0x00, 0x00, 0x05, 0x27,
                                     0x00, 0x10, 0x00, 0x00}));
 }
 
-TEST_F(FrameTest, SerializeConnackAdvertisesTopicAliasMaximumWithLengthByte)
+TEST_F(FrameTest, SerializeConnackAdvertisesTopicAliasMaximumAsTwoByteInteger)
 {
     Frame v5(Version::MQTT5);
     ConnackPacket connack(false, ReasonCode::SUCCESS);
     connack.properties[PropertyID::TOPIC_ALIAS_MAXIMUM] = static_cast<uint16_t>(16);
-    // 0x20, remaining length 7, flags 0, reason 0, property length 4,
-    // property id 0x22, length byte 2, then the 2-byte value 0x0010.
+    // 0x20, remaining length 6, flags 0, reason 0, property length 3,
+    // property id 0x22, then the 2-byte value 0x0010. §1.5.2: a Two Byte
+    // Integer is two bytes big-endian with no length prefix.
     EXPECT_EQ(v5.serialize(connack),
-              (std::vector<uint8_t>{0x20, 0x07, 0x00, 0x00, 0x04, 0x22, 0x02, 0x00, 0x10}));
+              (std::vector<uint8_t>{0x20, 0x06, 0x00, 0x00, 0x03, 0x22, 0x00, 0x10}));
 }
 
 TEST_F(FrameTest, SerializeConnackAdvertisesCapabilityFlags)
@@ -755,8 +822,8 @@ TEST_F(FrameTest, ParsePublishTopicAliasPropertyIsTwoByteInteger)
     v5.setVersion(Version::MQTT5);
     std::vector<uint8_t> payload = {
         0x00, 0x01, 'a',              // Topic name "a"
-        0x04,                         // Properties length
-        0x23, 0x02, 0x00, 0x07,       // TOPIC_ALIAS, len 2, value 7
+        0x03,                         // Properties length
+        0x23, 0x00, 0x07,             // TOPIC_ALIAS, two-byte value 7
         'h', 'i'                      // Payload
     };
     FixedHeader header(0x30);
@@ -776,8 +843,8 @@ TEST_F(FrameTest, ParsePublishWithEmptyTopicNameIsAccepted)
     v5.setVersion(Version::MQTT5);
     std::vector<uint8_t> payload = {
         0x00, 0x00,                   // Empty topic name
-        0x04,                         // Properties length
-        0x23, 0x02, 0x00, 0x07,       // TOPIC_ALIAS = 7
+        0x03,                         // Properties length
+        0x23, 0x00, 0x07,             // TOPIC_ALIAS = 7
         'h', 'i'                      // Payload
     };
     FixedHeader header(0x30);
