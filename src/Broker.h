@@ -55,6 +55,11 @@ class Broker {
         bool retain = false;
         std::chrono::steady_clock::time_point deadline;
         std::string username;
+        //! Will Message Expiry Interval, applied when the Will is finally
+        //! published (MQTT-3.3.2-9): the lifetime counts from publication, not
+        //! from the CONNECT, so the Will Delay must not consume it.
+        bool hasExpiry = false;
+        uint32_t expiryInterval = 0;
     };
     //! Delayed Wills keyed by client id. Populated on an abnormal disconnect
     //! whose CONNECT carried a Will Delay Interval; published by the sweeper once
@@ -186,7 +191,8 @@ public:
     //! sweeper once the delay elapses, keyed by client id. A reconnect calls
     //! cancelWill to drop it before it fires.
     void armWill(const std::string &clientId, const Message &will, QoS qos,
-                 bool retain, uint32_t delaySeconds);
+                 bool retain, uint32_t delaySeconds, bool hasExpiry = false,
+                 uint32_t expiryInterval = 0);
     //! Cancel a pending delayed Will for this client id (a reconnect within the
     //! window cancels it). No-op if none is pending.
     void cancelWill(const std::string &clientId);

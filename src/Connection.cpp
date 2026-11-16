@@ -110,7 +110,8 @@ void Connection::run() {
             // (at disconnect). The sweeper publishes it once the delay elapses,
             // unless a reconnect with the same client id cancels it first.
             broker->armWill(session->getClientId(), willMessage, willMessage.qos,
-                            willMessage.retain, willDelay);
+                            willMessage.retain, willDelay, willHasExpiry,
+                            willExpiryInterval);
         } else {
             publishWill();
         }
@@ -280,6 +281,7 @@ void Connection::publishWill() {
     Message will = willMessage;
     will.qos = willMessage.qos;
     will.retain = willMessage.retain;
+    armWillExpiry(will);
     // The Will is published as the client, so the same write ACL applies as
     // for a regular PUBLISH
     const std::string username = session ? session->getUsername() : std::string();
@@ -288,6 +290,18 @@ void Connection::publishWill() {
         return;
     }
     broker->publish(will);
+}
+
+void Connection::armWillExpiry(Message &will) const {
+    // MQTT-3.3.2-9: the Message Expiry Interval of a Will is relative to its
+    // publication, which is exactly now: the Will Delay Interval has already
+    // elapsed and must not be subtracted from the lifetime.
+    if (!willHasExpiry) {
+        return;
+    }
+    will.hasExpiry = true;
+    will.expiryDeadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(willExpiryInterval);
 }
 
 void Connection::handleIncoming(std::shared_ptr<Packet> packet) {
@@ -537,6 +551,19 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
             auto it = connect->willProperties->find(PropertyID::WILL_DELAY_INTERVAL);
             if (it != connect->willProperties->end() && std::holds_alternative<uint32_t>(it->second)) {
                 willDelay = std::get<uint32_t>(it->second);
+            }
+            // MQTT-3.3.2-9 / MQTT-3.3.2-6: the Will is published like any other
+            // Application Message, so its Message Expiry Interval has to become a
+            // deadline too. Without this the Will was delivered forever: an
+            // interval of 0 still reached subscribers, a copy queued for an
+            // offline session never went stale, and the retained copy never
+            // disappeared. The lifetime starts when the Will is published (after
+            // the Will Delay), not now, so the delay does not eat into it.
+            auto expiry = connect->willProperties->find(PropertyID::MESSAGE_EXPIRY_INTERVAL);
+            if (expiry != connect->willProperties->end() &&
+                std::holds_alternative<uint32_t>(expiry->second)) {
+                willExpiryInterval = std::get<uint32_t>(expiry->second);
+                willHasExpiry = true;
             }
         }
     }

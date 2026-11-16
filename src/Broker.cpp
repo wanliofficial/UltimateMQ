@@ -160,7 +160,8 @@ void Broker::sweepExpiredSessions() {
 }
 
 void Broker::armWill(const std::string &clientId, const Message &will, QoS qos,
-                     bool retain, uint32_t delaySeconds) {
+                     bool retain, uint32_t delaySeconds, bool hasExpiry,
+                     uint32_t expiryInterval) {
     if (delaySeconds == 0) {
         return;
     }
@@ -170,6 +171,8 @@ void Broker::armWill(const std::string &clientId, const Message &will, QoS qos,
     pending.qos = qos;
     pending.retain = retain;
     pending.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(delaySeconds);
+    pending.hasExpiry = hasExpiry;
+    pending.expiryInterval = expiryInterval;
     // Capture the username so the write ACL still applies when the Will is
     // published, even if the session has since been torn down.
     if (auto session = findSession(clientId)) {
@@ -202,6 +205,14 @@ void Broker::publishDueWills() {
     }
     // Publish outside the broker lock (publish() takes it itself).
     for (auto &pending : due) {
+        // MQTT-3.3.2-9: the lifetime of a Will counts from its publication, so
+        // it is stamped here and not when the Will was armed. The Will Delay has
+        // therefore already elapsed and does not shorten the Message Expiry
+        // Interval; an interval of 0 publishes a message that is already stale.
+        if (pending.hasExpiry) {
+            pending.message.hasExpiry = true;
+            pending.message.expiryDeadline = now + std::chrono::seconds(pending.expiryInterval);
+        }
         // The Will is published as the originating client, so the same write ACL
         // applies as for a regular PUBLISH.
         if (auth && auth->isForbidden(pending.username, pending.message.topic,

@@ -164,8 +164,58 @@ TEST_F(BrokerTest, DelayedWillIsNotPublishedUntilDue)
     EXPECT_EQ(subClient->size(), 1u);
 }
 
-TEST_F(BrokerTest, CancelWillPreventsPublication)
+TEST_F(BrokerTest, DelayedWillExpiryCountsFromPublication)
 {
+    // MQTT-3.3.2-6 / MQTT-3.3.2-9: the Will's Message Expiry Interval must be
+    // applied when it is published. Arming it must not stamp a deadline (that
+    // would let the Will Delay eat into the lifetime) and the published copy
+    // must carry the full interval minus the time since publication.
+    auto sub = std::make_shared<MQTT::Session>(broker, "dw-exp-sub");
+    sub->connect(sub, /*persistent=*/true);
+    sub->subscribe("dw/exp", MQTT::SubscriptionOptions{MQTT::QoS::QOS_0, false, false,
+                                                      MQTT::RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES});
+    auto subClient = MQTT::test::attach(*sub);
+
+    MQTT::Message will("dw/exp", "bye");
+    broker->armWill("dw-exp-will", will, MQTT::QoS::QOS_0, false, /*delaySeconds=*/1,
+                    /*hasExpiry=*/true, /*expiryInterval=*/60);
+    broker->sweepExpiredSessions();
+    EXPECT_EQ(subClient->size(), 0u) << "the Will fired before its delay elapsed";
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    broker->sweepExpiredSessions();
+    ASSERT_EQ(subClient->size(), 1u);
+    auto delivered = subClient->snapshot();
+    ASSERT_TRUE(delivered[0].hasExpiry) << "the published Will lost its expiry";
+    const auto left = std::chrono::duration_cast<std::chrono::seconds>(
+                          delivered[0].expiryDeadline - std::chrono::steady_clock::now())
+                          .count();
+    // 60 s minus ~1 s of publication time; far more than the 59 s a deadline
+    // armed at armWill() time would have left (which would also be wrong once
+    // the delay is long).
+    EXPECT_GE(left, 58) << "the Will Delay was subtracted from the Message Expiry";
+    EXPECT_LE(left, 60);
+}
+
+TEST_F(BrokerTest, WillWithZeroExpiryExpiresImmediately)
+{
+    // MQTT-3.3.2-9: an interval of 0 means the message expires immediately, so
+    // a Will published with it must not reach even a live subscriber.
+    auto sub = std::make_shared<MQTT::Session>(broker, "wz-sub");
+    sub->connect(sub, /*persistent=*/false);
+    sub->subscribe("wz/#", MQTT::SubscriptionOptions{MQTT::QoS::QOS_0, false, false,
+                                                      MQTT::RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES});
+    auto subClient = MQTT::test::attach(*sub);
+
+    MQTT::Message will("wz/gone", "bye");
+    will.hasExpiry = true;
+    will.expiryDeadline = std::chrono::steady_clock::now();
+    broker->publish(will);
+    sub->flush();
+    EXPECT_EQ(subClient->size(), 0u) << "an already expired Will was delivered";
+}
+
+TEST_F(BrokerTest, CancelWillPreventsPublication){
     auto sub = std::make_shared<MQTT::Session>(broker, "cw-sub");
     sub->connect(sub, /*persistent=*/true);
     sub->subscribe("cw/#", MQTT::SubscriptionOptions{MQTT::QoS::QOS_0, false, false,

@@ -86,6 +86,9 @@ private:
     void runReadLoop();
     void closeSocket();
     void publishWill();
+    //! Stamps the Will's Message Expiry Interval onto \p will as a deadline
+    //! starting now (MQTT-3.3.2-9). No-op when the CONNECT carried no interval.
+    void armWillExpiry(Message &will) const;
     void armKeepAliveTimer();
     void scheduleReadTimeout();
     void setDisconnectCallback(std::function<void()> callback);
@@ -149,6 +152,14 @@ private:
     //! MQTT-3.1.3.2), and the sweeper publishes it after the delay (cancellable
     //! by a reconnect). See handleConnect and run().
     uint32_t willDelay = 0;
+    //! Parsed Will Message Expiry Interval. The Will is published like any other
+    //! Application Message (MQTT-3.3.2-6 / MQTT-3.3.2-9), so its lifetime has to
+    //! be tracked as an absolute deadline to stop delivering it once stale. The
+    //! interval is kept here and stamped onto the Message only at publication
+    //! time (publishWill), because the Will Delay Interval must not be subtracted
+    //! from it.
+    bool willHasExpiry = false;
+    uint32_t willExpiryInterval = 0;
     std::function<void()> disconnectCallback;
     std::unique_ptr<SecureTransport> transport;
     static const int BUFFER_SIZE = 4096;
