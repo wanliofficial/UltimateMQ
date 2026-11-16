@@ -261,6 +261,10 @@ void Server::installSignalHandlers() {
 
 void Server::run() {
     while (running) {
+        // Join the threads of clients that have gone away. Threads are not
+        // detached, so their resources (and the last reference to their
+        // Connection) are only released when they are joined.
+        reapFinishedClientThreads();
         // Drop any sessions whose disconnect-time expiry has elapsed. Bounding
         // the poll timeout guarantees the loop wakes to run this even when idle.
         if (std::chrono::steady_clock::now() - lastSweep >= sweepInterval) {
@@ -332,13 +336,12 @@ void Server::run() {
         // The shared_ptr keeps the connection alive for the lifetime of the
         // session callbacks, even if the thread itself has already finished
         auto connection = std::make_shared<Connection>(clientSocket, broker, TLS);
-        registerConnection(clientSocket, connection);
-
-        std::thread clientThread([this, clientSocket, connection]() {
-            handleClient(clientSocket);
-            unregisterConnection(clientSocket);
-        });
-        clientThread.detach();
+        if (!startClientThread(clientSocket, connection)) {
+            // Shutdown started between accept() and here: no thread was
+            // started, so close the descriptor we own.
+            close(clientSocket);
+            break;
+        }
     }
 }
 
@@ -356,14 +359,64 @@ void Server::handleClient(int clientSocket) {
     connection->run();
 }
 
-void Server::registerConnection(int clientSocket, const std::shared_ptr<Connection>& connection) {
+bool Server::startClientThread(int clientSocket,
+                               const std::shared_ptr<Connection> &connection) {
+    // The thread is created while the map lock is held so that shutdown cannot
+    // miss it: stop() sets running=false and then snapshots the threads, so a
+    // thread either appears here before that snapshot or is never started.
+    std::shared_ptr<std::atomic<bool>> finished = std::make_shared<std::atomic<bool>>(false);
     std::lock_guard<std::mutex> lock(connectionsMutex);
+    if (!running) {
+        return false;
+    }
     connections[clientSocket] = connection;
+    std::thread thread([this, clientSocket, connection, finished]() {
+        handleClient(clientSocket);
+        unregisterConnection(clientSocket);
+        finished->store(true, std::memory_order_release);
+    });
+    clientThreads.push_back(ClientThread{std::move(thread), std::move(finished)});
+    return true;
 }
 
 void Server::unregisterConnection(int clientSocket) {
     std::lock_guard<std::mutex> lock(connectionsMutex);
     connections.erase(clientSocket);
+}
+
+void Server::reapFinishedClientThreads() {
+    std::vector<ClientThread> finished;
+    {
+        std::lock_guard<std::mutex> lock(connectionsMutex);
+        for (auto it = clientThreads.begin(); it != clientThreads.end();) {
+            if (it->finished->load(std::memory_order_acquire)) {
+                finished.push_back(std::move(*it));
+                it = clientThreads.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    // Join outside the lock: a finishing thread takes connectionsMutex on its
+    // way out.
+    for (auto &client : finished) {
+        if (client.thread.joinable()) {
+            client.thread.join();
+        }
+    }
+}
+
+void Server::joinClientThreads() {
+    std::vector<ClientThread> remaining;
+    {
+        std::lock_guard<std::mutex> lock(connectionsMutex);
+        remaining.swap(clientThreads);
+    }
+    for (auto &client : remaining) {
+        if (client.thread.joinable()) {
+            client.thread.join();
+        }
+    }
 }
 
 size_t Server::getActiveConnections() const {
@@ -398,6 +451,10 @@ void Server::stop() {
     for (auto& [socket, connection] : open) {
         closeClient(socket);
     }
+    // Wait for the serving threads to finish before anything they use (the
+    // broker, the store, this object) is torn down. Detaching them would let a
+    // thread outlive the server and unlock a mutex that no longer exists.
+    joinClientThreads();
 
     logInfo("MQTT server stopped");
 }

@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 #include "Listener.h"
 #include "Broker.h"
 #include "Auth.h"
@@ -37,8 +38,16 @@ public:
 
 private:
     void run();
-    void registerConnection(int clientSocket, const std::shared_ptr<Connection>& connection);
+    //! Register a connection and start the thread that serves it. Returns false
+    //! (and starts nothing) once shutdown has begun.
+    bool startClientThread(int clientSocket, const std::shared_ptr<Connection>& connection);
     void unregisterConnection(int clientSocket);
+    //! Join the threads of connections that have already finished, so a
+    //! long-running server does not accumulate them.
+    void reapFinishedClientThreads();
+    //! Join every client thread. Called after all sockets are shut down, before
+    //! the broker and the server state are destroyed.
+    void joinClientThreads();
     //! Flush the durable state and shut the store down
     void shutdownPersistence();
 
@@ -51,6 +60,14 @@ private:
     std::atomic<size_t> maxConnections;
     mutable std::mutex connectionsMutex;
     std::map<int, std::shared_ptr<Connection>> connections;
+    //! One entry per serving thread. A thread is joined by the accept loop once
+    //! it reports finished, and all of them are joined on shutdown: none may
+    //! still touch the broker (or this object) after Server is destroyed.
+    struct ClientThread {
+        std::thread thread;
+        std::shared_ptr<std::atomic<bool>> finished;
+    };
+    std::vector<ClientThread> clientThreads;
     //! How often the accept loop wakes to drop sessions whose disconnect-time
     //! expiry has elapsed (MQTT-5 Session Expiry Interval on DISCONNECT).
     std::chrono::milliseconds sweepInterval{1000};
