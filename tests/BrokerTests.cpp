@@ -78,7 +78,7 @@ TEST_F(BrokerTest, RetainedMessageIsStoredAndDeliveredOnSubscribe)
     auto client = MQTT::test::attach(*session);
 
     session->subscribe("sensors/+", options);
-    session->deliverRetained("sensors/+", options);
+    session->deliverRetained("sensors/+", options, /*isNewSubscription=*/true);
     session->flush();
 
     ASSERT_EQ(client->size(), 1u);
@@ -121,7 +121,7 @@ TEST_F(BrokerTest, RetainHandlingDoNotSendRetained)
     auto client = MQTT::test::attach(*session);
 
     session->subscribe("r/t", options);
-    session->deliverRetained("r/t", options);
+    session->deliverRetained("r/t", options, /*isNewSubscription=*/true);
     session->flush();
 
     EXPECT_EQ(client->size(), 0u);

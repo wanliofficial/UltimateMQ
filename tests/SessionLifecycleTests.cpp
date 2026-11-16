@@ -346,7 +346,7 @@ TEST_F(SessionLifecycleTest, RetainedMessageIsQueuedThenDeliveredByFlush)
 
     auto options = optionsFor(QoS::QOS_0, RetainHandling::SEND_RETAINED_MESSAGES_AT_SUBSCRIBE);
     session->subscribe("ret/t", options);
-    session->deliverRetained("ret/t", options);
+    session->deliverRetained("ret/t", options, /*isNewSubscription=*/true);
     session->flush();
 
     ASSERT_EQ(client->size(), 1u);

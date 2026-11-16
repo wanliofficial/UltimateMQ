@@ -270,7 +270,6 @@ void Session::pubcomp(uint16_t packetId) {
 void Session::subscribe(const std::string &topicFilter, const SubscriptionOptions &options) {
     {
         std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
-        newSubscription = subscriptions.find(topicFilter) == subscriptions.end();
         subscriptions[topicFilter] = options;
         notifyMutation();
     }
@@ -422,7 +421,8 @@ void Session::deliver(const std::string &filter, const Message &message) {
     pushDelivery(outgoing, qos, identifier);
 }
 
-void Session::deliverRetained(const std::string &topicFilter, const SubscriptionOptions &options) {
+void Session::deliverRetained(const std::string &topicFilter, const SubscriptionOptions &options,
+                              bool isNewSubscription) {
     if (options.retainHandling == RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES) {
         return;
     }
@@ -438,7 +438,7 @@ void Session::deliverRetained(const std::string &topicFilter, const Subscription
 
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
     if (options.retainHandling == RetainHandling::SEND_RETAINED_MESSAGES_AT_SUBSCRIBE_IF_NEW &&
-        !newSubscription) {
+        !isNewSubscription) {
         return;
     }
     for (const auto &[topic, message] : retained) {

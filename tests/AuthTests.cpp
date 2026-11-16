@@ -216,7 +216,7 @@ TEST(AuthTest, RetainedMessagesAreFilteredByReadAcl)
 
     // Wildcard filter covering both public and private topics
     session->subscribe("#", options);
-    session->deliverRetained("#", options);
+    session->deliverRetained("#", options, /*isNewSubscription=*/true);
     session->flush();
 
     ASSERT_EQ(client->size(), 2u);

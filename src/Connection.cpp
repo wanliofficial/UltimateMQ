@@ -872,6 +872,11 @@ void Connection::handleSubscribe(std::shared_ptr<SubscribePacket> subscribe) {
     // Per-filter outcome: <0 means accepted (the granted QoS is recorded later),
     // otherwise the reason code reported for a rejected filter.
     std::vector<int> rejected(subscribe->subscriptions.size(), acceptMarker);
+    // Per-filter "is this a brand-new subscription?" flag, captured before the
+    // filter is registered. It drives the retained-message handling decision
+    // (MQTT-3.3.1-9) and must reflect each filter independently, not the last
+    // one subscribed.
+    std::vector<bool> acceptedAsNew(subscribe->subscriptions.size(), false);
     for (size_t i = 0; i < subscribe->subscriptions.size(); ++i) {
         const auto& subscription = subscribe->subscriptions[i];
         // An empty filter is rejected before anything else (MQTT-3.8.3-1);
@@ -889,6 +894,7 @@ void Connection::handleSubscribe(std::shared_ptr<SubscribePacket> subscribe) {
             continue;
         }
         const bool isNew = !session->hasSubscription(subscription.first);
+        acceptedAsNew[i] = isNew;
         if (isNew && Topic::isShared(subscription.first)) {
             if (sharedCount >= maxSharedSubscriptions) {
                 logDebug("client %s: shared subscription quota (%zu) reached, rejecting %s",
@@ -929,7 +935,8 @@ void Connection::handleSubscribe(std::shared_ptr<SubscribePacket> subscribe) {
         }
         const auto& subscription = subscribe->subscriptions[i];
         if (!Topic::isShared(subscription.first)) {
-            session->deliverRetained(subscription.first, subscription.second);
+            session->deliverRetained(subscription.first, subscription.second,
+                                     acceptedAsNew[i]);
         }
     }
     // The queued retained messages are written here, with no lock held

@@ -115,8 +115,12 @@ public:
     //! Retain As Published, No Local) are applied, while read access is checked
     //! against the concrete message topic.
     void deliver(const std::string& filter, const Message& message);
-    //! Queue the retained messages matching a topic filter (honours the retain handling option)
-    void deliverRetained(const std::string& topicFilter, const SubscriptionOptions& options);
+    //! Queue the retained messages matching a topic filter (honours the retain handling option).
+    //! \p isNewSubscription is whether this filter was newly created by the current
+    //! SUBSCRIBE (as opposed to a re-subscribe updating options); it drives the
+    //! "send at subscribe only if the subscription did not already exist" handling.
+    void deliverRetained(const std::string& topicFilter, const SubscriptionOptions& options,
+                         bool isNewSubscription);
     //! Hand the queued deliveries to the bound client; must be called without holding any lock
     void flush();
     bool isPersistent() const { return persistent; }
@@ -209,7 +213,6 @@ private:
 
     Broker* broker;
     Auth* auth = nullptr;
-    bool newSubscription = true;
 };
 
 }
