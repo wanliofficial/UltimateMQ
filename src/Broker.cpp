@@ -388,6 +388,15 @@ void Broker::collectTargets(
         if (message.payload.empty()) {
             // An empty retained payload removes the retained message for that topic
             retainedMessages.erase(message.topic);
+        } else if (message.isExpired(std::chrono::steady_clock::now())) {
+            // MQTT-3.3.2-9: a Message Expiry Interval of 0 (or one already elapsed)
+            // means the message expires immediately, so it must never be
+            // delivered. A retained publish with that property REPLACES any
+            // existing retained message on the topic (MQTT-3.3.1-2) with
+            // nothing, so erase rather than store a message no subscriber may
+            // receive.
+            logDebug("broker: not retaining %s, message already expired", message.topic.c_str());
+            retainedMessages.erase(message.topic);
         } else {
             retainedMessages[message.topic] = message;
         }

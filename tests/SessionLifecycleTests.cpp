@@ -184,13 +184,26 @@ TEST_F(SessionLifecycleTest, ExpiredQueuedMessageIsNotFlushed)
 
 TEST_F(SessionLifecycleTest, SweepPurgesExpiredRetainedMessage)
 {
+    // A retained message whose expiry has already elapsed must not be stored
+    // at all (MQTT-3.3.2-9): it is not retained and never delivered.
     Message retained{"rt", std::string("x"), QoS::QOS_0, /*retain=*/true};
     retained.hasExpiry = true;
     retained.expiryDeadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
     broker.publish(retained);
+    EXPECT_EQ(broker.getRetainedCount(), 0u);
+
+    // A message that is still live is stored...
+    Message live{"rt2", std::string("y"), QoS::QOS_0, /*retain=*/true};
+    live.hasExpiry = true;
+    live.expiryDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    broker.publish(live);
     EXPECT_EQ(broker.getRetainedCount(), 1u);
 
-    broker.sweepExpiredSessions();
+    // ...and a retained publish that has already expired REPLACES it with
+    // nothing rather than storing an undeliverable message (MQTT-3.3.1-2 with
+    // MQTT-3.3.2-9).
+    live.expiryDeadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    broker.publish(live);
     EXPECT_EQ(broker.getRetainedCount(), 0u);
 }
 
