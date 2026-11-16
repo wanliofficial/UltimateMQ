@@ -568,8 +568,11 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     }
     // Remember the interval for the teardown path: a graceful DISCONNECT may
     // override it (MQTT-3.14.4-2), and a non-zero value arms the session's
-    // expiry deadline when the connection closes.
+    // expiry deadline when the connection closes. The CONNECT value is kept
+    // separately because §3.14.2.2.2 forbids a DISCONNECT from raising it once
+    // it is zero.
     sessionExpirySeconds = connectSessionExpiry;
+    this->connectSessionExpiry = connectSessionExpiry;
 
     auto sessionToUse = resumed ? existing : std::make_shared<Session>(broker, connect->clientId,
                                                                         connect->cleanStart);
@@ -1105,7 +1108,19 @@ void Connection::handleDisconnect(std::shared_ptr<DisconnectPacket> disconnect) 
         auto it = disconnect->properties.find(PropertyID::SESSION_EXPIRY_INTERVAL);
         if (it != disconnect->properties.end() &&
             std::holds_alternative<uint32_t>(it->second)) {
-            uint32_t interval = std::get<uint32_t>(it->second);
+            const uint32_t interval = std::get<uint32_t>(it->second);
+            // §3.14.2.2.2: "If the Session Expiry Interval in the CONNECT packet
+            // was zero, then it is a Protocol Error to set a non-zero Session
+            // Expiry Interval in the DISCONNECT packet sent by the Client."
+            // Honouring it would let a client turn a live-only connection into a
+            // durable session at the last moment, so the request is refused with
+            // DISCONNECT 0x82 (§4.13) instead.
+            if (connectSessionExpiry == 0 && interval != 0) {
+                logInfo("client %s: DISCONNECT raised a zero Session Expiry Interval to %u",
+                        session ? session->getClientId().c_str() : "?", interval);
+                closeWithReason(ReasonCode::PROTOCOL_ERROR);
+                return;
+            }
             sessionExpirySeconds = interval;
         }
     }

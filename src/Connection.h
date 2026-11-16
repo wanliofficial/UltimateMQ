@@ -111,6 +111,10 @@ private:
     //! (MQTT-3.14.4-2). 0 (the default when absent, and always on MQTT 3.1.x with
     //! clean session) means the session is discarded when the connection closes.
     uint32_t sessionExpirySeconds = 0;
+    //! The Session Expiry Interval exactly as the CONNECT packet carried it (0
+    //! when absent). §3.14.2.2.2 compares against this value, not against the
+    //! one a DISCONNECT may have overridden afterwards.
+    uint32_t connectSessionExpiry = 0;
     //! MQTT 5 Topic Alias support (MQTT-3.3.2-7..11). The broker advertises
     //! TopicAliasMaximum in CONNACK and a client may then send a PUBLISH whose
     //! topic name is replaced by an alias after mapping it once. The mapping is
