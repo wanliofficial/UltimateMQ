@@ -99,6 +99,10 @@ private:
     Auth* auth = nullptr;
     std::recursive_mutex writeMutex;
     std::atomic<bool> connected{false};
+    //! Whether a CONNACK has already been sent on this connection. A failure
+    //! while parsing the CONNECT must answer with CONNACK (MQTT-3.2.2-2), but
+    //! only once: every later failure gets a DISCONNECT instead.
+    bool connackSent = false;
     std::chrono::steady_clock::time_point lastActivity;
     uint16_t keepAliveSeconds = 0;
     std::chrono::milliseconds readTimeout{0};

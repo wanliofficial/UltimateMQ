@@ -36,6 +36,13 @@ public:
     public:
         explicit ProtocolViolation(const std::string &what) : std::runtime_error(what) {}
     };
+    //! A text field that is not a valid UTF-8 Encoded String (MQTT-1.5.4-1/-2).
+    //! Reported as MALFORMED_PACKET (0x81), which is what the specification calls
+    //! a packet containing ill-formed UTF-8 or U+0000.
+    class MalformedString : public std::runtime_error {
+    public:
+        explicit MalformedString(const std::string &what) : std::runtime_error(what) {}
+    };
 
     static constexpr size_t MAX_MULTIPLIER = 128 * 128 * 128;
     static constexpr size_t MAX_LENGTH = 268435455; 

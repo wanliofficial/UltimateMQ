@@ -15,6 +15,7 @@ set(TEST_SOURCES
     StoreTests.cpp
     TLSTests.cpp
     SysTopicsTests.cpp
+    Utf8Tests.cpp
     # Add more test files here as you create them
 )
 
