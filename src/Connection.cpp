@@ -89,6 +89,11 @@ void Connection::run() {
         // MQTT-4.13: a packet above the limit is reported as PACKET_TOO_LARGE,
         // not as a malformed one, so the client knows to send smaller packets.
         closeWithReason(ReasonCode::PACKET_TOO_LARGE);
+    } catch (const Frame::ProtocolViolation &e) {
+        logError("dropping connection: %s", e.what());
+        // MQTT-4.13: the packet parsed cleanly but its content breaks a rule, so
+        // the client is told PROTOCOL_ERROR rather than MALFORMED_PACKET.
+        closeWithReason(ReasonCode::PROTOCOL_ERROR);
     } catch (const std::exception &e) {
         logError("dropping connection: %s", e.what());
         // Anything else the broker cannot parse is malformed (MQTT-4.13): tell

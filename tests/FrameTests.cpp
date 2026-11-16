@@ -563,6 +563,40 @@ TEST_F(FrameTest, ParsePublishWithEmptyTopicNameIsAccepted)
     ASSERT_NE(packet.properties.find(PropertyID::TOPIC_ALIAS), packet.properties.end());
 }
 
+TEST_F(FrameTest, ParsePublishWithZeroPacketIdentifierIsAProtocolViolation)
+{
+    // MQTT-2.2.1-3: a PUBLISH with QoS > 0 must carry a non-zero Packet
+    // Identifier. The bytes parse cleanly, so this is a Protocol Error (0x82),
+    // reported through Frame::ProtocolViolation rather than as malformed input.
+    Frame v5;
+    v5.setVersion(Version::MQTT5);
+    std::vector<uint8_t> payload = {
+        0x00, 0x01, 'a',              // Topic name "a"
+        0x00, 0x00,                   // Packet Identifier 0
+        0x00,                         // No properties
+        'h', 'i'                      // Payload
+    };
+    FixedHeader header(0x32);         // PUBLISH, QoS 1
+    EXPECT_THROW(v5.parsePublish(header, payload.data(), payload.size()),
+                 Frame::ProtocolViolation);
+}
+
+TEST_F(FrameTest, ParseSubscribeWithZeroPacketIdentifierIsAProtocolViolation)
+{
+    // Same rule for SUBSCRIBE (MQTT-2.2.1-3): identifier 0 is never valid.
+    Frame v5;
+    v5.setVersion(Version::MQTT5);
+    std::vector<uint8_t> payload = {
+        0x00, 0x00,                   // Packet Identifier 0
+        0x00,                         // No properties
+        0x00, 0x01, 'a',              // Filter "a"
+        0x01                          // Requested QoS 1
+    };
+    FixedHeader header(0x82);
+    EXPECT_THROW(v5.parseSubscribe(payload.data(), payload.size()),
+                 Frame::ProtocolViolation);
+}
+
 TEST_F(FrameTest, ParsePublishWithEmptyTopicNameAndNoAliasLeavesTopicEmpty)
 {
     // MQTT-3.3.2-7 makes this a Protocol Error, but the decision belongs to the

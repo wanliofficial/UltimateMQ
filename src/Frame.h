@@ -28,6 +28,14 @@ public:
     public:
         explicit PacketTooLarge(const std::string &what) : std::runtime_error(what) {}
     };
+    //! A packet whose bytes parse fine but whose values violate the protocol
+    //! (for example a Packet Identifier of 0, MQTT-2.2.1-3). Distinct from a
+    //! generic parse failure because the server must report it as
+    //! PROTOCOL_ERROR (0x82) rather than MALFORMED_PACKET (MQTT-4.13).
+    class ProtocolViolation : public std::runtime_error {
+    public:
+        explicit ProtocolViolation(const std::string &what) : std::runtime_error(what) {}
+    };
 
     static constexpr size_t MAX_MULTIPLIER = 128 * 128 * 128;
     static constexpr size_t MAX_LENGTH = 268435455; 

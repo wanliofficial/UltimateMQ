@@ -174,7 +174,16 @@ uint16_t Frame::parsePacketId(const uint8_t* buffer, size_t length) {
     if (length < 2) {
         throw std::runtime_error("Packet ID is not present in the data");
     }
-    return buffer[0] << 8 | buffer[1];
+    const uint16_t packetId = static_cast<uint16_t>((buffer[0] << 8) | buffer[1]);
+    // MQTT-2.2.1-3: every PUBLISH with QoS > 0, SUBSCRIBE and UNSUBSCRIBE must
+    // carry a non-zero Packet Identifier. 0 is the "no identifier" sentinel, so
+    // accepting it would make the acknowledgement unmatchable and let two flows
+    // share one identifier. Refusing it here covers every inbound packet type
+    // that carries an identifier.
+    if (packetId == 0) {
+        throw ProtocolViolation("Packet Identifier must not be 0 (MQTT-2.2.1-3)");
+    }
+    return packetId;
 }
 
 Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
