@@ -60,8 +60,10 @@ public:
     void handleDisconnect(std::shared_ptr<DisconnectPacket> packet);
     void handleAuth(std::shared_ptr<AuthPacket> packet);
 
-    //! Client interface: write a delivery to the socket (called without any broker/session lock)
-    void deliver(const Message& message, uint16_t packetId, QoS qos,
+    //! Client interface: write a delivery to the socket (called without any broker/session lock).
+    //! Returns false if the packet could not be sent (e.g. over the client's
+    //! Maximum Packet Size), so the session can release the inflight slot.
+    bool deliver(const Message& message, uint16_t packetId, QoS qos,
                  uint32_t subscriptionIdentifier = 0) override;
     //! Client interface: resend a PUBREC for an inbound QoS 2 flow awaiting PUBREL
     void sendPubrec(uint16_t packetId) override;
@@ -69,9 +71,11 @@ public:
     void sendPubrel(uint16_t packetId) override;
     //! Client interface: a newer connection has taken over this session; stop using it
     void onSuperseded(Version version) override;
-    void handleDeliver(const Message& message, uint16_t packetId, QoS qos,
+    bool handleDeliver(const Message& message, uint16_t packetId, QoS qos,
                        uint32_t subscriptionIdentifier = 0);
-    void sendPacket(Packet &packet);
+    //! Serialize and write a packet. Returns false when nothing was written
+    //! (socket gone, or the packet exceeds the client's Maximum Packet Size).
+    bool sendPacket(Packet &packet);
     //! End the connection with a reason code (MQTT 5 only) instead of vanishing
     void closeWithReason(ReasonCode reason);
 

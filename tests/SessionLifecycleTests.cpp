@@ -618,6 +618,34 @@ TEST_F(SessionLifecycleTest, ReceiveMaximumCapsOutstandingQos1Messages)
     EXPECT_EQ(std::string(client->delivered[2].payload.begin(), client->delivered[2].payload.end()), "m3");
 }
 
+TEST_F(SessionLifecycleTest, RejectedDeliveryReleasesInflightSlot)
+{
+    // MQTT-3.1.2-24: the broker must not send a packet larger than the client's
+    // Maximum Packet Size. When a QoS 1 delivery is refused for that reason the
+    // reserved packet id must be released, otherwise the un-acknowledgeable
+    // message occupies the Receive Maximum window forever and blocks every later
+    // delivery for the client.
+    auto session = std::make_shared<Session>(&broker, "rcv-reject");
+    session->connect(session, /*persistent=*/true);
+    auto client = test::attach(*session);
+    session->subscribe("rj/t", optionsFor(QoS::QOS_1));
+    session->setReceiveMaximum(1);
+    // The client refuses payloads larger than 4 bytes.
+    client->refuseLargerThan = 4;
+
+    // A big message is refused by the client -> the slot must be freed again.
+    broker.publish(Message("rj/t", "too-big-payload", QoS::QOS_1));
+    session->flush();
+    EXPECT_EQ(client->size(), 0u);
+
+    // Because the slot was released, a following small message is delivered.
+    broker.publish(Message("rj/t", "ok", QoS::QOS_1));
+    session->flush();
+    ASSERT_EQ(client->size(), 1u);
+    EXPECT_EQ(std::string(client->delivered[0].payload.begin(), client->delivered[0].payload.end()),
+              "ok");
+}
+
 TEST_F(SessionLifecycleTest, ReceiveMaximumDoesNotThrottleQos0)
 {
     // QoS 0 has no acknowledgement and is therefore never flow-controlled, even

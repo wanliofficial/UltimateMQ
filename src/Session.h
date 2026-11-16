@@ -35,7 +35,11 @@ class Broker;
 class Client {
 public:
     virtual ~Client() = default;
-    virtual void deliver(const Message& message, uint16_t packetId, QoS qos,
+    //! Queue one delivery for the client. Returns false when the packet could
+    //! not be sent (for example it exceeds the client's Maximum Packet Size,
+    //! MQTT-3.1.2-24): the session then releases the packet id it reserved so
+    //! the flow-control window is not leaked.
+    virtual bool deliver(const Message& message, uint16_t packetId, QoS qos,
                          uint32_t subscriptionIdentifier = 0) = 0;
     //! Resend a PUBREC for an inbound QoS 2 flow that is still awaiting its PUBREL.
     //! Called on resume so a client whose PUBREL was lost can complete the
@@ -226,6 +230,10 @@ private:
     //! Move blocked QoS>0 messages into the inflight set / send queue while the
     //! outstanding count is below the client's Receive Maximum.
     void releaseBlocked();
+    //! Forget an inflight QoS>0 message that will never be acknowledged (it was
+    //! dropped by flow control/expiry or refused by the client) and release its
+    //! slot so the Receive Maximum window does not leak.
+    void releaseInflight(uint16_t packetId);
 
     Broker* broker;
     Auth* auth = nullptr;

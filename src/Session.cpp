@@ -585,10 +585,39 @@ void Session::flush() {
         // message to a reconnecting client would violate MQTT-3.3.2-9.
         if (delivery.message.isExpired(std::chrono::steady_clock::now())) {
             logDebug("session %s: dropping expired queued message", clientId.c_str());
+            // A stale QoS>0 message must not keep its inflight slot; release it
+            // so the flow-control window (Receive Maximum) does not leak.
+            if (delivery.qos != QoS::QOS_0) {
+                releaseInflight(delivery.packetId);
+            }
             continue;
         }
-        target->deliver(delivery.message, delivery.packetId, delivery.qos,
-                        delivery.subscriptionIdentifier);
+        const bool sent = target->deliver(delivery.message, delivery.packetId, delivery.qos,
+                                          delivery.subscriptionIdentifier);
+        if (!sent && delivery.qos != QoS::QOS_0) {
+            // The client refused the packet (e.g. it exceeds its Maximum Packet
+            // Size, MQTT-3.1.2-24). Free the packet id and inflight slot now, or
+            // the un-acknowledgeable message would occupy the flow-control window
+            // forever and block every later QoS>0 delivery for this client.
+            logDebug("session %s: delivery rejected, releasing packetId=%u", clientId.c_str(),
+                     delivery.packetId);
+            releaseInflight(delivery.packetId);
+        }
+    }
+}
+
+void Session::releaseInflight(uint16_t packetId) {
+    std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
+    bool freed = false;
+    if (inflightMessages.erase(packetId) > 0) {
+        freed = true;
+    }
+    if (inflightIdentifiers.erase(packetId) > 0) {
+        freed = true;
+    }
+    if (freed) {
+        notifyMutation();
+        releaseBlocked();
     }
 }
 

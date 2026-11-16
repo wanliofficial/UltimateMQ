@@ -1075,15 +1075,15 @@ void Connection::handleAuth(std::shared_ptr<AuthPacket> auth) {
     state = State::DISCONNECTED;
 }
 
-void Connection::deliver(const Message &message, uint16_t packetId, QoS qos,
+bool Connection::deliver(const Message &message, uint16_t packetId, QoS qos,
                          uint32_t subscriptionIdentifier) {
-    handleDeliver(message, packetId, qos, subscriptionIdentifier);
+    return handleDeliver(message, packetId, qos, subscriptionIdentifier);
 }
 
-void Connection::handleDeliver(const Message &message, uint16_t packetId, QoS qos,
+bool Connection::handleDeliver(const Message &message, uint16_t packetId, QoS qos,
                                uint32_t subscriptionIdentifier) {
     if (state != State::CONNECTED) {
-        return;
+        return false;
     }
     PublishPacket publish{message.topic, message.payload, qos, message.retain};
     publish.packetId = packetId;
@@ -1100,7 +1100,7 @@ void Connection::handleDeliver(const Message &message, uint16_t packetId, QoS qo
             const auto now = std::chrono::steady_clock::now();
             if (now >= message.expiryDeadline) {
                 logDebug("dropping an expired delivery on %s", message.topic.c_str());
-                return;
+                return false;
             }
             const auto left = std::chrono::duration_cast<std::chrono::seconds>(
                                   message.expiryDeadline - now).count();
@@ -1115,7 +1115,10 @@ void Connection::handleDeliver(const Message &message, uint16_t packetId, QoS qo
     }
     logDebug("deliver %s qos=%d packetId=%u dup=%d", message.topic.c_str(), (int)qos, packetId,
              (int)message.dup);
-    sendPacket(publish);
+    // sendPacket() reports whether the packet actually went out; a packet over
+    // the client's Maximum Packet Size is refused there (MQTT-3.1.2-24) and the
+    // session must release the inflight slot in that case.
+    return sendPacket(publish);
 }
 
 void Connection::sendPubrec(uint16_t packetId) {
@@ -1150,24 +1153,27 @@ void Connection::closeWithReason(ReasonCode reason) {
     state = State::DISCONNECTED;
 }
 
-void Connection::sendPacket(Packet &packet) {
+bool Connection::sendPacket(Packet &packet) {
     std::lock_guard<std::recursive_mutex> lock(writeMutex);
     if (sockfd < 0) {
-        return;
+        return false;
     }
     auto data = frame.serialize(packet);
     // MQTT-3.1.2-24: never exceed the client's Maximum Packet Size. A packet
     // that would is dropped here; sending it would make the client close the
-    // connection, losing every later delivery as well.
+    // connection, losing every later delivery as well. The caller is told so a
+    // QoS>0 delivery can release the inflight slot it reserved.
     if (clientMaxPacketSize != 0 && data.size() > clientMaxPacketSize) {
         logDebug("dropping a %zu-byte packet: the client accepts at most %zu bytes",
                  data.size(), clientMaxPacketSize);
-        return;
+        return false;
     }
     if (!transport->writeAll(data.data(), data.size())) {
         // The peer is gone; stop the connection on the next loop iteration
         state = State::DISCONNECTED;
+        return false;
     }
+    return true;
 }
 
 } // namespace MQTT

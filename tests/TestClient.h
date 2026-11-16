@@ -9,14 +9,22 @@ namespace MQTT {
 //! Records everything the session hands to its client
 class RecordingClient : public Client {
 public:
-    void deliver(const Message &message, uint16_t packetId, QoS qos,
+    //! When set, deliver() reports failure for an oversized packet, letting the
+    //! tests exercise the flow-control release path (MQTT-3.1.2-24).
+    size_t refuseLargerThan = 0;
+
+    bool deliver(const Message &message, uint16_t packetId, QoS qos,
                  uint32_t subscriptionIdentifier = 0) override {
         // Deliveries can come from any publishing thread
         std::lock_guard<std::mutex> lock(mutex);
+        if (refuseLargerThan != 0 && message.payload.size() > refuseLargerThan) {
+            return false;
+        }
         delivered.push_back(message);
         packetIds.push_back(packetId);
         qosValues.push_back(qos);
         subscriptionIdentifiers.push_back(subscriptionIdentifier);
+        return true;
     }
 
     void sendPubrec(uint16_t packetId) override {
