@@ -226,6 +226,9 @@ struct ConnectFlags {
         cleanStart = (flags & 0x02) != 0;
         _reserved = flags & 0x01;
     }
+    //! MQTT-3.1.2-3: the reserved flag bit MUST be zero; a set bit is a
+    //! protocol error the CONNECT handler rejects.
+    bool reservedSet() const { return _reserved != 0; }
 };
 
 struct ConnectPacket : Packet {
@@ -240,6 +243,8 @@ struct ConnectPacket : Packet {
     bool willFlag;
     QoS willQos;
     bool willRetain;
+    //! MQTT-3.1.2-3: the reserved CONNECT flags bit was set (protocol error).
+    bool reservedFlagSet = false;
     std::optional<std::string> willTopic;
     std::optional<std::string> willMsg;
     std::optional<Properties> willProperties;

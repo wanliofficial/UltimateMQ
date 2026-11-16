@@ -474,6 +474,7 @@ ConnectPacket Frame::parseConnect(const uint8_t *buffer, size_t length) {
     connect.willFlag = flags.willFlag;
     connect.willQos = flags.willQoS;
     connect.willRetain = flags.willRetain;
+    connect.reservedFlagSet = flags.reservedSet();
     offset += 1;
 
     // Parse keep alive

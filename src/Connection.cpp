@@ -315,6 +315,45 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     // CONNECT starts with an empty table (MQTT-3.3.2-7).
     topicAliases.clear();
 
+    // Validate the CONNECT flags before anything else: several combinations are
+    // protocol errors that must be refused outright rather than half-honoured.
+    // Rejecting here also keeps a malformed Will from ever being armed.
+    {
+        bool badFlags = false;
+        const char *why = "";
+        // MQTT-3.1.2-3: the reserved flag bit MUST be zero.
+        if (connect->reservedFlagSet) {
+            badFlags = true;
+            why = "reserved CONNECT flag bit is set";
+        }
+        // MQTT-3.1.2-13 / MQTT-3.1.2-14: when the Will Flag is 0 the Will QoS must
+        // be 0; when it is 1 the Will QoS may be 0, 1 or 2 but never 3.
+        else if (connect->willFlag
+                     ? static_cast<uint8_t>(connect->willQos) > 2
+                     : connect->willQos != QoS::QOS_0) {
+            badFlags = true;
+            why = connect->willFlag ? "Will QoS is 3" : "Will QoS set without the Will Flag";
+        }
+        // MQTT-3.1.2-15: when the Will Flag is 0 the Will Retain flag must be 0.
+        else if (!connect->willFlag && connect->willRetain) {
+            badFlags = true;
+            why = "Will Retain set without the Will Flag";
+        }
+        if (badFlags) {
+            logInfo("rejecting client %s: invalid CONNECT flags (%s)",
+                    connect->clientId.c_str(), why);
+            if (frame.getVersion() == Version::MQTT5) {
+                // MQTT 5 has a Protocol Error reason code for this.
+                ConnackPacket connack{false, ReasonCode::PROTOCOL_ERROR};
+                sendPacket(connack);
+            }
+            // MQTT 3.1.1 (MQTT-3.1.4-1): a CONNECT that does not conform is
+            // answered by closing the Network Connection, with no CONNACK.
+            state = State::DISCONNECTED;
+            return;
+        }
+    }
+
     // Authenticate before any session state is touched (and before the Will is
     // armed): a rejected client must not be able to take over an existing
     // session, learn about its messages, or publish a Will message.

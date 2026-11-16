@@ -325,6 +325,57 @@ TEST_F(FrameTest, ParseConnectPacketMqtt311HasNoProperties)
     EXPECT_TRUE(packet.properties.empty());
 }
 
+TEST_F(FrameTest, ParseConnectPacketExposesInvalidFlagCombinations)
+{
+    // Will Flag / Will QoS / Will Retain / reserved are surfaced so the CONNECT
+    // handler can reject the protocol errors they encode (MQTT-3.1.2-3, -13,
+    // -14, -15) instead of silently storing a malformed Will.
+    auto parseWithFlags = [this](uint8_t flags) {
+        // MQTT 3.1.1 keeps the payload simple: no property section.
+        std::vector<uint8_t> payload = {
+            0x00, 0x04, 'M', 'Q', 'T', 'T',
+            0x04,
+            flags,
+            0x00, 0x3C,
+            0x00, 0x01, 'c'
+        };
+        // A Will Flag needs the Will Topic/Message fields present.
+        if (flags & 0x04) {
+            const char *topic = "w";
+            const char *msg = "m";
+            payload.push_back(0x00); payload.push_back(0x01); payload.push_back('w');
+            payload.push_back(0x00); payload.push_back(0x01); payload.push_back('m');
+        }
+        return frame->parseConnect(payload.data(), payload.size());
+    };
+
+    // Will Flag = 1 with Will QoS = 3: keep the raw value for the handler to see
+    auto willQos3 = parseWithFlags(0x02 | 0x04 | (3 << 3));
+    EXPECT_TRUE(willQos3.willFlag);
+    EXPECT_EQ(static_cast<uint8_t>(willQos3.willQos), 3);
+
+    // Will Flag = 0 with Will QoS != 0
+    auto qosNoFlag = parseWithFlags(0x02 | (2 << 3));
+    EXPECT_FALSE(qosNoFlag.willFlag);
+    EXPECT_EQ(static_cast<uint8_t>(qosNoFlag.willQos), 2);
+
+    // Will Flag = 0 with Will Retain = 1
+    auto retainNoFlag = parseWithFlags(0x02 | 0x20);
+    EXPECT_FALSE(retainNoFlag.willFlag);
+    EXPECT_TRUE(retainNoFlag.willRetain);
+
+    // Reserved bit set
+    auto reserved = parseWithFlags(0x02 | 0x01);
+    EXPECT_TRUE(reserved.reservedFlagSet);
+
+    // A clean CONNECT sets none of the error flags
+    auto clean = parseWithFlags(0x02);
+    EXPECT_FALSE(clean.reservedFlagSet);
+    EXPECT_FALSE(clean.willFlag);
+    EXPECT_EQ(static_cast<uint8_t>(clean.willQos), 0);
+    EXPECT_FALSE(clean.willRetain);
+}
+
 TEST_F(FrameTest, SerializeConnackForMqtt311HasNoProperties)
 {
     Frame v4(Version::MQTT311);
