@@ -1086,9 +1086,18 @@ void Connection::handlePingreq(std::shared_ptr<PingreqPacket> pingreq) {
 }
 
 void Connection::handleDisconnect(std::shared_ptr<DisconnectPacket> disconnect) {
-    // A normal DISCONNECT discards the Will message (MQTT-3.14.4-3); the read
-    // loop then exits and run() tears the session down.
-    willPending = false;
+    // MQTT-3.1.2-8: the Will Message is deleted only by a DISCONNECT with Reason
+    // Code 0x00 (Normal disconnection). Every other reason leaves it armed, and
+    // 0x04 (Disconnect with Will Message) exists precisely so a client can leave
+    // cleanly yet have its Will published. Keeping willPending set lets the
+    // teardown below publish it (honouring the Will Delay Interval). MQTT 3.1.1
+    // has no reason code, so a DISCONNECT there is always a normal one.
+    const bool normalDisconnection =
+        frame.getVersion() != Version::MQTT5 ||
+        disconnect->reasonCode == ReasonCode::NORMAL_DISCONNECTION;
+    if (normalDisconnection) {
+        willPending = false;
+    }
     // MQTT 5 Session Expiry Interval on DISCONNECT (MQTT-3.14.4-2): it overrides
     // the CONNECT value for this teardown. When the property is absent the CONNECT
     // value stays in effect; an explicit 0 ends the session immediately.
