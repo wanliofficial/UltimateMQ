@@ -130,8 +130,9 @@ private:
     Message willMessage;
     //! Parsed Will Delay Interval (seconds) for this connection's Will. 0 means
     //! publish immediately on abnormal disconnect; >0 arms the Will on the
-    //! session so the sweeper publishes it after the delay (cancellable by a
-    //! reconnect). See handleConnect.
+    //! session when the connection closes (so the delay counts from the close,
+    //! MQTT-3.1.3.2), and the sweeper publishes it after the delay (cancellable
+    //! by a reconnect). See handleConnect and run().
     uint32_t willDelay = 0;
     std::function<void()> disconnectCallback;
     std::unique_ptr<SecureTransport> transport;

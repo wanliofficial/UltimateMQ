@@ -97,9 +97,18 @@ void Connection::run() {
     }
     state = State::DISCONNECTED;
 
-    // An abnormal termination publishes the Will message
+    // An abnormal termination publishes the Will message.
     if (willPending) {
-        publishWill();
+        if (willDelay > 0 && session) {
+            // MQTT-3.1.3.2: the Will Delay Interval is measured from the moment
+            // this Network Connection closes, so arm the Will on the broker now
+            // (at disconnect). The sweeper publishes it once the delay elapses,
+            // unless a reconnect with the same client id cancels it first.
+            broker->armWill(session->getClientId(), willMessage, willMessage.qos,
+                            willMessage.retain, willDelay);
+        } else {
+            publishWill();
+        }
     }
 
     // Detach from the session. A graceful DISCONNECT with a zero session-expiry
@@ -492,17 +501,14 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     sessionToUse->setPersistent(!connect->cleanStart);
     session = sessionToUse;
 
-    // If this client's Will carries a delay, hand it to the broker so it is
-    // published by the sweeper only after the delay elapses (MQTT-3.1.4-6 /
-    // 5.4.3.2), giving the client a window to reconnect and cancel it. The
-    // broker holds it (not this connection) so it survives the disconnect. With
-    // no delay the Will stays on the connection and is published immediately on
-    // an abnormal disconnect, as before.
-    if (connect->willFlag && connect->willTopic && connect->willMsg && willDelay > 0) {
-        willPending = false;
-        broker->armWill(connect->clientId, willMessage, connect->willQos,
-                        connect->willRetain, willDelay);
-    }
+    // The Will (immediate or delayed) stays on this connection and is resolved
+    // when the Network Connection closes: run() publishes it at once when there
+    // is no delay, or hands it to the broker so the sweeper publishes it after
+    // the Will Delay Interval elapses (MQTT-3.1.4-6 / 5.4.3.2). Arming at
+    // disconnect (not at connect) is what makes the delay count from the close
+    // of the connection (MQTT-3.1.3.2). A reconnect cancels a pending delayed
+    // Will via cancelWill() above, and onSuperseded() clears willPending so a
+    // taken-over connection never publishes.
 
     setDisconnectCallback([weak = weak_from_this()]() {
         if (auto connection = weak.lock()) {
