@@ -111,10 +111,11 @@ void Connection::run() {
         }
     }
 
-    // Detach from the session. A graceful DISCONNECT with a zero session-expiry
-    // interval discards the session immediately (MQTT-3.14.4-2); otherwise a
-    // persistent session is kept so it can be resumed on a later connect. A
-    // session already taken over by a newer connection is left untouched.
+    // Detach from the session. Whether it outlives this connection is governed
+    // by the Session Expiry Interval (MQTT-3.14.4-2 / 3.1.2-23): a graceful
+    // DISCONNECT may override it with a value carried in the DISCONNECT, and a
+    // zero interval discards the session at once. A non-zero interval keeps the
+    // session resumable for that long, whether the close was graceful or not.
     if (session) {
         std::shared_ptr<Session> owned;
         {
@@ -122,16 +123,17 @@ void Connection::run() {
             owned = session;
             session.reset();
         }
-        if (gracefulDisconnect && sessionExpirySeconds == 0) {
-            // The client asked to end the session (or is MQTT 3.1.1): drop it
-            // rather than leaving it resumable.
+        if (sessionExpirySeconds == 0) {
+            // The client asked to end the session (or is MQTT 3.1.1 with clean
+            // session): drop it rather than leaving it resumable.
             owned->discard();
         } else {
             owned->close(shared_from_this());
-            if (gracefulDisconnect && sessionExpirySeconds > 0) {
-                // The session is kept, but must be dropped if it is not resumed
-                // before the DISCONNECT Session Expiry Interval elapses
-                // (MQTT-3.14.4-2). The background sweeper enforces the deadline.
+            // A kept session must be dropped if it is not resumed before the
+            // Session Expiry Interval elapses (MQTT-3.14.4-2). Only a persistent
+            // session was kept by close(); the background sweeper enforces the
+            // deadline.
+            if (owned->isPersistent()) {
                 owned->armExpiry(std::chrono::seconds(sessionExpirySeconds));
             }
         }
@@ -493,12 +495,36 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     }
     bool resumed = (existing != nullptr) && !connect->cleanStart;
 
+    // Whether the session survives this connection is decided by the Session
+    // Expiry Interval, not by Clean Start (MQTT-3.1.2-23): Clean Start only says
+    // whether a *previous* session is discarded, while a non-zero Session Expiry
+    // Interval keeps the session resumable after the connection closes. MQTT 5
+    // carries that interval as a CONNECT property (absent = 0 = discard on
+    // close); MQTT 3.1.x has no such property, so its Clean Session flag is the
+    // only signal (cleanSession=0 keeps the session).
+    uint32_t connectSessionExpiry = 0;
+    bool persistentSession = false;
+    if (frame.getVersion() == Version::MQTT5) {
+        auto expiry = connect->properties.find(PropertyID::SESSION_EXPIRY_INTERVAL);
+        if (expiry != connect->properties.end() &&
+            std::holds_alternative<uint32_t>(expiry->second)) {
+            connectSessionExpiry = std::get<uint32_t>(expiry->second);
+        }
+        persistentSession = connectSessionExpiry > 0;
+    } else {
+        persistentSession = !connect->cleanStart;
+    }
+    // Remember the interval for the teardown path: a graceful DISCONNECT may
+    // override it (MQTT-3.14.4-2), and a non-zero value arms the session's
+    // expiry deadline when the connection closes.
+    sessionExpirySeconds = connectSessionExpiry;
+
     auto sessionToUse = resumed ? existing : std::make_shared<Session>(broker, connect->clientId,
                                                                         connect->cleanStart);
     // The session belongs to the user it authenticated with, and a persistent
     // connection keeps it across disconnects (unless cleanStart discarded it)
     sessionToUse->setUsername(username);
-    sessionToUse->setPersistent(!connect->cleanStart);
+    sessionToUse->setPersistent(persistentSession);
     session = sessionToUse;
 
     // The Will (immediate or delayed) stays on this connection and is resolved
@@ -609,7 +635,7 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
         sessionToUse->flush();
     } else {
         sessionToUse->bindClient(shared_from_this());
-        sessionToUse->connect(sessionToUse, /*persistent=*/!connect->cleanStart);
+        sessionToUse->connect(sessionToUse, /*persistent=*/persistentSession);
     }
     logInfo("client connected: %s (resumed=%d)", connect->clientId.c_str(), (int)resumed);
 }
@@ -979,11 +1005,9 @@ void Connection::handleDisconnect(std::shared_ptr<DisconnectPacket> disconnect) 
     // A normal DISCONNECT discards the Will message (MQTT-3.14.4-3); the read
     // loop then exits and run() tears the session down.
     willPending = false;
-    // MQTT 5 Session Expiry Interval (MQTT-3.14.4-2): 0 (or absent when the
-    // CONNECT did not request persistence) discards the session immediately;
-    // a positive interval keeps it resumable for that long. An interval of 0
-    // overrides persistence, so a graceful DISCONNECT ends the session.
-    gracefulDisconnect = true;
+    // MQTT 5 Session Expiry Interval on DISCONNECT (MQTT-3.14.4-2): it overrides
+    // the CONNECT value for this teardown. When the property is absent the CONNECT
+    // value stays in effect; an explicit 0 ends the session immediately.
     if (frame.getVersion() == Version::MQTT5) {
         auto it = disconnect->properties.find(PropertyID::SESSION_EXPIRY_INTERVAL);
         if (it != disconnect->properties.end() &&
@@ -1060,6 +1084,17 @@ void Connection::sendPubrec(uint16_t packetId) {
     PubrecPacket pubrec{packetId, ReasonCode::SUCCESS};
     logDebug("resend PUBREC packetId=%u (awaiting PUBREL)", packetId);
     sendPacket(pubrec);
+}
+
+void Connection::sendPubrel(uint16_t packetId) {
+    if (state != State::CONNECTED) {
+        return;
+    }
+    // A re-sent PUBREL always carries SUCCESS (the PUBREC that opened this leg
+    // was accepted), so the client can finish the flow with PUBCOMP.
+    PubrelPacket pubrel{packetId, ReasonCode::SUCCESS};
+    logDebug("resend PUBREL packetId=%u (awaiting PUBCOMP)", packetId);
+    sendPacket(pubrel);
 }
 
 void Connection::closeWithReason(ReasonCode reason) {

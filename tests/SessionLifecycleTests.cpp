@@ -268,6 +268,60 @@ TEST_F(SessionLifecycleTest, ResumeResendsPubrecForInboundQos2AwaitingPubrel)
     EXPECT_TRUE(third->resentPubrecs.empty());
 }
 
+TEST_F(SessionLifecycleTest, ResumeResendsPubrelForOutgoingQos2AwaitingPubcomp)
+{
+    auto session = std::make_shared<Session>(&broker, "outq2");
+    session->connect(session, /*persistent=*/true);
+    auto first = test::attach(*session);
+    session->subscribe("out/q", optionsFor(QoS::QOS_2));
+
+    // Deliver a QoS 2 message; it enters the outgoing inflight set.
+    broker.publish(Message("out/q", "hello", QoS::QOS_2));
+    ASSERT_EQ(first->size(), 1u);
+    uint16_t packetId = first->packetIds[0];
+
+    // The client acknowledges the PUBLISH with PUBREC; the broker now sends a
+    // PUBREL and moves into the "waiting for PUBCOMP" leg (MQTT-4.3.3).
+    ASSERT_EQ(session->pubrec(packetId), ReasonCode::SUCCESS);
+
+    // The connection drops before the client's PUBCOMP arrives.
+    session->close(first);
+    EXPECT_EQ(broker.findSession("outq2"), session);
+
+    // On reconnect the broker must re-send the PUBREL so the client can finish
+    // the flow with PUBCOMP; the PUBLISH itself is not re-sent (MQTT-4.4.0-1).
+    auto second = std::make_shared<RecordingClient>();
+    session->resume(second, Version::MQTT5);
+    EXPECT_EQ(second->resentPubrels, (std::vector<uint16_t>{packetId}));
+    EXPECT_TRUE(second->resentPubrecs.empty());
+    EXPECT_EQ(second->size(), 0u);
+
+    // Once the PUBCOMP arrives the flow is complete and nothing is re-sent.
+    session->pubcomp(packetId);
+    auto third = std::make_shared<RecordingClient>();
+    session->resume(third, Version::MQTT5);
+    EXPECT_TRUE(third->resentPubrels.empty());
+}
+
+TEST_F(SessionLifecycleTest, PubcompBeforePubrecClearsPendingPubrel)
+{
+    auto session = std::make_shared<Session>(&broker, "outq2b");
+    session->connect(session, /*persistent=*/true);
+    auto first = test::attach(*session);
+    session->subscribe("out/qb", optionsFor(QoS::QOS_2));
+
+    broker.publish(Message("out/qb", "x", QoS::QOS_2));
+    ASSERT_EQ(first->size(), 1u);
+    uint16_t packetId = first->packetIds[0];
+    ASSERT_EQ(session->pubrec(packetId), ReasonCode::SUCCESS);
+
+    // A PUBCOMP without an intervening disconnect completes the flow.
+    session->pubcomp(packetId);
+    auto second = std::make_shared<RecordingClient>();
+    session->resume(second, Version::MQTT5);
+    EXPECT_TRUE(second->resentPubrels.empty());
+}
+
 TEST_F(SessionLifecycleTest, InboundQos2PacketIdReuseIsRejectedWhileAwaitingPubrel)
 {
     auto session = std::make_shared<Session>(&broker, "q2reuse");

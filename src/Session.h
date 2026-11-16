@@ -41,6 +41,10 @@ public:
     //! Called on resume so a client whose PUBREL was lost can complete the
     //! handshake instead of starting the QoS 2 flow over.
     virtual void sendPubrec(uint16_t packetId) = 0;
+    //! Re-send a PUBREL for an outgoing QoS 2 flow that had already sent its
+    //! PUBREC but whose PUBCOMP was lost when the connection dropped. Called on
+    //! resume so the client can complete the handshake (MQTT-4.4.0-1).
+    virtual void sendPubrel(uint16_t packetId) = 0;
     //! Called when a newer connection takes over this session; the receiver must
     //! stop using the session and release it. \p version is the MQTT version of
     //! the session being handed over, so a protocol-aware client can tell its
@@ -182,6 +186,11 @@ private:
     uint16_t receiveMaximum = 65535;
     uint16_t packetId = 1;
     std::set<uint16_t> awaitingPubrel;
+    //! Outgoing QoS 2 packet ids for which this session has sent a PUBREL and is
+    //! waiting for the matching PUBCOMP. If the connection drops in that state
+    //! the PUBREL is re-sent on resume (MQTT-4.4.0-1); the message itself has
+    //! already been delivered, so only the packet id needs remembering.
+    std::set<uint16_t> pendingPubrel;
     std::map<std::string, SubscriptionOptions> subscriptions;
     std::map<uint16_t, std::shared_ptr<Message>> inflightMessages;
     //! The MQTT 5 Subscription Identifier carried by each inflight delivery, so

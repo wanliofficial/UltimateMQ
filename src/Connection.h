@@ -65,6 +65,8 @@ public:
                  uint32_t subscriptionIdentifier = 0) override;
     //! Client interface: resend a PUBREC for an inbound QoS 2 flow awaiting PUBREL
     void sendPubrec(uint16_t packetId) override;
+    //! Client interface: resend a PUBREL for an outgoing QoS 2 flow awaiting PUBCOMP
+    void sendPubrel(uint16_t packetId) override;
     //! Client interface: a newer connection has taken over this session; stop using it
     void onSuperseded(Version version) override;
     void handleDeliver(const Message& message, uint16_t packetId, QoS qos,
@@ -93,12 +95,10 @@ private:
     std::chrono::steady_clock::time_point lastActivity;
     uint16_t keepAliveSeconds = 0;
     std::chrono::milliseconds readTimeout{0};
-    //! Set when the client sent a graceful DISCONNECT (as opposed to the read
-    //! loop ending on an error or keep-alive timeout). Governs whether a
-    //! zero session-expiry interval discards the session on teardown.
-    bool gracefulDisconnect = false;
-    //! MQTT 5 session expiry interval from a graceful DISCONNECT; 0 (the default
-    //! when absent or on MQTT 3.1.1) means the session is discarded on disconnect.
+    //! Session Expiry Interval (MQTT 5) in effect for this connection: taken from
+    //! the CONNECT and possibly overridden by a graceful DISCONNECT
+    //! (MQTT-3.14.4-2). 0 (the default when absent, and always on MQTT 3.1.x with
+    //! clean session) means the session is discarded when the connection closes.
     uint32_t sessionExpirySeconds = 0;
     //! MQTT 5 Topic Alias support (MQTT-3.3.2-7..11). The broker advertises
     //! TopicAliasMaximum in CONNACK and a client may then send a PUBLISH whose

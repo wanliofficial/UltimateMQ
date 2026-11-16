@@ -310,6 +310,11 @@ bool Store::write(const PersistedState &state) {
         for (uint16_t id : session.awaitingPubrel) {
             out += "pubrel " + std::to_string(id) + "\n";
         }
+        // Outgoing QoS 2 flow in the PUBREL-wait state (broker sent PUBREL, the
+        // client's PUBCOMP is still outstanding); re-sent on resume.
+        for (uint16_t id : session.pendingPubrel) {
+            out += "outpubrel " + std::to_string(id) + "\n";
+        }
     }
     out += "end\n";
 
@@ -416,7 +421,8 @@ bool Store::load(PersistedState &out, std::string *error) const {
             session.nextPacketId = static_cast<uint16_t>(nextId);
             out.sessions.push_back(std::move(session));
             current = &out.sessions.back();
-        } else if (kind == "sub" || kind == "inflight" || kind == "blocked" || kind == "pubrel") {
+        } else if (kind == "sub" || kind == "inflight" || kind == "blocked" || kind == "pubrel" ||
+                   kind == "outpubrel") {
             if (current == nullptr) {
                 if (error) *error = "record without a session at line " + std::to_string(lineNo);
                 return false;
@@ -476,6 +482,15 @@ bool Store::load(PersistedState &out, std::string *error) const {
                     return false;
                 }
                 current->blocked.push_back(std::move(m));
+            } else if (kind == "outpubrel") {
+                // Outgoing QoS 2 flow awaiting PUBCOMP; re-sent to the client on
+                // resume (MQTT-4.4.0-1).
+                unsigned id = 0;
+                if (!(ss >> id)) {
+                    if (error) *error = "bad outpubrel record at line " + std::to_string(lineNo);
+                    return false;
+                }
+                current->pendingPubrel.insert(static_cast<uint16_t>(id));
             } else {
                 unsigned id = 0;
                 if (!(ss >> id)) {

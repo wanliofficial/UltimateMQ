@@ -50,6 +50,9 @@ PersistedState sampleState() {
     session.blocked.push_back(messageFor("a/c", std::string("\x10\x11", 2), QoS::QOS_2));
     session.awaitingPubrel.insert(3);
     session.awaitingPubrel.insert(9);
+    // Outgoing QoS 2 flow awaiting PUBCOMP (broker sent PUBREL)
+    session.pendingPubrel.insert(11);
+    session.pendingPubrel.insert(12);
     state.sessions.push_back(session);
     return state;
 }
@@ -104,6 +107,7 @@ TEST(StoreTest, RoundTripsTheWholeState)
     EXPECT_EQ(session.blocked[0].payload, (std::vector<uint8_t>{0x10, 0x11}));
     EXPECT_EQ(session.blocked[0].qos, QoS::QOS_2);
     EXPECT_EQ(session.awaitingPubrel, (std::set<uint16_t>{3, 9}));
+    EXPECT_EQ(session.pendingPubrel, (std::set<uint16_t>{11, 12}));
 
     ::remove(path.c_str());
 }

@@ -52,6 +52,7 @@ Session::Snapshot Session::snapshot() const {
         }
     }
     snapshot.awaitingPubrel = awaitingPubrel;
+    snapshot.pendingPubrel = pendingPubrel;
     for (const auto &blocked : blockedDeliveries) {
         snapshot.blocked.push_back(blocked.message);
     }
@@ -75,6 +76,7 @@ void Session::restore(const Snapshot &snapshot) {
             inflightMessages[entry.first] = std::make_shared<Message>(entry.second);
         }
         awaitingPubrel = snapshot.awaitingPubrel;
+        pendingPubrel = snapshot.pendingPubrel;
         blockedDeliveries.clear();
         for (const auto &m : snapshot.blocked) {
             Message copy = m;
@@ -162,6 +164,7 @@ void Session::discard() {
         blockedDeliveries.clear();
         inflightMessages.clear();
         awaitingPubrel.clear();
+        pendingPubrel.clear();
         client.reset();
         notify = std::move(onDisconnect);
         onDisconnect = nullptr;
@@ -245,6 +248,10 @@ ReasonCode Session::pubrec(uint16_t packetId) {
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
     if (inflightMessages.erase(packetId) > 0) {
         inflightIdentifiers.erase(packetId);
+        // The PUBLISH is acknowledged; from now on only the PUBREL/PUBCOMP leg
+        // of the QoS 2 flow is outstanding. Remember it so a resume can re-send
+        // the PUBREL if the connection drops before the PUBCOMP (MQTT-4.4.0-1).
+        pendingPubrel.insert(packetId);
         notifyMutation();
         releaseBlocked();
         return ReasonCode::SUCCESS;
@@ -268,8 +275,18 @@ ReasonCode Session::pubrel(uint16_t packetId) {
 
 void Session::pubcomp(uint16_t packetId) {
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
+    // The PUBCOMP completes the outgoing QoS 2 flow. It normally follows the
+    // PUBREC that moved the id into pendingPubrel, but a client that skips
+    // straight to PUBCOMP (or sends a duplicate) must still clear both.
+    bool freed = false;
+    if (pendingPubrel.erase(packetId) > 0) {
+        freed = true;
+    }
     if (inflightMessages.erase(packetId) > 0) {
         inflightIdentifiers.erase(packetId);
+        freed = true;
+    }
+    if (freed) {
         notifyMutation();
         releaseBlocked();
     }
@@ -334,6 +351,7 @@ void Session::bindClient(const std::shared_ptr<Client>& client) {
 void Session::resume(const std::shared_ptr<Client>& client, Version protocolVersion) {
     std::shared_ptr<Client> previous;
     std::vector<uint16_t> awaitingRel;
+    std::vector<uint16_t> outgoingRel;
     {
         std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
         previous = std::move(this->client);
@@ -366,6 +384,11 @@ void Session::resume(const std::shared_ptr<Client>& client, Version protocolVers
         // PUBREC now and let the client complete the flow with its PUBREL
         // (MQTT-4.3.2-2 / MQTT-4.4.0-1).
         awaitingRel.assign(awaitingPubrel.begin(), awaitingPubrel.end());
+        // Outbound QoS 2: the broker sent PUBREL but never got the PUBCOMP
+        // before the connection dropped. Re-send the PUBREL now so the client
+        // can finish the flow (MQTT-4.4.0-1); the PUBLISH itself was already
+        // delivered, so only the PUBREL/PUBCOMP leg is outstanding.
+        outgoingRel.assign(pendingPubrel.begin(), pendingPubrel.end());
     }
     if (previous) {
         // Tell the connection that lost the session to release it
@@ -373,6 +396,9 @@ void Session::resume(const std::shared_ptr<Client>& client, Version protocolVers
     }
     for (uint16_t id : awaitingRel) {
         client->sendPubrec(id);
+    }
+    for (uint16_t id : outgoingRel) {
+        client->sendPubrel(id);
     }
 }
 

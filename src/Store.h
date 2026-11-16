@@ -37,6 +37,10 @@ struct PersistedSession {
     //! yet (first field is 0), to be promoted once a slot frees up.
     std::vector<Message> blocked;
     std::set<uint16_t> awaitingPubrel;
+    //! Outgoing QoS 2 flow in the PUBREL-wait state: the broker sent PUBREL and
+    //! the client's PUBCOMP is still outstanding. Re-sent on resume
+    //! (MQTT-4.4.0-1).
+    std::set<uint16_t> pendingPubrel;
 };
 
 struct PersistedState {
