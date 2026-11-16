@@ -66,7 +66,11 @@ public:
     //! it is persistent (and therefore kept alive for a later reconnect)
     void close(const std::shared_ptr<Client>& client);
     void discard();
-    ReasonCode publish(uint16_t packetId, const Message& message);
+    //! \p duplicate is the DUP flag of an inbound QoS 2 PUBLISH. A DUP retransmit
+    //! for a flow already awaiting PUBREL must not re-route the message, but the
+    //! caller must resend PUBREC with SUCCESS (MQTT-4.3.3-1) rather than report an
+    //! error.
+    ReasonCode publish(uint16_t packetId, const Message& message, bool duplicate = false);
     void subscribe(const std::string& topic, const SubscriptionOptions& options);
     void unsubscribe(const std::string& topic);
     void puback(uint16_t packetId);

@@ -196,7 +196,7 @@ bool Session::isExpired(std::chrono::steady_clock::time_point now) const {
     return hasExpiry && now >= expiryDeadline;
 }
 
-ReasonCode Session::publish(uint16_t packetId, const Message &message) {
+ReasonCode Session::publish(uint16_t packetId, const Message &message, bool duplicate) {
     // Tag the message with this session so the fan-out can honour the MQTT 5
     // No Local option: a subscriber that opted in must not receive its own
     // publications. Set for every inbound publish; a restored (durable) message
@@ -211,6 +211,14 @@ ReasonCode Session::publish(uint16_t packetId, const Message &message) {
             // flow whose PUBREL could never be paired, so MQTT-3.3.4-1 forbids
             // it; report PACKET_IDENTIFIER_IN_USE (0x91) without re-routing.
             if (awaitingPubrel.count(packetId) > 0) {
+                // A DUP retransmit (the client did not get our PUBREC) is NOT a
+                // new identifier clash: the flow is already in progress. Do not
+                // re-route the message, but tell the caller to resend PUBREC
+                // with SUCCESS (MQTT-4.3.3-1). Returning anything else would
+                // look like a hard error to a client that is simply retrying.
+                if (duplicate) {
+                    return ReasonCode::SUCCESS;
+                }
                 return ReasonCode::PACKET_IDENTIFIER_IN_USE;
             }
         }

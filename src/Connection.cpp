@@ -783,7 +783,7 @@ void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
     if (broker) {
         broker->incrementMessagesReceived();
     }
-    ReasonCode reason = session->publish(publish->packetId, message);
+    ReasonCode reason = session->publish(publish->packetId, message, publish->dup);
     if (publish->qos == QoS::QOS_1) {
         PubackPacket puback{publish->packetId, reason};
         sendPacket(puback);
