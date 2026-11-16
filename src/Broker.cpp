@@ -350,29 +350,39 @@ void Broker::publish(const Message &message) {
     // and "a/b") receives a single copy, while every share group is its own
     // subscription and keeps its own copy. Key the dedup on the session for
     // ordinary deliveries and on the group's filter for shared ones.
-    std::vector<std::pair<std::shared_ptr<Session>, std::string>> unique;
-    std::set<std::pair<Session *, std::string>> seen;
-    unique.reserve(targets.size());
+    // The matched filters of an ordinary session are kept together so
+    // Session::deliver() can combine their options as MQTT-3.3.4-2 requires:
+    // keeping only the first one would deliver at the wrong QoS, drop the other
+    // Subscription Identifiers, and misjudge No Local.
+    struct Dispatch {
+        std::shared_ptr<Session> session;
+        std::vector<std::string> filters;
+    };
+    std::vector<Dispatch> unique;
+    std::map<Session *, size_t> ordinaryIndex;
+    // A shared subscription is identified by its full "$share/group/filter"
+    // name; an ordinary filter (even a "$SYS/..." one) shares one identity per
+    // session.
     for (auto &target : targets) {
-        // A shared subscription is identified by its full "$share/group/filter"
-        // name; an ordinary filter (even a "$SYS/..." one) shares one identity
-        // per session.
-        const bool shared = Topic::isShared(target.second);
-        std::pair<Session *, std::string> key{target.first.get(),
-                                              shared ? target.second : std::string()};
-        if (seen.insert(key).second) {
-            unique.push_back(std::move(target));
+        if (Topic::isShared(target.second)) {
+            unique.push_back(Dispatch{std::move(target.first), {std::move(target.second)}});
+            continue;
         }
+        auto inserted = ordinaryIndex.emplace(target.first.get(), unique.size());
+        if (inserted.second) {
+            unique.push_back(Dispatch{std::move(target.first), {}});
+        }
+        unique[inserted.first->second].filters.push_back(std::move(target.second));
     }
     // Deliveries are queued on the sessions here; the sockets are only written
     // by Session::flush() so that no client write is done while a lock is held
-    for (const auto &[session, filter] : unique) {
-        session->deliver(filter, message);
+    for (const auto &dispatch : unique) {
+        dispatch.session->deliver(dispatch.filters, message);
     }
     std::set<Session *> flushed;
-    for (const auto &[session, filter] : unique) {
-        if (flushed.insert(session.get()).second) {
-            session->flush();
+    for (const auto &dispatch : unique) {
+        if (flushed.insert(dispatch.session.get()).second) {
+            dispatch.session->flush();
         }
     }
     // Count what actually reached a subscriber: one increment per delivery the

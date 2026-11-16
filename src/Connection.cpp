@@ -794,6 +794,19 @@ void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
     if (!resolveTopicAlias(publish)) {
         return;
     }
+    // MQTT-3.3.4-6: a PUBLISH sent from a Client to a Server MUST NOT contain a
+    // Subscription Identifier. Echoing one would be meaningless (the server has
+    // no subscription of its own) and accepting it lets a client claim its
+    // message belongs to subscriptions it never made.
+    if (frame.getVersion() == Version::MQTT5 &&
+        !publish->subscriptionIdentifiers.empty()) {
+        logDebug("client %s: inbound PUBLISH carries a Subscription Identifier",
+                 session->getClientId().c_str());
+        DisconnectPacket disconnect{ReasonCode::PROTOCOL_ERROR};
+        sendPacket(disconnect);
+        state = State::DISCONNECTED;
+        return;
+    }
     // A PUBLISH topic must be a legal topic name: wildcards are never allowed
     // (MQTT-3.3.2-1). QoS 1/2 get the reason code in the ack; MQTT 5 QoS 0 is
     // reported with a DISCONNECT (MQTT-5.4.1-1), 3.1.1 is simply dropped.
@@ -1104,12 +1117,12 @@ void Connection::handleAuth(std::shared_ptr<AuthPacket> auth) {
 }
 
 bool Connection::deliver(const Message &message, uint16_t packetId, QoS qos,
-                         uint32_t subscriptionIdentifier) {
-    return handleDeliver(message, packetId, qos, subscriptionIdentifier);
+                         const SubscriptionIdentifiers &subscriptionIdentifiers) {
+    return handleDeliver(message, packetId, qos, subscriptionIdentifiers);
 }
 
 bool Connection::handleDeliver(const Message &message, uint16_t packetId, QoS qos,
-                               uint32_t subscriptionIdentifier) {
+                               const SubscriptionIdentifiers &subscriptionIdentifiers) {
     if (state != State::CONNECTED) {
         return false;
     }
@@ -1135,11 +1148,10 @@ bool Connection::handleDeliver(const Message &message, uint16_t packetId, QoS qo
             publish.properties[PropertyID::MESSAGE_EXPIRY_INTERVAL] =
                 static_cast<uint32_t>(left);
         }
-        // MQTT-3.3.2-5: echo the identifier of the subscription that caused
-        // this delivery.
-        if (subscriptionIdentifier != 0) {
-            publish.properties[PropertyID::SUBSCRIPTION_IDENTIFIER] = subscriptionIdentifier;
-        }
+        // MQTT-3.3.4-3/-4: echo the identifier of every subscription that caused
+        // this copy. Overlapping subscriptions produce one copy, so the list can
+        // hold several (and repeats) and must be sent as several properties.
+        publish.subscriptionIdentifiers = subscriptionIdentifiers;
     }
     logDebug("deliver %s qos=%d packetId=%u dup=%d", message.topic.c_str(), (int)qos, packetId,
              (int)message.dup);

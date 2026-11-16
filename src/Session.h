@@ -39,8 +39,11 @@ public:
     //! not be sent (for example it exceeds the client's Maximum Packet Size,
     //! MQTT-3.1.2-24): the session then releases the packet id it reserved so
     //! the flow-control window is not leaked.
+    //! \p subscriptionIdentifiers holds the MQTT 5 Subscription Identifier of
+    //! every subscription that caused this copy (MQTT-3.3.4-4), so it can be
+    //! more than one when overlapping subscriptions produced a single copy.
     virtual bool deliver(const Message& message, uint16_t packetId, QoS qos,
-                         uint32_t subscriptionIdentifier = 0) = 0;
+                         const SubscriptionIdentifiers& subscriptionIdentifiers) = 0;
     //! Resend a PUBREC for an inbound QoS 2 flow that is still awaiting its PUBREL.
     //! Called on resume so a client whose PUBREL was lost can complete the
     //! handshake instead of starting the QoS 2 flow over.
@@ -125,11 +128,14 @@ public:
     //! broker afterwards. Does not touch the broker.
     void restore(const Snapshot& snapshot);
 
-    //! Queue a message for this session (thread safe). \p filter is the
-    //! subscription the delivery comes through; its options (Maximum QoS,
-    //! Retain As Published, No Local) are applied, while read access is checked
-    //! against the concrete message topic.
-    void deliver(const std::string& filter, const Message& message);
+    //! Queue a message for this session (thread safe). \p filters are all the
+    //! subscriptions of this session the message matched; their options are
+    //! combined as MQTT-3.3.4-2 requires (a single copy is delivered at the
+    //! highest Maximum QoS of the matching subscriptions, carries every
+    //! Subscription Identifier, and is suppressed by No Local only when every
+    //! matching subscription asked for it). Read access is checked against the
+    //! concrete message topic.
+    void deliver(const std::vector<std::string>& filters, const Message& message);
     //! Queue the retained messages matching a topic filter (honours the retain handling option).
     //! \p isNewSubscription is whether this filter was newly created by the current
     //! SUBSCRIBE (as opposed to a re-subscribe updating options); it drives the
@@ -169,13 +175,14 @@ private:
         Message message;
         uint16_t packetId;
         QoS qos;
-        //! MQTT 5 Subscription Identifier of the subscription that caused this
-        //! delivery (0 for none); echoed on the PUBLISH (MQTT-3.3.2-5).
-        uint32_t subscriptionIdentifier;
+        //! MQTT 5 Subscription Identifiers of the subscriptions that caused this
+        //! delivery (empty for none); echoed on the PUBLISH (MQTT-3.3.4-3/-4).
+        SubscriptionIdentifiers subscriptionIdentifiers;
 
-        Delivery(Message message, uint16_t packetId, QoS qos, uint32_t subscriptionIdentifier = 0)
+        Delivery(Message message, uint16_t packetId, QoS qos,
+                 SubscriptionIdentifiers subscriptionIdentifiers = {})
             : message(std::move(message)), packetId(packetId), qos(qos),
-              subscriptionIdentifier(subscriptionIdentifier) {}
+              subscriptionIdentifiers(std::move(subscriptionIdentifiers)) {}
     };
 
     std::string clientId;
@@ -200,10 +207,10 @@ private:
     std::set<uint16_t> pendingPubrel;
     std::map<std::string, SubscriptionOptions> subscriptions;
     std::map<uint16_t, std::shared_ptr<Message>> inflightMessages;
-    //! The MQTT 5 Subscription Identifier carried by each inflight delivery, so
-    //! a retransmitted QoS 1/2 PUBLISH still echoes it (MQTT-3.3.2-5 applies to
-    //! retransmissions too). Keyed by the same packet id as inflightMessages.
-    std::map<uint16_t, uint32_t> inflightIdentifiers;
+    //! The MQTT 5 Subscription Identifiers carried by each inflight delivery, so
+    //! a retransmitted QoS 1/2 PUBLISH still echoes them (MQTT-3.3.4-3 applies
+    //! to retransmissions too). Keyed by the same packet id as inflightMessages.
+    std::map<uint16_t, SubscriptionIdentifiers> inflightIdentifiers;
     std::vector<Delivery> pendingDeliveries;
     //! QoS>0 messages waiting for an inflight slot to free up under the client's
     //! MQTT 5 Receive Maximum. They have no packet id yet and are not inflight,
@@ -224,7 +231,8 @@ private:
     //! Called with deliveryMutex held; never takes any other lock
     void notifyMutation();
 
-    void pushDelivery(const Message& message, QoS qos, uint32_t subscriptionIdentifier = 0);
+    void pushDelivery(const Message& message, QoS qos,
+                      const SubscriptionIdentifiers& subscriptionIdentifiers = {});
     void removeSubscriptions(const std::map<std::string, SubscriptionOptions>& filters);
     uint16_t nextPacketId();
     //! Move blocked QoS>0 messages into the inflight set / send queue while the

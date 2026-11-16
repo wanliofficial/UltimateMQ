@@ -838,4 +838,77 @@ TEST_F(FrameTest, AcceptsABooleanPropertyOfOne)
     EXPECT_EQ(std::get<uint8_t>(parsed.at(PropertyID::PAYLOAD_FORMAT_INDICATOR)), 1);
 }
 
+
+TEST_F(FrameTest, ParsesEverySubscriptionIdentifierFromAPublish)
+{
+    // MQTT-3.3.4-4: a single copy published for several overlapping
+    // subscriptions carries one Subscription Identifier per subscription, so
+    // the parser has to collect all of them instead of rejecting the repeat or
+    // keeping only the last one.
+    Frame v5;
+    v5.setVersion(Version::MQTT5);
+    std::vector<uint8_t> payload = {
+        0x00, 0x03, 'a', '/', 'b',  // Topic name "a/b"
+        0x05,                       // Properties length
+        0x0B, 0x07,                 // SUBSCRIPTION_IDENTIFIER = 7
+        0x0B, 0xAC, 0x02,           // SUBSCRIPTION_IDENTIFIER = 300
+        'h', 'i',                   // Payload
+    };
+    FixedHeader header(0x30);
+    auto packet = v5.parsePublish(header, payload.data(), payload.size());
+
+    EXPECT_EQ(packet.subscriptionIdentifiers, (SubscriptionIdentifiers{7, 300}));
+    EXPECT_EQ(packet.properties.count(PropertyID::SUBSCRIPTION_IDENTIFIER), 0u)
+        << "the repeatable identifiers live in their own list, not in the map";
+    ASSERT_EQ(packet.payload.size(), 2u);
+    EXPECT_EQ(packet.payload[0], 'h');
+}
+
+TEST_F(FrameTest, SerializesEverySubscriptionIdentifierOnAPublish)
+{
+    // The outbound side must emit one property per identifier, including a
+    // repeated identifier used by two subscriptions.
+    Frame mqtt5(Version::MQTT5);
+    PublishPacket packet;
+    packet.type = PacketType::PUBLISH;
+    packet.qos = QoS::QOS_0;
+    packet.topicName = "a/b";
+    packet.payload = {'h', 'i'};
+    packet.subscriptionIdentifiers = {7, 300, 7};
+
+    auto serialized = mqtt5.serializePublish(packet);
+
+    // Fixed header (1) + remaining length (1) + topic (2 + 3) + property
+    // length (1) + identifiers (2 + 3 + 2) + payload (2)
+    ASSERT_EQ(serialized.size(), 2 + 5 + 1 + 7 + 2);
+    EXPECT_EQ(serialized[0], 0x30);
+    EXPECT_EQ(serialized[1], 15);   // remaining length
+    EXPECT_EQ(serialized[7], 7);    // property length = 7 bytes
+    EXPECT_EQ(serialized[8], 0x0B);
+    EXPECT_EQ(serialized[9], 0x07);
+    EXPECT_EQ(serialized[10], 0x0B);
+    EXPECT_EQ(serialized[11], 0xAC); // 300 = 0b1_0010_1100
+    EXPECT_EQ(serialized[12], 0x02);
+    EXPECT_EQ(serialized[13], 0x0B);
+    EXPECT_EQ(serialized[14], 0x07);
+    EXPECT_EQ(serialized[15], 'h');
+    EXPECT_EQ(serialized[16], 'i');
+}
+
+TEST_F(FrameTest, ASubscribeStillRejectsARepeatedSubscriptionIdentifier)
+{
+    // MQTT-3.8.2-16: the property may appear only once in a SUBSCRIBE, so the
+    // list-based handling added for PUBLISH must not loosen that check.
+    Frame mqtt5(Version::MQTT5);
+    std::vector<uint8_t> payload = {
+        0x00, 0x01,                 // packet id
+        0x04,                       // property length
+        0x0B, 0x07,                 // SUBSCRIPTION_IDENTIFIER = 7
+        0x0B, 0x08,                 // ... again
+        0x00, 0x01, 'a',            // filter
+        0x00,                       // options: QoS 0
+    };
+    EXPECT_THROW(mqtt5.parseSubscribe(payload.data(), payload.size()), std::runtime_error);
+}
+
 } // namespace MQTT

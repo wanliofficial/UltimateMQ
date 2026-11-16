@@ -21,6 +21,27 @@ uint32_t readU32BE(const uint8_t *p) {
     return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
            (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
 }
+
+//! Append a Variable Byte Integer (MQTT-1.5.5): least significant 7-bit group
+//! first, continuation bit set while more groups follow, no length byte.
+void appendVariableByteInteger(std::vector<uint8_t> &buffer, uint32_t value) {
+    size_t remaining = value;
+    do {
+        uint8_t encoded = remaining & 0x7F;
+        remaining >>= 7;
+        if (remaining != 0) {
+            encoded |= 0x80;
+        }
+        buffer.push_back(encoded);
+    } while (remaining != 0);
+}
+
+//! Encode a Variable Byte Integer on its own (for computing a length prefix).
+std::vector<uint8_t> variableByteInteger(uint32_t value) {
+    std::vector<uint8_t> encoded;
+    appendVariableByteInteger(encoded, value);
+    return encoded;
+}
 } // namespace
 
 size_t Frame::feed(const uint8_t *buffer, size_t length) {
@@ -196,7 +217,8 @@ uint16_t Frame::parsePacketId(const uint8_t* buffer, size_t length) {
     return packetId;
 }
 
-Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
+Properties Frame::doParseProperties(const uint8_t *buffer, size_t length,
+                                    SubscriptionIdentifiers *identifiers) {
     Properties properties;
     std::string contentType;
     std::string responseTopic;
@@ -217,7 +239,14 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
         auto [id, idBytes] = decodeVariableByteInteger(buffer+offset, length-offset);
             offset += idBytes;
         PropertyID propertyId = static_cast<PropertyID>(id);
-        if (propertyId != PropertyID::USER_PROPERTY && !seen.insert(propertyId).second) {
+        // MQTT-3.3.4-4: a PUBLISH may carry the Subscription Identifier once for
+        // every subscription that caused it, so that one property is collected
+        // in a list. A SUBSCRIBE still carries at most one (MQTT-3.8.2-16) and
+        // is rejected below like any other repeated property.
+        const bool repeatable = propertyId == PropertyID::SUBSCRIPTION_IDENTIFIER &&
+                                identifiers != nullptr;
+        if (propertyId != PropertyID::USER_PROPERTY && !repeatable &&
+            !seen.insert(propertyId).second) {
             throw std::runtime_error("Invalid properties: a property appears more than once");
         }
         // Payload Format Indicator, Request Response Information, Request
@@ -320,14 +349,20 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
             case PropertyID::SUBSCRIPTION_IDENTIFIER:
                 // MQTT 5 Variable Byte Integer (MQTT-3.8.2.1.2): unlike the
                 // fixed-width integer properties it has no length byte. A value
-                // of 0 is a protocol error (MQTT-3.8.2-16).
+                // of 0 is a protocol error (MQTT-3.8.2-16), whether it comes
+                // from a SUBSCRIBE or from a PUBLISH.
                 {
                     auto [identifier, identifierBytes] =
                         decodeVariableByteInteger(buffer + offset, length - offset);
                     if (identifier == 0) {
                         throw std::runtime_error("Invalid properties: SUBSCRIPTION_IDENTIFIER of 0");
                     }
-                    properties[propertyId] = static_cast<uint32_t>(identifier);
+                    if (identifiers != nullptr) {
+                        // On a PUBLISH every occurrence is kept (MQTT-3.3.4-4).
+                        identifiers->push_back(static_cast<uint32_t>(identifier));
+                    } else {
+                        properties[propertyId] = static_cast<uint32_t>(identifier);
+                    }
                     offset += identifierBytes;
                 }
                 break;
@@ -454,7 +489,8 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length) {
     return properties;
 }
 
-std::pair<Properties, size_t> Frame::parseProperties(const uint8_t *buffer, size_t length) {
+std::pair<Properties, size_t> Frame::parseProperties(const uint8_t *buffer, size_t length,
+                                                     SubscriptionIdentifiers *identifiers) {
     if (length == 0) {
         throw std::runtime_error("Properties: no property length present");
     }
@@ -466,7 +502,7 @@ std::pair<Properties, size_t> Frame::parseProperties(const uint8_t *buffer, size
         throw std::runtime_error("Not enough data for properperties");
     }     
     const uint8_t *propertyBuffer = buffer + propertyBytes;
-    Properties properties = doParseProperties(propertyBuffer, propertyLength);
+    Properties properties = doParseProperties(propertyBuffer, propertyLength, identifiers);
     return std::make_pair(properties, propertyBytes + propertyLength);
 }   
 
@@ -570,7 +606,11 @@ PublishPacket Frame::parsePublish(const FixedHeader &header, const uint8_t *buff
     }
 
     if(version == Version::MQTT5) {
-        auto [properties, propLength] = parseProperties(buffer+offset, length - offset);
+        // A client MUST NOT put a Subscription Identifier on a PUBLISH it sends
+        // (MQTT-3.3.4-6); parse it so the caller can reject the packet rather
+        // than route it as if the identifier had never been there.
+        auto [properties, propLength] = parseProperties(buffer+offset, length - offset,
+                                                       &publish.subscriptionIdentifiers);
         publish.properties = properties;
         offset += propLength;
     }
@@ -984,6 +1024,12 @@ std::vector<uint8_t> Frame::serializePublish(const PublishPacket &packet) {
     buffer.push_back(flags);
     // Serialize properties
     auto propertiesBuffer = serializeProperties(packet.properties);
+    // MQTT-3.3.4-4: one Subscription Identifier per subscription that caused
+    // this copy, in the order the broker collected them.
+    for (uint32_t identifier : packet.subscriptionIdentifiers) {
+        propertiesBuffer.push_back(static_cast<uint8_t>(PropertyID::SUBSCRIPTION_IDENTIFIER));
+        appendVariableByteInteger(propertiesBuffer, identifier);
+    }
     
     // Serialize remaining length
     uint32_t remainingLength = 2;                 // Topic Name length (2 bytes)
@@ -1383,15 +1429,7 @@ std::vector<uint8_t> Frame::serializeProperties(const Properties &properties) {
                     // A Variable Byte Integer: no length byte, least significant
                     // 7-bit group first with the continuation bit set (MQTT-1.5.5).
                     buffer.push_back(static_cast<uint8_t>(id));
-                    size_t remaining = arg;
-                    do {
-                        uint8_t encoded = remaining & 0x7F;
-                        remaining >>= 7;
-                        if (remaining != 0) {
-                            encoded |= 0x80;
-                        }
-                        buffer.push_back(encoded);
-                    } while (remaining != 0);
+                    appendVariableByteInteger(buffer, arg);
                     return;
                 }
                 // MQTT 5 four-byte integer: a length byte (0x04) then the value.

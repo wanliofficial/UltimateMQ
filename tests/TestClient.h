@@ -14,7 +14,7 @@ public:
     size_t refuseLargerThan = 0;
 
     bool deliver(const Message &message, uint16_t packetId, QoS qos,
-                 uint32_t subscriptionIdentifier = 0) override {
+                 const SubscriptionIdentifiers &subscriptionIdentifiers) override {
         // Deliveries can come from any publishing thread
         std::lock_guard<std::mutex> lock(mutex);
         if (refuseLargerThan != 0 && message.payload.size() > refuseLargerThan) {
@@ -23,7 +23,7 @@ public:
         delivered.push_back(message);
         packetIds.push_back(packetId);
         qosValues.push_back(qos);
-        subscriptionIdentifiers.push_back(subscriptionIdentifier);
+        identifiersPerDelivery.push_back(subscriptionIdentifiers);
         return true;
     }
 
@@ -52,7 +52,9 @@ public:
     std::vector<Message> delivered;
     std::vector<uint16_t> packetIds;
     std::vector<QoS> qosValues;
-    std::vector<uint32_t> subscriptionIdentifiers;
+    //! Subscription Identifiers of each delivery, one list per delivery (empty
+    //! when no matching subscription had one).
+    std::vector<SubscriptionIdentifiers> identifiersPerDelivery;
     std::vector<uint16_t> resentPubrecs;
     std::vector<uint16_t> resentPubrels;
     std::atomic<int> superseded{0};

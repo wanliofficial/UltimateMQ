@@ -143,10 +143,10 @@ TEST_F(SessionLifecycleTest, ExpiredMessageIsNotDelivered)
     Message stale{"m/t", std::string("old"), QoS::QOS_0};
     stale.hasExpiry = true;
     stale.expiryDeadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
-    session->deliver("m/t", stale);
+    session->deliver({"m/#"}, stale);
 
     // ...while a still-live message to the same topic is delivered normally.
-    session->deliver("m/t", Message{"m/t", std::string("new"), QoS::QOS_0});
+    session->deliver({"m/#"}, Message{"m/t", std::string("new"), QoS::QOS_0});
 
     session->flush();
 
@@ -169,8 +169,8 @@ TEST_F(SessionLifecycleTest, ExpiredQueuedMessageIsNotFlushed)
     Message stale{"q/t", std::string("old"), QoS::QOS_0};
     stale.hasExpiry = true;
     stale.expiryDeadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
-    session->deliver("q/t", stale);
-    session->deliver("q/t", Message{"q/t", std::string("new"), QoS::QOS_0});
+    session->deliver({"q/#"}, stale);
+    session->deliver({"q/#"}, Message{"q/t", std::string("new"), QoS::QOS_0});
     session->close(offline);  // persistent: the buffered queue is kept
 
     // Reconnect with a new client and drain the queue
@@ -747,6 +747,44 @@ TEST_F(SessionLifecycleTest, NormalSubscriptionStillReceivesOthers)
     ASSERT_EQ(subscriberClient->size(), 1u);
     EXPECT_EQ(std::string(subscriberClient->delivered[0].payload.begin(),
                           subscriberClient->delivered[0].payload.end()), "hello");
+}
+
+
+TEST_F(SessionLifecycleTest, ResumeRetransmitsEverySubscriptionIdentifier)
+{
+    // MQTT-3.3.4-3 applies to retransmissions too: a QoS 1 message caused by
+    // overlapping subscriptions is re-sent with the whole identifier list, not
+    // with just the first one.
+    auto session = std::make_shared<Session>(&broker, "sid-resume");
+    session->connect(session, /*persistent=*/true);
+    auto first = test::attach(*session);
+    SubscriptionOptions broad = optionsFor(QoS::QOS_1);
+    broad.subscriptionIdentifier = 7;
+    SubscriptionOptions narrow = optionsFor(QoS::QOS_1);
+    narrow.subscriptionIdentifier = 9;
+    session->subscribe("sid/#", broad);
+    session->subscribe("sid/+", narrow);
+
+    broker.publish(Message("sid/x", "hi", QoS::QOS_1));
+    ASSERT_EQ(first->size(), 1u);
+    // MQTT-3.3.4-4: the order of the identifiers is not significant.
+    auto delivered = first->identifiersPerDelivery[0];
+    std::sort(delivered.begin(), delivered.end());
+    ASSERT_EQ(delivered, (SubscriptionIdentifiers{7, 9}));
+    uint16_t packetId = first->packetIds[0];
+
+    session->close(first);
+    auto second = std::make_shared<RecordingClient>();
+    session->resume(second, Version::MQTT5);
+    session->flush();
+
+    ASSERT_EQ(second->size(), 1u);
+    EXPECT_TRUE(second->delivered[0].dup);
+    EXPECT_EQ(second->packetIds[0], packetId);
+    auto resent = second->identifiersPerDelivery[0];
+    std::sort(resent.begin(), resent.end());
+    EXPECT_EQ(resent, delivered)
+        << "the retransmission must repeat the same identifier list";
 }
 
 } // namespace MQTT

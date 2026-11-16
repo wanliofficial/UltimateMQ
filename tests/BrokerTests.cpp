@@ -4,6 +4,7 @@
 #include "TestClient.h"
 #include <cstdio>
 #include <fstream>
+#include <algorithm>
 
 class BrokerTest : public ::testing::Test
 {
@@ -486,8 +487,9 @@ TEST_F(BrokerTest, LiveDeliveryCarriesTheSubscriptionIdentifier)
     broker->publish(MQTT::Message("sid/x", "hi"));
 
     ASSERT_EQ(client->size(), 1u);
-    ASSERT_EQ(client->subscriptionIdentifiers.size(), 1u);
-    EXPECT_EQ(client->subscriptionIdentifiers[0], 42u);
+    ASSERT_EQ(client->identifiersPerDelivery.size(), 1u);
+    ASSERT_EQ(client->identifiersPerDelivery[0].size(), 1u);
+    EXPECT_EQ(client->identifiersPerDelivery[0][0], 42u);
     // The identifier belongs to the subscription, not the message
     EXPECT_TRUE(client->delivered[0].properties.empty());
 }
@@ -531,6 +533,105 @@ TEST_F(BrokerTest, ASubscriptionWithoutAnIdentifierDeliversNone)
     broker->publish(MQTT::Message("plain/x", "hi"));
 
     ASSERT_EQ(client->size(), 1u);
-    ASSERT_EQ(client->subscriptionIdentifiers.size(), 1u);
-    EXPECT_EQ(client->subscriptionIdentifiers[0], 0u);
+    ASSERT_EQ(client->identifiersPerDelivery.size(), 1u);
+    EXPECT_TRUE(client->identifiersPerDelivery[0].empty());
+}
+
+TEST_F(BrokerTest, OverlappingSubscriptionsDeliverAtTheHighestMaximumQos)
+{
+    // MQTT-3.3.4-2: when several subscriptions match, the copy that is
+    // delivered must respect the maximum QoS of all of them. "a/+" is reached
+    // before "a/#" by the routing trie, so an implementation that applied only
+    // the first match would deliver at QoS 0 here.
+    auto session = std::make_shared<MQTT::Session>(broker, "overlap-qos");
+    session->connect(session, /*persistent=*/false);
+    auto client = MQTT::test::attach(*session);
+    session->subscribe("a/#", opts(MQTT::QoS::QOS_2));
+    session->subscribe("a/+", opts(MQTT::QoS::QOS_0));
+
+    broker->publish(MQTT::Message("a/b", "hi", MQTT::QoS::QOS_2));
+
+    ASSERT_EQ(client->size(), 1u) << "overlapping subscriptions must produce one copy";
+    EXPECT_EQ(client->qosValues[0], MQTT::QoS::QOS_2)
+        << "the delivered QoS must be the highest Maximum QoS of the matching subscriptions";
+}
+
+TEST_F(BrokerTest, OverlappingSubscriptionsCarryEverySubscriptionIdentifier)
+{
+    // MQTT-3.3.4-3/-4: a single copy must list the identifier of every matching
+    // subscription, keeping repeats (a client may reuse one identifier).
+    auto session = std::make_shared<MQTT::Session>(broker, "overlap-sid");
+    session->connect(session, /*persistent=*/false);
+    auto client = MQTT::test::attach(*session);
+    auto withId = [](MQTT::QoS qos, uint32_t id) {
+        MQTT::SubscriptionOptions options{qos, false, false,
+                                          MQTT::RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES};
+        options.subscriptionIdentifier = id;
+        return options;
+    };
+    session->subscribe("a/#", withId(MQTT::QoS::QOS_0, 7));
+    session->subscribe("a/+", withId(MQTT::QoS::QOS_0, 7));
+    session->subscribe("a/b", withId(MQTT::QoS::QOS_0, 9));
+
+    broker->publish(MQTT::Message("a/b", "hi"));
+
+    ASSERT_EQ(client->size(), 1u);
+    ASSERT_EQ(client->identifiersPerDelivery.size(), 1u);
+    // MQTT-3.3.4-4: "their order is not significant".
+    auto identifiers = client->identifiersPerDelivery[0];
+    std::sort(identifiers.begin(), identifiers.end());
+    EXPECT_EQ(identifiers, (MQTT::SubscriptionIdentifiers{7, 7, 9}))
+        << "the single copy must carry one identifier per matching subscription";
+}
+
+TEST_F(BrokerTest, NoLocalOnOneOverlappingSubscriptionStillDelivers)
+{
+    // MQTT-3.8.3-3: No Local removes only the subscriptions that asked for it.
+    // The message must still arrive through the other matching subscription.
+    auto session = std::make_shared<MQTT::Session>(broker, "overlap-nl");
+    session->connect(session, /*persistent=*/false);
+    auto client = MQTT::test::attach(*session);
+    session->subscribe("a/+", opts(MQTT::QoS::QOS_0, /*noLocal=*/true));
+    session->subscribe("a/#", opts(MQTT::QoS::QOS_0, /*noLocal=*/false));
+
+    MQTT::Message message("a/b", "self");
+    message.originSession = session.get();
+    broker->publish(message);
+
+    EXPECT_EQ(client->size(), 1u)
+        << "one overlapping subscription without No Local still wants the message";
+}
+
+TEST_F(BrokerTest, NoLocalOnEveryOverlappingSubscriptionSuppressesTheCopy)
+{
+    auto session = std::make_shared<MQTT::Session>(broker, "overlap-nl2");
+    session->connect(session, /*persistent=*/false);
+    auto client = MQTT::test::attach(*session);
+    session->subscribe("a/+", opts(MQTT::QoS::QOS_0, /*noLocal=*/true));
+    session->subscribe("a/#", opts(MQTT::QoS::QOS_0, /*noLocal=*/true));
+
+    MQTT::Message message("a/b", "self");
+    message.originSession = session.get();
+    broker->publish(message);
+
+    EXPECT_EQ(client->size(), 0u)
+        << "every matching subscription asked for No Local, so nothing may be delivered";
+}
+
+TEST_F(BrokerTest, RetainAsPublishedOnOneOverlappingSubscriptionKeepsRetain)
+{
+    // MQTT-3.3.1-8: the flag travels with the copy if any matching subscription
+    // asked for it. "a/+" is matched first, so looking only at it would clear
+    // the flag while the overlapping "a/#" wants it kept.
+    auto session = std::make_shared<MQTT::Session>(broker, "overlap-rap");
+    session->connect(session, /*persistent=*/false);
+    auto client = MQTT::test::attach(*session);
+    session->subscribe("a/+", opts(MQTT::QoS::QOS_0, false, /*rap=*/false));
+    session->subscribe("a/#", opts(MQTT::QoS::QOS_0, false, /*rap=*/true));
+
+    broker->publish(MQTT::Message("a/b", "hi", MQTT::QoS::QOS_0, /*retain=*/true));
+
+    ASSERT_EQ(client->size(), 1u);
+    EXPECT_TRUE(client->delivered[0].retain)
+        << "Retain As Published must be honoured when any matching subscription asks for it";
 }

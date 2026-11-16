@@ -64,7 +64,7 @@ public:
     //! Returns false if the packet could not be sent (e.g. over the client's
     //! Maximum Packet Size), so the session can release the inflight slot.
     bool deliver(const Message& message, uint16_t packetId, QoS qos,
-                 uint32_t subscriptionIdentifier = 0) override;
+                 const SubscriptionIdentifiers& subscriptionIdentifiers) override;
     //! Client interface: resend a PUBREC for an inbound QoS 2 flow awaiting PUBREL
     void sendPubrec(uint16_t packetId) override;
     //! Client interface: resend a PUBREL for an outgoing QoS 2 flow awaiting PUBCOMP
@@ -72,7 +72,7 @@ public:
     //! Client interface: a newer connection has taken over this session; stop using it
     void onSuperseded(Version version) override;
     bool handleDeliver(const Message& message, uint16_t packetId, QoS qos,
-                       uint32_t subscriptionIdentifier = 0);
+                       const SubscriptionIdentifiers& subscriptionIdentifiers);
     //! Serialize and write a packet. Returns false when nothing was written
     //! (socket gone, or the packet exceeds the client's Maximum Packet Size).
     bool sendPacket(Packet &packet);

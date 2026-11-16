@@ -9,7 +9,8 @@ namespace MQTT {
 
 class Frame {
     Version version = Version::MQTT5;
-    Properties doParseProperties(const uint8_t *buffer, size_t length);
+    Properties doParseProperties(const uint8_t *buffer, size_t length,
+                                 SubscriptionIdentifiers *identifiers = nullptr);
 
     // Streaming parser state: a TCP segment may contain a partial packet, more
     // than one packet, or a packet split across several segments
@@ -97,7 +98,11 @@ public:
     AuthPacket parseAuth(const uint8_t *buffer, size_t length);
 
     // Parse properties
-    std::pair<Properties, size_t> parseProperties(const uint8_t *buffer, size_t length);
+    //! Parse a property block. \p identifiers, when given, collects every
+    //! Subscription Identifier instead of rejecting a repeat: a PUBLISH may
+    //! carry one per subscription that caused it (MQTT-3.3.4-4).
+    std::pair<Properties, size_t> parseProperties(const uint8_t *buffer, size_t length,
+                                                  SubscriptionIdentifiers *identifiers = nullptr);
 
     // Serialize MQTT packets
     std::vector<uint8_t> serialize(const Packet &packet);

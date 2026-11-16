@@ -371,14 +371,14 @@ void Session::resume(const std::shared_ptr<Client>& client, Version protocolVers
         for (const auto& [id, stored] : inflightMessages) {
             Message outgoing = *stored;
             outgoing.dup = true;
-            // Echo the original subscription identifier on the retransmitted
-            // PUBLISH (MQTT-3.3.2-5 applies to retransmissions too).
-            uint32_t identifier = 0;
+            // Echo the original subscription identifiers on the retransmitted
+            // PUBLISH (MQTT-3.3.4-3 applies to retransmissions too).
+            SubscriptionIdentifiers identifiers;
             auto idIt = inflightIdentifiers.find(id);
             if (idIt != inflightIdentifiers.end()) {
-                identifier = idIt->second;
+                identifiers = idIt->second;
             }
-            pendingDeliveries.emplace_back(std::move(outgoing), id, stored->qos, identifier);
+            pendingDeliveries.emplace_back(std::move(outgoing), id, stored->qos, identifiers);
         }
         // Now that the unacked inflight messages have been re-queued (still
         // occupying their window slots), promote any blocked messages that fit.
@@ -412,7 +412,7 @@ void Session::setDisconnectCallback(std::function<void()> callback) {
     onDisconnect = std::move(callback);
 }
 
-void Session::deliver(const std::string &filter, const Message &message) {
+void Session::deliver(const std::vector<std::string> &filters, const Message &message) {
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
 
     // Enforce read access on the concrete topic, never on the filter: a filter
@@ -432,32 +432,67 @@ void Session::deliver(const std::string &filter, const Message &message) {
         return;
     }
 
-    QoS qos = message.qos;
-    auto it = subscriptions.find(filter);
-    if (it != subscriptions.end() && it->second.maximumQos < qos) {
-        // The delivered QoS is the minimum of the published QoS and the granted QoS
-        qos = it->second.maximumQos;
+    // Several of this session's subscriptions can match the same message. The
+    // broker delivers one copy for all of them, so the options of every
+    // matching subscription have to be combined (MQTT-3.3.4-2/-3/-4/-5):
+    //  * the copy goes out at the highest Maximum QoS of the matching
+    //    subscriptions, not at the QoS of whichever one was found first;
+    //  * it carries the identifier of every subscription that has one, with
+    //    repeats kept because two subscriptions may share an identifier;
+    //  * No Local suppresses the copy only when every matching subscription
+    //    asked for it, since the others still want their own message;
+    //  * Retain As Published is honoured if any matching subscription asked
+    //    for it.
+    QoS maximumQos = QoS::QOS_0;
+    bool retainAsPublished = false;
+    bool anyRequestedNoLocal = false;
+    bool allRequestedNoLocal = true;
+    bool matched = false;
+    SubscriptionIdentifiers identifiers;
+    for (const auto &filter : filters) {
+        auto it = subscriptions.find(filter);
+        if (it == subscriptions.end()) {
+            // Unsubscribed between the match and the delivery: not a
+            // subscription of this session any more.
+            continue;
+        }
+        const SubscriptionOptions &options = it->second;
+        matched = true;
+        if (options.maximumQos > maximumQos) {
+            maximumQos = options.maximumQos;
+        }
+        retainAsPublished = retainAsPublished || options.retainAsPublished;
+        if (options.noLocal) {
+            anyRequestedNoLocal = true;
+        } else {
+            allRequestedNoLocal = false;
+        }
+        if (options.subscriptionIdentifier != 0) {
+            identifiers.push_back(options.subscriptionIdentifier);
+        }
     }
-
-    Message outgoing = message;
-    outgoing.dup = false;
-    if (it != subscriptions.end() && !it->second.retainAsPublished) {
-        // MQTT-3.3.1-8: when forwarding a live message the retain flag is cleared
-        // unless the subscription asked for retain-as-published
-        outgoing.retain = false;
+    if (!matched) {
+        return;
     }
-    // MQTT-3.8.2-3: a subscription with the No Local option set must not
+    // MQTT-3.8.3-3: a subscription with the No Local option set must not
     // receive messages this same client published. Compare the originator set
     // on the live fan-out path.
-    if (it != subscriptions.end() && it->second.noLocal &&
-        message.originSession == this) {
+    if (allRequestedNoLocal && anyRequestedNoLocal && message.originSession == this) {
         logDebug("session %s: skipping own message on %s (no local)",
                  clientId.c_str(), message.topic.c_str());
         return;
     }
-    const uint32_t identifier =
-        it != subscriptions.end() ? it->second.subscriptionIdentifier : 0;
-    pushDelivery(outgoing, qos, identifier);
+
+    QoS qos = message.qos < maximumQos ? message.qos : maximumQos;
+
+    Message outgoing = message;
+    outgoing.dup = false;
+    if (!retainAsPublished) {
+        // MQTT-3.3.1-8: when forwarding a live message the retain flag is cleared
+        // unless the subscription asked for retain-as-published
+        outgoing.retain = false;
+    }
+    pushDelivery(outgoing, qos, identifiers);
 }
 
 void Session::deliverRetained(const std::string &topicFilter, const SubscriptionOptions &options,
@@ -499,12 +534,17 @@ void Session::deliverRetained(const std::string &topicFilter, const Subscription
         outgoing.retain = true;
         QoS qos = message.qos < options.maximumQos ? message.qos : options.maximumQos;
         // A retained delivery caused by this subscription also carries its
-        // identifier (MQTT-3.3.2-5 covers every publish the subscription causes).
-        pushDelivery(outgoing, qos, options.subscriptionIdentifier);
+        // identifier (MQTT-3.3.4-3 covers every publish the subscription causes).
+        SubscriptionIdentifiers identifiers;
+        if (options.subscriptionIdentifier != 0) {
+            identifiers.push_back(options.subscriptionIdentifier);
+        }
+        pushDelivery(outgoing, qos, identifiers);
     }
 }
 
-void Session::pushDelivery(const Message &message, QoS qos, uint32_t subscriptionIdentifier) {
+void Session::pushDelivery(const Message &message, QoS qos,
+                           const SubscriptionIdentifiers &subscriptionIdentifiers) {
     // Bound the per-session queue: a persistent session that stays offline
     // would otherwise grow without limit. Once the cap is reached new messages
     // are dropped rather than buffered forever. Blocked messages count toward
@@ -525,23 +565,23 @@ void Session::pushDelivery(const Message &message, QoS qos, uint32_t subscriptio
         logDebug("session %s: receive maximum reached (%u), blocking message on %s",
                  clientId.c_str(), receiveMaximum, message.topic.c_str());
         blockedDeliveries.emplace_back(std::move(outgoing), /*packetId=*/0, qos,
-                                        subscriptionIdentifier);
+                                        subscriptionIdentifiers);
         return;
     }
     uint16_t id = 0;
     if (qos != QoS::QOS_0) {
         id = nextPacketId();
         inflightMessages[id] = std::make_shared<Message>(outgoing);
-        // Remember the subscription identifier so a later retransmission of this
-        // inflight message still echoes it (MQTT-3.3.2-5).
-        if (subscriptionIdentifier != 0) {
-            inflightIdentifiers[id] = subscriptionIdentifier;
+        // Remember the subscription identifiers so a later retransmission of this
+        // inflight message still echoes them (MQTT-3.3.4-3).
+        if (!subscriptionIdentifiers.empty()) {
+            inflightIdentifiers[id] = subscriptionIdentifiers;
         }
         notifyMutation();
     }
     // Only queue while the broker lock is held (Broker::publish) or while this
     // session lock is held: flush() is then called outside of both.
-    pendingDeliveries.emplace_back(std::move(outgoing), id, qos, subscriptionIdentifier);
+    pendingDeliveries.emplace_back(std::move(outgoing), id, qos, subscriptionIdentifiers);
 }
 
 void Session::releaseBlocked() {
@@ -558,12 +598,12 @@ void Session::releaseBlocked() {
         uint16_t id = nextPacketId();
         blocked.packetId = id;
         inflightMessages[id] = std::make_shared<Message>(blocked.message);
-        if (blocked.subscriptionIdentifier != 0) {
-            inflightIdentifiers[id] = blocked.subscriptionIdentifier;
+        if (!blocked.subscriptionIdentifiers.empty()) {
+            inflightIdentifiers[id] = blocked.subscriptionIdentifiers;
         }
         notifyMutation();
         pendingDeliveries.emplace_back(std::move(blocked.message), id, blocked.qos,
-                                        blocked.subscriptionIdentifier);
+                                        blocked.subscriptionIdentifiers);
     }
 }
 
@@ -593,7 +633,7 @@ void Session::flush() {
             continue;
         }
         const bool sent = target->deliver(delivery.message, delivery.packetId, delivery.qos,
-                                          delivery.subscriptionIdentifier);
+                                          delivery.subscriptionIdentifiers);
         if (!sent && delivery.qos != QoS::QOS_0) {
             // The client refused the packet (e.g. it exceeds its Maximum Packet
             // Size, MQTT-3.1.2-24). Free the packet id and inflight slot now, or

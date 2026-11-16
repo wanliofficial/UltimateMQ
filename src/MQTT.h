@@ -11,6 +11,7 @@
 #include <optional>
 #include <memory>
 #include <set>
+#include <vector>
 
 namespace MQTT {
 
@@ -149,6 +150,15 @@ using UserProperties = std::map<std::string, std::string>;
 using PropertyValue = std::variant<bool, uint8_t, uint16_t, uint32_t, std::string, UserProperties>;
 
 using Properties = std::map<PropertyID, PropertyValue>;
+
+//! The Subscription Identifiers carried by one PUBLISH packet, in the order
+//! they appeared. Unlike the other properties this one may be repeated: when a
+//! single copy of a message is published as the result of several overlapping
+//! subscriptions, the PUBLISH has to list the identifier of every one of them
+//! [MQTT-3.3.4-4], and two subscriptions that happen to share an identifier
+//! make it appear twice. A map keyed by PropertyID cannot hold that, so
+//! PUBLISH keeps the list separately.
+using SubscriptionIdentifiers = std::vector<uint32_t>;
 
 // MQTT FixedHeader
 struct FixedHeader {
@@ -290,6 +300,10 @@ struct PublishPacket : Packet {
     bool retain = false;
     uint16_t packetId;  // Only for QoS > 0
     std::vector<uint8_t> payload;
+    //! MQTT 5 Subscription Identifiers this PUBLISH was caused by, one per
+    //! matching subscription (MQTT-3.3.4-3/-4). Kept out of `properties`
+    //! because the property may repeat.
+    SubscriptionIdentifiers subscriptionIdentifiers;
     PublishPacket() : Packet(PacketType::PUBLISH) {};
     PublishPacket(const std::string& topic, const std::vector<uint8_t>& payload, QoS qos = QoS::QOS_0, bool retain = false, uint16_t packetId = 0)
         : Packet(PacketType::PUBLISH), topicName(topic), payload(payload), qos(qos), retain(retain), packetId(packetId) {}
