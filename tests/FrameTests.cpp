@@ -563,6 +563,25 @@ TEST_F(FrameTest, ParsePublishWithEmptyTopicNameIsAccepted)
     ASSERT_NE(packet.properties.find(PropertyID::TOPIC_ALIAS), packet.properties.end());
 }
 
+TEST_F(FrameTest, ParsePublishWithEmptyTopicNameAndNoAliasLeavesTopicEmpty)
+{
+    // MQTT-3.3.2-7 makes this a Protocol Error, but the decision belongs to the
+    // connection layer (it must answer DISCONNECT 0x82). The parser therefore
+    // keeps the empty topic and must not invent an alias, so the layer above can
+    // tell "empty topic, no alias" apart from "empty topic, alias present".
+    Frame v5;
+    v5.setVersion(Version::MQTT5);
+    std::vector<uint8_t> payload = {
+        0x00, 0x00,                   // Empty topic name
+        0x00,                         // No properties at all
+        'h', 'i'                      // Payload
+    };
+    FixedHeader header(0x30);
+    auto packet = v5.parsePublish(header, payload.data(), payload.size());
+    EXPECT_TRUE(packet.topicName.empty());
+    EXPECT_EQ(packet.properties.find(PropertyID::TOPIC_ALIAS), packet.properties.end());
+}
+
 TEST_F(FrameTest, SerializePubackWithFailureCodeIsTwoBytesOnMqtt311)
 {
     // MQTT 3.1.1 PUBACK is strictly packet id + 2 bytes: a non-SUCCESS reason

@@ -76,6 +76,9 @@ public:
     //! Serialize and write a packet. Returns false when nothing was written
     //! (socket gone, or the packet exceeds the client's Maximum Packet Size).
     bool sendPacket(Packet &packet);
+    //! Report a Topic Alias protocol violation with a DISCONNECT carrying \p
+    //! reason, mark the connection closed and return false (MQTT-3.3.2-7/-8).
+    bool failTopicAlias(ReasonCode reason, const std::string &detail);
     //! End the connection with a reason code (MQTT 5 only) instead of vanishing
     void closeWithReason(ReasonCode reason);
 

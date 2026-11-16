@@ -699,49 +699,61 @@ bool Connection::allowPublish() {
 }
 
 bool Connection::resolveTopicAlias(const std::shared_ptr<PublishPacket> &publish) {
-    // MQTT 3.1.1 has no properties, so no alias can be present.
+    // MQTT 3.1.1 has no properties, so no alias can be present. A PUBLISH
+    // without a topic name is a protocol violation there too (MQTT-3.3.2-1),
+    // but 3.1.1 has no reason codes: the connection is simply closed.
     if (frame.getVersion() != Version::MQTT5) {
         return true;
     }
-    auto it = publish->properties.find(PropertyID::TOPIC_ALIAS);
-    if (it == publish->properties.end()) {
-        // No alias: the topic name must be present and is routed as-is.
+    const bool emptyTopic = publish->topicName.empty();
+
+    // MQTT-3.3.2-7: "It is a Protocol Error if the Topic Name is zero length and
+    // there is no Topic Alias" -> DISCONNECT 0x82.
+    if (publish->properties.find(PropertyID::TOPIC_ALIAS) == publish->properties.end()) {
+        if (emptyTopic) {
+            return failTopicAlias(ReasonCode::PROTOCOL_ERROR,
+                                  "PUBLISH with an empty topic and no topic alias");
+        }
+        // With a topic name the packet is routed as-is.
         return true;
     }
-    if (!std::holds_alternative<uint16_t>(it->second)) {
-        return true;
-    }
-    const uint16_t alias = std::get<uint16_t>(it->second);
+    // parseProperties() guarantees a uint16_t for TOPIC_ALIAS.
+    const uint16_t alias = std::get<uint16_t>(publish->properties[PropertyID::TOPIC_ALIAS]);
 
     // MQTT-3.3.2-8: an alias of 0, or one above what we advertised in CONNACK,
-    // is a protocol error.
+    // is a protocol error reported with Topic Alias invalid (0x94).
     if (alias == 0 || alias > TOPIC_ALIAS_MAXIMUM) {
-        logDebug("client %s: invalid topic alias %u (max %u)", session->getClientId().c_str(),
-                 alias, TOPIC_ALIAS_MAXIMUM);
-        DisconnectPacket disconnect{ReasonCode::TOPIC_ALIAS_INVALID};
-        sendPacket(disconnect);
-        state = State::DISCONNECTED;
-        return false;
+        return failTopicAlias(ReasonCode::TOPIC_ALIAS_INVALID,
+                              "invalid topic alias " + std::to_string(alias) + " (max " +
+                                  std::to_string(TOPIC_ALIAS_MAXIMUM) + ")");
     }
 
-    if (!publish->topicName.empty()) {
+    if (!emptyTopic) {
         // The topic name registers (or updates) the mapping for this alias
-        // (MQTT-3.3.2-9) and the message is routed with it.
+        // (§3.3.2.3.4 step 2b/3b) and the message is routed with it.
         topicAliases[alias] = publish->topicName;
         return true;
     }
 
-    // Empty topic name: the alias must already be mapped (MQTT-3.3.2-11).
+    // Empty topic name: the alias must already be mapped. §3.3.2.3.4 step 3a:
+    // an unmapped alias with a zero length Topic Name is a Protocol Error and
+    // the receiver answers with DISCONNECT 0x82 (OASIS MQTT-474); 0x94 is
+    // reserved for an alias number that is 0 or above our advertised maximum.
     auto mapping = topicAliases.find(alias);
     if (mapping == topicAliases.end()) {
-        logDebug("client %s: unknown topic alias %u", session->getClientId().c_str(), alias);
-        DisconnectPacket disconnect{ReasonCode::TOPIC_ALIAS_INVALID};
-        sendPacket(disconnect);
-        state = State::DISCONNECTED;
-        return false;
+        return failTopicAlias(ReasonCode::PROTOCOL_ERROR,
+                              "unknown topic alias " + std::to_string(alias));
     }
     publish->topicName = mapping->second;
     return true;
+}
+
+bool Connection::failTopicAlias(ReasonCode reason, const std::string &detail) {
+    logDebug("client %s: %s", session->getClientId().c_str(), detail.c_str());
+    DisconnectPacket disconnect{reason};
+    sendPacket(disconnect);
+    state = State::DISCONNECTED;
+    return false;
 }
 
 void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
