@@ -353,6 +353,73 @@ TEST_F(FrameTest, ParseSubscribeRejectsForeignProperty)
     }
 }
 
+TEST_F(FrameTest, ParseBinaryDataFieldKeepsArbitraryBytes)
+{
+    // §1.5.6: a Binary Data field is a two-byte length followed by that many
+    // opaque bytes. It is not a UTF-8 Encoded String, so MQTT-1.5.4-1's
+    // well-formedness check must not apply and invalid UTF-8 must survive.
+    const std::vector<uint8_t> data = {0xff, 0xfe, 0x00, 0x80, 0x41};
+    std::vector<uint8_t> payload = {0x00, static_cast<uint8_t>(data.size())};
+    payload.insert(payload.end(), data.begin(), data.end());
+
+    auto parsed = frame->parseBinaryData(payload.data(), payload.size());
+
+    EXPECT_EQ(parsed.size(), data.size());
+    EXPECT_EQ(parsed, std::string(data.begin(), data.end()));
+}
+
+TEST_F(FrameTest, ParsePublishCorrelationDataWithInvalidUtf8)
+{
+    // §3.3.2.3.6: Correlation Data is Binary Data; a request id that is not
+    // valid UTF-8 must still be routed, not rejected as a malformed packet.
+    const std::vector<uint8_t> data = {0xff, 0xfe, 0x00};
+    std::vector<uint8_t> props;
+    props.push_back(0x09);  // Correlation Data
+    props.push_back(0x00);
+    props.push_back(static_cast<uint8_t>(data.size()));
+    props.insert(props.end(), data.begin(), data.end());
+    std::vector<uint8_t> payload = {0x00, 0x02, 't', 'p'};
+    appendVBI(payload, props.size());
+    payload.insert(payload.end(), props.begin(), props.end());
+    payload.insert(payload.end(), {'h', 'i'});
+
+    auto publish = frame->parsePublish(0x30, payload.data(), payload.size());
+
+    ASSERT_EQ(publish.properties.count(PropertyID::CORRELATION_DATA), 1u);
+    EXPECT_EQ(std::get<std::string>(publish.properties[PropertyID::CORRELATION_DATA]),
+              std::string(data.begin(), data.end()));
+}
+
+TEST_F(FrameTest, ParseConnectWithBinaryWillPayloadAndPassword)
+{
+    // §3.1.3.3 and §3.1.3.5: the Will Payload and the Password are Binary Data.
+    // Both must keep bytes that are not valid UTF-8.
+    const std::vector<uint8_t> binary = {0xff, 0xfe, 0x00, 0x80};
+    // §3.1.3.2-3: CONNECT payload order is properties, Client ID, then the Will.
+    std::vector<uint8_t> payload = {
+        0x00, 0x04, 'M', 'Q', 'T', 'T',  // Protocol name
+        0x05,                            // Protocol version
+        0b01000110,                      // Will flag + clean start + password flag
+        0x00, 0x3c,                      // Keep alive = 60
+        0x00,                            // (CONNECT) properties length
+        0x00, 0x03, 'c', 'i', 'd',       // Client ID
+        0x00,                            // Will properties length
+        0x00, 0x03, 'w', 't', 'p',       // Will topic
+        0x00, static_cast<uint8_t>(binary.size()),  // Will payload length
+    };
+    payload.insert(payload.end(), binary.begin(), binary.end());
+    payload.push_back(0x00);
+    payload.push_back(static_cast<uint8_t>(binary.size()));  // Password length
+    payload.insert(payload.end(), binary.begin(), binary.end());
+
+    auto packet = frame->parseConnect(payload.data(), payload.size());
+
+    ASSERT_TRUE(packet.willMsg.has_value());
+    EXPECT_EQ(*packet.willMsg, std::string(binary.begin(), binary.end()));
+    ASSERT_TRUE(packet.password.has_value());
+    EXPECT_EQ(*packet.password, std::string(binary.begin(), binary.end()));
+}
+
 TEST_F(FrameTest, ParseDisconnectRejectsForeignProperty)
 {
     // §3.14.2.2.2: DISCONNECT properties are limited to Session Expiry Interval,

@@ -104,6 +104,11 @@ public:
     std::pair<size_t, size_t> decodeRemainingLength(const uint8_t *buffer, size_t length);
     std::pair<size_t, size_t> decodeVariableByteInteger(const uint8_t *buffer, size_t length);
     std::string parseString(const uint8_t* buffer, size_t length);
+    //! Parse a Binary Data field (§1.5.6): a two-byte length then that many
+    //! opaque bytes. Unlike parseString() the payload is NOT validated as UTF-8
+    //! (MQTT-1.5.4-1 applies to UTF-8 Encoded Strings only), so a password, Will
+    //! payload, Correlation Data or Authentication Data may be arbitrary bytes.
+    std::string parseBinaryData(const uint8_t* buffer, size_t length);
     uint16_t parsePacketId(const uint8_t* buffer, size_t length);
 
     // Parse specific packet types

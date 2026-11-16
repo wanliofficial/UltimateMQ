@@ -279,6 +279,21 @@ std::string Frame::parseString(const uint8_t* buffer, size_t length) {
     return std::string(reinterpret_cast<const char*>(text), strLen);
 }
 
+std::string Frame::parseBinaryData(const uint8_t* buffer, size_t length) {
+    if (length < 2) {
+        throw std::runtime_error("Binary Data length field is truncated");
+    }
+    const uint16_t dataLength = static_cast<uint16_t>((buffer[0] << 8) | buffer[1]);
+    if (dataLength + 2 > length) {
+        throw std::runtime_error("Binary Data length is greater than the remaining data");
+    }
+    // §1.5.6: Binary Data is a sequence of bytes, so there is nothing to validate
+    // here. MQTT-1.5.4-1's well-formedness rules apply to UTF-8 Encoded Strings;
+    // applying them to Binary Data would reject perfectly valid passwords, Will
+    // payloads, Correlation Data and Authentication Data.
+    return std::string(reinterpret_cast<const char*>(buffer + 2), dataLength);
+}
+
 uint16_t Frame::parsePacketId(const uint8_t* buffer, size_t length) {
     if (length < 2) {
         throw std::runtime_error("Packet ID is not present in the data");
@@ -408,7 +423,8 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length,
                 if (offset + 2 > length) {
                     throw std::runtime_error("Invalid properties: insufficient data");  
                 }  
-                correlationData = parseString(buffer + offset, length - offset);
+                // §3.3.2.3.6: Binary Data, not a UTF-8 Encoded String.
+                correlationData = parseBinaryData(buffer + offset, length - offset);
                 properties[propertyId] = correlationData;
                 offset += correlationData.length() + 2;
                 break;
@@ -489,8 +505,9 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length,
                 if (offset + 2 > length) {
                     throw std::runtime_error("Invalid properties: insufficient data");  
                 }   
-                //TODO: parse authentication data
-                authenticationData = parseString(buffer + offset, length - offset);
+                // §3.1.2.11.10: Authentication Data is Binary Data, so it is not
+                // subject to the UTF-8 check (only the Method name is a string).
+                authenticationData = parseBinaryData(buffer + offset, length - offset);
                 properties[propertyId] = authenticationData;
                 offset += authenticationData.length() + 2;
                 break;          
@@ -664,7 +681,9 @@ ConnectPacket Frame::parseConnect(const uint8_t *buffer, size_t length) {
         offset += willTopic.length() + 2;
         
         // Parse will message
-        std::string willMessage = parseString(buffer+offset, length-offset);
+        // §3.1.3.3: the Will Payload is Binary Data, so arbitrary bytes must be
+        // accepted and delivered unchanged.
+        std::string willMessage = parseBinaryData(buffer+offset, length-offset);
         connect.willMsg = willMessage;
         offset += willMessage.length() + 2;
     }
@@ -677,7 +696,9 @@ ConnectPacket Frame::parseConnect(const uint8_t *buffer, size_t length) {
     }
 
     if(flags.password) {
-        std::string password = parseString(buffer+offset, length-offset);
+        // §3.1.3.5: the Password field is Binary Data; a digest or random token
+        // is not required to be valid UTF-8.
+        std::string password = parseBinaryData(buffer+offset, length-offset);
         connect.password = password;
         offset += password.length() + 2;
     }
