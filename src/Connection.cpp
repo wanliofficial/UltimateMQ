@@ -1024,13 +1024,17 @@ void Connection::handleUnsubscribe(std::shared_ptr<UnsubscribePacket> unsubscrib
         closeWithReason(ReasonCode::PROTOCOL_ERROR);
         return;
     }
-    for (const auto& topic : unsubscribe->topicFilters) {
-        session->unsubscribe(topic);
-    }
+    // MQTT 5 UNSUBACK (MQTT-3.11.3): one reason code per topic filter, in the
+    // order they appeared in the UNSUBSCRIBE. Success (0x00) when a subscription
+    // existed and was removed, No Subscription Existed (0x11) otherwise. MQTT
+    // 3.1.1 answers with a bare packet identifier and no payload.
     UnsubackPacket unsuback{unsubscribe->packetId};
-    if (frame.getVersion() != Version::MQTT5) {
-        // MQTT 3.1.1 has no reason codes in UNSUBACK
-        unsuback.reasonCodes.clear();
+    for (const auto& topic : unsubscribe->topicFilters) {
+        const bool removed = session->unsubscribe(topic);
+        if (frame.getVersion() == Version::MQTT5) {
+            unsuback.reasonCodes.push_back(
+                removed ? ReasonCode::SUCCESS : ReasonCode::NO_SUBSCRIPTION_EXISTED);
+        }
     }
     sendPacket(unsuback);
 }

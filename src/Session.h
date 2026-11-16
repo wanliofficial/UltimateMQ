@@ -76,7 +76,10 @@ public:
     //! error.
     ReasonCode publish(uint16_t packetId, const Message& message, bool duplicate = false);
     void subscribe(const std::string& topic, const SubscriptionOptions& options);
-    void unsubscribe(const std::string& topic);
+    //! Remove a subscription. Returns true when one actually existed and was
+    //! removed, false when there was none (MQTT 5 UNSUBACK reports the two cases
+    //! with Success and No Subscription Existed respectively, MQTT-3.11.3).
+    bool unsubscribe(const std::string& topic);
     void puback(uint16_t packetId);
     ReasonCode pubrec(uint16_t packetId);
     ReasonCode pubrel(uint16_t packetId);

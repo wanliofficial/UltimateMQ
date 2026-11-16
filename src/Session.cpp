@@ -327,11 +327,13 @@ size_t Session::getSharedSubscriptionCount() {
     return count;
 }
 
-void Session::unsubscribe(const std::string &topicFilter) {
+bool Session::unsubscribe(const std::string &topicFilter) {
+    bool removed = false;
     {
         std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
         if (subscriptions.erase(topicFilter) > 0) {
             notifyMutation();
+            removed = true;
         }
     }
     if (Topic::isShared(topicFilter)) {
@@ -340,6 +342,9 @@ void Session::unsubscribe(const std::string &topicFilter) {
     } else {
         broker->unsubscribe(clientId, topicFilter);
     }
+    // The caller reports Success or No Subscription Existed in the MQTT 5
+    // UNSUBACK (MQTT-3.11.3), so it needs to know whether one was removed.
+    return removed;
 }
 
 void Session::bindClient(const std::shared_ptr<Client>& client) {

@@ -495,6 +495,21 @@ TEST_F(SessionLifecycleTest, SubscriptionCountAndLookupTrackFilters)
     EXPECT_FALSE(session->hasSubscription("c/a"));
 }
 
+TEST_F(SessionLifecycleTest, UnsubscribeReportsWhetherASubscriptionExisted)
+{
+    auto session = std::make_shared<Session>(&broker, "uq");
+    session->connect(session, /*persistent=*/false);
+    session->subscribe("u/a", optionsFor());
+
+    // An existing filter is removed and reports true (UNSUBACK Success)
+    EXPECT_TRUE(session->unsubscribe("u/a"));
+    // Removing it a second time removes nothing and reports false
+    // (UNSUBACK No Subscription Existed, MQTT-3.11.3)
+    EXPECT_FALSE(session->unsubscribe("u/a"));
+    // A filter that was never subscribed also reports false
+    EXPECT_FALSE(session->unsubscribe("u/never"));
+}
+
 TEST_F(SessionLifecycleTest, SubscriptionLimitDefaultsAndAppliesFromBroker)
 {
     // A fresh session starts with the documented default limit
