@@ -164,13 +164,21 @@ void Connection::armKeepAliveTimer() {
 }
 
 void Connection::runReadLoop() {
+    //! The keep alive just expired: the Network Connection is closed but the
+    //! Will still has to go out (MQTT-3.1.2-8 treats it as an abnormal end), so
+    //! the reason travels back to run() instead of closing here.
+    bool keepAliveExpired = false;
     while (state != State::DISCONNECTED) {
         if (readTimeout.count() > 0) {
             auto deadline = lastActivity + readTimeout;
             auto now = std::chrono::steady_clock::now();
             if (now >= deadline) {
                 logDebug("keep alive expired, closing connection");
-                return;
+                // Only a connected client has a Keep Alive to violate: before
+                // CONNECT this same timer is the CONNECT timeout, which just
+                // drops a silent peer without inventing a reason code.
+                keepAliveExpired = state == State::CONNECTED;
+                break;
             }
             int timeout = static_cast<int>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
@@ -203,6 +211,17 @@ void Connection::runReadLoop() {
                 handleIncoming(packet);
             }
         }
+    }
+    if (keepAliveExpired) {
+        // MQTT-3.1.2-24: the server must close the connection after 1.5 times
+        // the Keep Alive. §3.11.3 defines 0x8D (KEEP_ALIVE_TIMEOUT) for exactly
+        // this case, and an MQTT 5 client that gets no DISCONNECT cannot tell a
+        // timeout from a network fault.
+        closeWithReason(ReasonCode::KEEP_ALIVE_TIMEOUT);
+        // The Will is left pending exactly as for any abnormal close: MQTT-3.1.2-8
+        // only deletes it on a normal DISCONNECT, which never arrived here. When a
+        // DISCONNECT was already handled, willPending is false already and the
+        // loop above exits on the DISCONNECTED state rather than this timeout.
     }
 }
 
