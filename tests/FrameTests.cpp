@@ -1097,7 +1097,10 @@ TEST_F(FrameTest, RejectsAPropertyAppearingTwice)
 
 TEST_F(FrameTest, AllowsRepeatedUserProperties)
 {
-    // User Property is the one property that may appear many times.
+    // User Property is the one property that may appear many times, and the
+    // Server must forward every pair, in order, when it relays a PUBLISH
+    // (MQTT-3.3.2-17 / MQTT-3.3.2-18). A repeated name is therefore two pairs,
+    // not one overwritten value.
     Frame mqtt5(Version::MQTT5);
     std::vector<uint8_t> section = {
         0x0E,                                  // property length
@@ -1106,8 +1109,13 @@ TEST_F(FrameTest, AllowsRepeatedUserProperties)
     };
     auto parsed = mqtt5.parseProperties(section.data(), section.size()).first;
     const auto &pairs = std::get<UserProperties>(parsed.at(PropertyID::USER_PROPERTY));
-    EXPECT_EQ(pairs.size(), 1u);
-    EXPECT_EQ(pairs.at("k"), "w");  // a repeated key keeps the last value
+    ASSERT_EQ(pairs.size(), 2u) << "a repeated name must not collapse the second pair";
+    auto it = pairs.begin();
+    EXPECT_EQ(it->first, "k");
+    EXPECT_EQ(it->second, "v");
+    ++it;
+    EXPECT_EQ(it->first, "k");
+    EXPECT_EQ(it->second, "w");
 }
 
 TEST_F(FrameTest, RejectsABooleanPropertyThatIsNeitherZeroNorOne)

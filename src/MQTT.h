@@ -11,6 +11,8 @@
 #include <optional>
 #include <memory>
 #include <set>
+#include <initializer_list>
+#include <stdexcept>
 #include <vector>
 
 namespace MQTT {
@@ -145,7 +147,41 @@ enum class PropertyID : uint8_t {
     SHARED_SUBSCRIPTION_AVAILABLE = 0x2A
 };
 
-using UserProperties = std::map<std::string, std::string>;
+//! MQTT 5 User Property: a UTF-8 string pair. The protocol lets the same name
+//! appear several times and requires the Server to forward *every* pair, in the
+//! order it received them, when relaying a PUBLISH (MQTT-3.3.2-17 / -18). A map
+//! keyed by name cannot represent that: it would merge repeated names and sort
+//! the rest into key order. This keeps the pairs in arrival order instead, and
+//! still offers at() for the common "look up one value" case.
+struct UserProperties {
+    using Pair = std::pair<std::string, std::string>;
+    std::vector<Pair> pairs;
+
+    UserProperties() = default;
+    UserProperties(std::initializer_list<Pair> init) : pairs(init) {}
+
+    auto begin() { return pairs.begin(); }
+    auto end() { return pairs.end(); }
+    auto begin() const { return pairs.begin(); }
+    auto end() const { return pairs.end(); }
+    size_t size() const { return pairs.size(); }
+    bool empty() const { return pairs.empty(); }
+    void emplace_back(const std::string &key, const std::string &value) {
+        pairs.emplace_back(key, value);
+    }
+    void push_back(const Pair &pair) { pairs.push_back(pair); }
+    //! The value of the first pair stored under \p key. Duplicates are legal, so
+    //! callers that just want "the" value get the earliest one. Throws like the
+    //! std::map accessor this replaces when no such name is present.
+    const std::string &at(const std::string &key) const {
+        for (const auto &pair : pairs) {
+            if (pair.first == key) {
+                return pair.second;
+            }
+        }
+        throw std::out_of_range("no such User Property: " + key);
+    }
+};
 
 using PropertyValue = std::variant<bool, uint8_t, uint16_t, uint32_t, std::string, UserProperties>;
 

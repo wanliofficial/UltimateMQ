@@ -606,6 +606,38 @@ TEST_F(BrokerTest, LiveDeliveryForwardsApplicationProperties)
     EXPECT_EQ(pairs.at("trace"), "abc");
 }
 
+TEST_F(BrokerTest, ForwardingKeepsEveryUserPropertyInOrder)
+{
+    // MQTT-3.3.2-17: the Server must forward *all* User Properties unaltered, and
+    // MQTT-3.3.2-18: it must keep their order. Repeated names are legal, so a
+    // broker that models them as a map loses pairs and reorders the rest.
+    auto session = std::make_shared<MQTT::Session>(broker, "up-sub");
+    MQTT::SubscriptionOptions options{MQTT::QoS::QOS_0, false, false,
+                                      MQTT::RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES};
+    auto client = MQTT::test::attach(*session);
+    session->connect(session);
+    session->subscribe("up/#", options);
+
+    MQTT::Message message("up/x", "hi");
+    message.properties[MQTT::PropertyID::USER_PROPERTY] = MQTT::UserProperties{
+        {"z", "1"}, {"a", "2"}, {"z", "3"}};
+    broker->publish(message);
+
+    ASSERT_EQ(client->size(), 1u);
+    const auto &pairs =
+        std::get<MQTT::UserProperties>(client->delivered[0].properties.at(
+            MQTT::PropertyID::USER_PROPERTY));
+    ASSERT_EQ(pairs.size(), 3u)
+        << "both copies of the repeated name must survive the forwarding";
+    std::vector<std::pair<std::string, std::string>> got;
+    for (const auto &pair : pairs) {
+        got.emplace_back(pair.first, pair.second);
+    }
+    const std::vector<std::pair<std::string, std::string>> expected{
+        {"z", "1"}, {"a", "2"}, {"z", "3"}};
+    EXPECT_EQ(got, expected) << "User Properties arrived reordered or merged";
+}
+
 TEST_F(BrokerTest, ASubscriptionWithoutAnIdentifierDeliversNone)
 {
     auto session = std::make_shared<MQTT::Session>(broker, "plain-sub");

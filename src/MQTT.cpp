@@ -21,10 +21,11 @@ std::optional<std::string> Packet::getUserProperty(const std::string &key)
 {
     auto it = properties.find(PropertyID::USER_PROPERTY);
     if (it != properties.end()) {
-        auto userProperties = std::get<UserProperties>(it->second);
-        auto userPropertyIt = userProperties.find(key);
-        if (userPropertyIt != userProperties.end()) {
-            return userPropertyIt->second;
+        const auto &userProperties = std::get<UserProperties>(it->second);
+        for (const auto &pair : userProperties) {
+            if (pair.first == key) {
+                return pair.second;
+            }
         }
     }
     return std::nullopt;
@@ -35,7 +36,7 @@ void Packet::setUserProperty(const std::string &key, const std::string &value)
     if (properties.find(PropertyID::USER_PROPERTY) == properties.end()) {
         properties[PropertyID::USER_PROPERTY] = UserProperties();
     }
-    std::get<UserProperties>(properties[PropertyID::USER_PROPERTY])[key] = value;
+    std::get<UserProperties>(properties[PropertyID::USER_PROPERTY]).emplace_back(key, value);
 }
 
 }

@@ -195,7 +195,7 @@ bool decodeMessageProperties(const std::string &encoded, Properties &out) {
                 std::string key, value;
                 if (!fromHex(pair.substr(0, equals), key)) return false;
                 if (!fromHex(pair.substr(equals + 1), value)) return false;
-                pairs[key] = value;
+                pairs.emplace_back(key, value);
             }
             out[static_cast<PropertyID>(id)] = pairs;
             break;

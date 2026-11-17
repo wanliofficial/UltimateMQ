@@ -397,7 +397,8 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length,
                     if (properties.find(propertyId) == properties.end()) {
                         properties[propertyId] = UserProperties();
                     }
-                    std::get<UserProperties>(properties[propertyId])[key] = value;
+                    // MQTT-3.3.2-17/-18: keep every pair, in arrival order.
+                    std::get<UserProperties>(properties[propertyId]).emplace_back(key, value);
                 }
                 break;
             case PropertyID::MESSAGE_EXPIRY_INTERVAL:
