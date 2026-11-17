@@ -34,6 +34,14 @@ std::vector<std::string> Trie::match(const std::string &topic)
             if (node->topicFilter.has_value()) {
                 matches.push_back(node->topicFilter.value());
             }
+            // MQTT-4.7.1-2: the multi-level wildcard "represents the parent and
+            // any number of child levels", so "sport/#" also matches "sport".
+            // The '#' node hangs one level below the node the whole topic
+            // reached, so the wildcard has to be checked here as well.
+            auto hash = node->children.find("#");
+            if (hash != node->children.end() && hash->second->topicFilter.has_value()) {
+                matches.push_back(hash->second->topicFilter.value());
+            }
             return;
         }
 

@@ -12,6 +12,18 @@ TEST(TopicTest, Split)
     EXPECT_EQ(result, expected);
 }
 
+TEST(TopicTest, SplitKeepsEmptyLevels)
+{
+    // MQTT-4.7.1-1: adjacent separators are a zero-length level, and so is the
+    // level after a trailing separator. Dropping it made "sport/" match like
+    // "sport" (MQTT-4.7.1-2).
+    EXPECT_EQ(Topic::split("a//b"), (std::vector<std::string>{"a", "", "b"}));
+    EXPECT_EQ(Topic::split("/a"), (std::vector<std::string>{"", "a"}));
+    EXPECT_EQ(Topic::split("sport/"), (std::vector<std::string>{"sport", ""}));
+    EXPECT_EQ(Topic::split("/"), (std::vector<std::string>{"", ""}));
+    EXPECT_TRUE(Topic::split("").empty());
+}
+
 TEST(TopicTest, Join)
 {
     std::vector<std::string> topicLevels = {"x", "y", "z"};
@@ -80,6 +92,27 @@ TEST(TopicTest, Match)
     EXPECT_TRUE(Topic::match("a/b/c", "a/+/c"));
     EXPECT_TRUE(Topic::match("a/b/c/d", "a/#"));
     EXPECT_FALSE(Topic::match("a/b/c", "x/+/c"));
+}
+
+TEST(TopicTest, MultiLevelWildcardMatchesTheParentLevel)
+{
+    // MQTT-4.7.1-2: '#' "represents the parent and any number of child levels",
+    // so "sport/#" also matches "sport" (the spec spells this example out).
+    EXPECT_TRUE(Topic::match("sport/tennis/player1", "sport/tennis/player1/#"));
+    EXPECT_TRUE(Topic::match("sport/tennis/player1/ranking", "sport/tennis/player1/#"));
+    EXPECT_TRUE(Topic::match("sport/tennis/player1/score/wimbledon", "sport/tennis/player1/#"));
+    EXPECT_TRUE(Topic::match("sport", "sport/#"));
+    EXPECT_TRUE(Topic::match("sport/tennis", "sport/#"));
+    EXPECT_FALSE(Topic::match("sports", "sport/#"));
+}
+
+TEST(TopicTest, SingleLevelWildcardAndTrailingEmptyLevels)
+{
+    // "sport/+" matches "sport/" but not "sport" (MQTT-4.7.1-3): "sport/" has
+    // two levels, the second one empty.
+    EXPECT_TRUE(Topic::match("sport/tennis", "sport/+"));
+    EXPECT_TRUE(Topic::match("sport/", "sport/+"));
+    EXPECT_FALSE(Topic::match("sport", "sport/+"));
 }
 
 TEST(TopicTest, WildcardsDoNotMatchDollarTopics)

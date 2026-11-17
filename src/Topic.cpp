@@ -6,14 +6,24 @@ namespace MQTT {
 // Split an MQTT topic into a vector of topic levels
 std::vector<std::string> Topic::split(const std::string &topic) {
     std::vector<std::string> result;
-    std::string level;
-    std::istringstream topicStream(topic);
-
-    while (std::getline(topicStream, level, '/')) {
-        result.push_back(level);
+    if (topic.empty()) {
+        return result;
     }
-
-    return result;
+    // MQTT-4.7.1-1: adjacent separators are a zero-length level, and a trailing
+    // separator produces one too ("sport/" is the levels "sport" and ""). A
+    // getline-based split silently dropped that trailing empty level, which made
+    // "sport/" indistinguishable from "sport" when matching filters: "sport/+"
+    // failed to match the two-level topic "sport/".
+    size_t start = 0;
+    while (true) {
+        const size_t slash = topic.find('/', start);
+        if (slash == std::string::npos) {
+            result.push_back(topic.substr(start));
+            return result;
+        }
+        result.push_back(topic.substr(start, slash - start));
+        start = slash + 1;
+    }
 }
 
 // Join a vector of topic levels into a single MQTT topic

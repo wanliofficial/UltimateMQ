@@ -68,4 +68,30 @@ TEST_F(TrieTest, WildcardsDoNotMatchDollarTopics) {
     EXPECT_NE(std::find(matches.begin(), matches.end(), "+/state"), matches.end());
 }
 
+TEST_F(TrieTest, MultiLevelWildcardMatchesTheParentLevel) {
+    // MQTT-4.7.1-2: the routing table must deliver "sport" to a subscriber of
+    // "sport/#" as well, since '#' includes the parent level.
+    trie.insert("sport/#");
+
+    auto matches = trie.match("sport");
+    ASSERT_EQ(matches.size(), 1u);
+    EXPECT_EQ(matches[0], "sport/#");
+
+    matches = trie.match("sport/tennis");
+    ASSERT_EQ(matches.size(), 1u);
+    EXPECT_EQ(matches[0], "sport/#");
+}
+
+TEST_F(TrieTest, SingleLevelWildcardMatchesATrailingEmptyLevel) {
+    // "sport/" is the two levels "sport" and "", so "sport/+" matches it while
+    // "sport" itself is one level and must not match.
+    trie.insert("sport/+");
+
+    auto matches = trie.match("sport/");
+    ASSERT_EQ(matches.size(), 1u);
+    EXPECT_EQ(matches[0], "sport/+");
+
+    EXPECT_TRUE(trie.match("sport").empty());
+}
+
 // Add more tests as needed
