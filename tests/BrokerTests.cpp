@@ -228,6 +228,37 @@ TEST_F(BrokerTest, CancelWillPreventsPublication){
     EXPECT_EQ(subClient->size(), 0u) << "a cancelled Will must never be published";
 }
 
+TEST_F(BrokerTest, WillDelayIsCutShortBySessionExpiry)
+{
+    // MQTT-3.1.2-8 / MQTT-3.1.3-9: the Will goes out when the Will Delay Interval
+    // elapses OR the Session ends, whichever comes first. When the sweeper
+    // discards an expired session, a still-pending Will for that client must be
+    // released even if its Will Delay has not elapsed yet.
+    auto sub = std::make_shared<MQTT::Session>(broker, "ws-sub");
+    sub->connect(sub, /*persistent=*/true);
+    sub->subscribe("ws/#", MQTT::SubscriptionOptions{MQTT::QoS::QOS_0, false, false,
+                                                      MQTT::RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES});
+    auto subClient = MQTT::test::attach(*sub);
+
+    auto willer = std::make_shared<MQTT::Session>(broker, "ws-will");
+    willer->connect(willer, /*persistent=*/true);
+    willer->armExpiry(std::chrono::seconds(1));
+
+    broker->armWill("ws-will", MQTT::Message("ws/goodbye", "bye"), MQTT::QoS::QOS_0, false,
+                    /*delaySeconds=*/300);
+    // The session is still alive and connected, and the delay has not elapsed:
+    // the Will must not fire.
+    broker->sweepExpiredSessions();
+    EXPECT_EQ(subClient->size(), 0u) << "the Will fired before anything ended it";
+
+    // Let the connection drop and the session expire. The sweeper discards the
+    // session and must cap the pending Will's deadline so it is published.
+    willer->close(nullptr);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    broker->sweepExpiredSessions();
+    EXPECT_EQ(subClient->size(), 1u) << "the Will was not published when the Session ended";
+}
+
 namespace {
 //! A connected session holding a shared subscription, with a recording client
 struct SharedMember {

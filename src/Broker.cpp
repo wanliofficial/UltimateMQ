@@ -138,16 +138,26 @@ void Broker::sweepExpiredSessions() {
             auto &session = it->second;
             if (session && !session->isConnected() && session->isExpired(now)) {
                 victims.push_back(session);
+                // MQTT-3.1.2-8 / MQTT-3.1.3-9: the Session ends when its state
+                // is destroyed, so the Will goes out now even if the Will Delay
+                // Interval has not elapsed. Cap the pending Will's deadline to
+                // the present so publishDueWills() (called below) releases it
+                // instead of leaving it parked for the rest of the delay.
+                auto willIt = pendingWills.find(it->first);
+                if (willIt != pendingWills.end()) {
+                    willIt->second.deadline = now;
+                    notifyStateChanged();
+                }
                 it = sessions.erase(it);
             } else {
                 ++it;
             }
         }
     }
-    // Publish any delayed Wills whose Will Delay Interval has elapsed. Done
-    // outside the lock (publish() takes it) and independently of the session
-    // sweep, so a delayed Will fires even for a non-persistent session that was
-    // torn down at disconnect.
+    // Publish any delayed Wills whose Will Delay Interval has elapsed (or whose
+    // session was just discarded above). Done outside the lock (publish() takes
+    // it) and independently of the session sweep, so a delayed Will fires even
+    // for a non-persistent session that was torn down at disconnect.
     publishDueWills();
     // Refresh the $SYS/broker monitoring messages with the current counters.
     // A no-op unless FLOWMQ_SYS_TOPICS is set.

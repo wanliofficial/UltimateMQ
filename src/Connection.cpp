@@ -104,7 +104,15 @@ void Connection::run() {
 
     // An abnormal termination publishes the Will message.
     if (willPending) {
-        if (willDelay > 0 && session) {
+        // MQTT-3.1.2-8 / MQTT-3.1.3-9: releasing a Will is triggered by the
+        // Will Delay Interval elapsing *or* the Session ending, whichever comes
+        // first. The Session ends here - the moment its state is destroyed, which
+        // happens only for a non-persistent session (Session Expiry Interval 0,
+        // or MQTT 3.1.1 Clean Session 1). A persistent session merely goes
+        // dormant: its Will Delay runs in full, and when it *does* end (the
+        // sweeper discarding it at the Session Expiry) the Will goes out then.
+        const bool persistentSession = session->isPersistent();
+        if (willDelay > 0 && session && persistentSession) {
             // MQTT-3.1.3.2: the Will Delay Interval is measured from the moment
             // this Network Connection closes, so arm the Will on the broker now
             // (at disconnect). The sweeper publishes it once the delay elapses,
