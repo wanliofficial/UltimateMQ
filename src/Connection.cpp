@@ -305,6 +305,26 @@ void Connection::armWillExpiry(Message &will) const {
 }
 
 void Connection::handleIncoming(std::shared_ptr<Packet> packet) {
+    // MQTT-3.1.0-1: the first packet from a client MUST be a CONNECT, and
+    // MQTT-3.1.0-2 forbids a second one on the same Network Connection. Only
+    // CONNECT itself is dispatched while no session exists; everything else is
+    // refused here, before any handler can answer it. Previously a PINGREQ
+    // sent before the CONNECT was answered with a PINGRESP, which amounts to
+    // completing a protocol exchange none of the two packets is allowed to
+    // take part in.
+    if (packet->type != PacketType::CONNECT && !session && state != State::CONNECTED) {
+        logInfo("refusing packet type %d before CONNECT (MQTT-3.1.0-1)",
+                static_cast<int>(packet->type));
+        // No CONNACK here: it is the answer to a CONNECT, and no CONNECT was
+        // accepted. §4.13: a DISCONNECT may only follow in a session, so the
+        // Network Connection is simply closed as MQTT-3.1.0-1 requires.
+        if (state == State::CONNECTED) {
+            closeWithReason(ReasonCode::PROTOCOL_ERROR);
+        } else {
+            state = State::DISCONNECTED;
+        }
+        return;
+    }
     switch (packet->type) {
     case PacketType::CONNECT:
         handleConnect(std::static_pointer_cast<ConnectPacket>(packet));

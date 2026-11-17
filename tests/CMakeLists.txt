@@ -11,6 +11,7 @@ set(TEST_SOURCES
     FrameTests.cpp
     FrameStreamTests.cpp
     SessionLifecycleTests.cpp
+    ConnectionStateTests.cpp
     AuthTests.cpp
     StoreTests.cpp
     TLSTests.cpp

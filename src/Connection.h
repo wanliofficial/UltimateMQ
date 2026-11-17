@@ -57,6 +57,14 @@ public:
     void handleUnsubscribe(std::shared_ptr<UnsubscribePacket> packet);
     void handlePingreq(std::shared_ptr<PingreqPacket> packet);
     void handlePingresp(std::shared_ptr<PingrespPacket> packet);
+
+    //! Stop the loop and tear the socket down. Used by tests that drive the
+    //! packet handlers directly: closing the socket unblocks a read loop left
+    //! waiting on it, so the object can be destroyed without a dangling thread.
+    void detach() {
+        state = State::DISCONNECTED;
+        closeSocket();
+    }
     void handleDisconnect(std::shared_ptr<DisconnectPacket> packet);
     void handleAuth(std::shared_ptr<AuthPacket> packet);
 
