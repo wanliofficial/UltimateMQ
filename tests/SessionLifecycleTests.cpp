@@ -399,6 +399,49 @@ TEST_F(SessionLifecycleTest, PubrecWithoutOutstandingDeliveryReportsNotFound)
     EXPECT_EQ(session->pubrec(77), ReasonCode::PACKET_IDENTIFIER_NOT_FOUND);
 }
 
+TEST_F(SessionLifecycleTest, PubrecRejectionEndsTheFlowWithoutPubrel)
+{
+    // A PUBREC with a Reason Code of 0x80 or greater means the client refused the
+    // message. MQTT-4.3.3 only lets a sender answer a PUBREC below 0x80 with a
+    // PUBREL, and MQTT-4.4.0-2 says such a rejection acknowledges the PUBLISH,
+    // which must never be retransmitted. The identifier is reusable at once.
+    auto session = std::make_shared<Session>(&broker, "q2reject");
+    session->connect(session, /*persistent=*/true);
+    auto client = test::attach(*session);
+    session->subscribe("rej/q", optionsFor(QoS::QOS_2));
+
+    broker.publish(Message("rej/q", "hello", QoS::QOS_2));
+    ASSERT_EQ(client->size(), 1u);
+    const uint16_t packetId = client->packetIds[0];
+
+    const auto reason = session->pubrec(packetId, ReasonCode::QUOTA_EXCEEDED);
+    EXPECT_FALSE(reason.has_value())
+        << "a rejecting PUBREC must not be answered with a PUBREL";
+
+    // Nothing is left to retransmit on reconnect: no PUBREL, no PUBLISH.
+    auto second = std::make_shared<RecordingClient>();
+    session->resume(second, Version::MQTT5);
+    session->flush();
+    EXPECT_TRUE(second->resentPubrels.empty())
+        << "a rejected PUBLISH was remembered for a PUBREL retransmission";
+    EXPECT_EQ(second->size(), 0u)
+        << "a rejected PUBLISH must not be retransmitted";
+}
+
+TEST_F(SessionLifecycleTest, PubrecAcceptanceStillSendsAPubrel)
+{
+    auto session = std::make_shared<Session>(&broker, "q2accept");
+    session->connect(session, /*persistent=*/false);
+    auto client = test::attach(*session);
+    session->subscribe("acc/q", optionsFor(QoS::QOS_2));
+
+    broker.publish(Message("acc/q", "hello", QoS::QOS_2));
+    ASSERT_EQ(client->size(), 1u);
+    const auto reason = session->pubrec(client->packetIds[0]);
+    ASSERT_TRUE(reason.has_value());
+    EXPECT_EQ(*reason, ReasonCode::SUCCESS);
+}
+
 TEST_F(SessionLifecycleTest, ResumeResendsEveryPendingInboundQos2Pubrec)
 {
     auto session = std::make_shared<Session>(&broker, "q2multi");

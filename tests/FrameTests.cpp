@@ -808,6 +808,46 @@ TEST_F(FrameTest, ParsePubackWithOnlyPacketIdDoesNotThrow)
     EXPECT_EQ(packet.reasonCode, ReasonCode::SUCCESS);
 }
 
+TEST_F(FrameTest, ParsesAckVariableHeaderInSpecOrder)
+{
+    // MQTT-3.4.2 / 3.5.2 / 3.6.2 / 3.7.2: the variable header is the Packet
+    // Identifier, then the Reason Code, and only then the Property Length.
+    // Parsing the property section first turns a non-zero Reason Code into a
+    // property length (0x91 would claim 145 property bytes) and rejects a legal
+    // packet as malformed.
+    Frame v5(Version::MQTT5);
+
+    std::vector<uint8_t> puback = {0x00, 0x07, 0x91, 0x00};
+    auto a = v5.parsePuback(puback.data(), puback.size());
+    EXPECT_EQ(a.packetId, 7);
+    EXPECT_EQ(a.reasonCode, ReasonCode::PACKET_IDENTIFIER_IN_USE);
+
+    std::vector<uint8_t> pubrec = {0x00, 0x08, 0x92, 0x00};
+    auto r = v5.parsePubrec(pubrec.data(), pubrec.size());
+    EXPECT_EQ(r.packetId, 8);
+    EXPECT_EQ(r.reasonCode, ReasonCode::PACKET_IDENTIFIER_NOT_FOUND);
+
+    std::vector<uint8_t> pubrel = {0x00, 0x09, 0x92, 0x00};
+    auto rel = v5.parsePubrel(pubrel.data(), pubrel.size());
+    EXPECT_EQ(rel.packetId, 9);
+    EXPECT_EQ(rel.reasonCode, ReasonCode::PACKET_IDENTIFIER_NOT_FOUND);
+
+    std::vector<uint8_t> pubcomp = {0x00, 0x0A, 0x00, 0x00};
+    auto comp = v5.parsePubcomp(pubcomp.data(), pubcomp.size());
+    EXPECT_EQ(comp.packetId, 10);
+    EXPECT_EQ(comp.reasonCode, ReasonCode::SUCCESS);
+}
+
+TEST_F(FrameTest, ParsesAckReasonCodeWithoutPropertyLength)
+{
+    // A Remaining Length of 3 carries the Reason Code but no Property Length.
+    Frame v5(Version::MQTT5);
+    std::vector<uint8_t> payload = {0x00, 0x07, 0x10};
+    auto packet = v5.parsePuback(payload.data(), payload.size());
+    EXPECT_EQ(packet.packetId, 7);
+    EXPECT_EQ(packet.reasonCode, ReasonCode::NO_MATCHING_SUBSCRIBERS);
+}
+
 TEST_F(FrameTest, ParseStringThrowsOnTruncatedLength)
 {
     std::vector<uint8_t> payload = {0x00};

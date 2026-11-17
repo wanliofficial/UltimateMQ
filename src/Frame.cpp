@@ -760,109 +760,54 @@ PublishPacket Frame::parsePublish(const FixedHeader &header, const uint8_t *buff
     return publish;
 }
 
+void Frame::parseAckReasonAndProperties(const uint8_t *buffer, size_t length, size_t offset,
+                                         PropertyContext context, ReasonCode &reasonCode,
+                                         Properties &properties) {
+    // MQTT-3.4.2 / 3.5.2 / 3.6.2 / 3.7.2: the Reason Code follows the Packet
+    // Identifier, and the Property Length follows the Reason Code.
+    if (offset >= length) {
+        return; // Remaining Length 2: neither field is present (Reason Code 0x00)
+    }
+    reasonCode = static_cast<ReasonCode>(buffer[offset]);
+    offset += 1;
+    if (offset >= length) {
+        return; // Remaining Length 3: Reason Code only, no Property Length
+    }
+    if (version != Version::MQTT5) {
+        return; // MQTT 3.1.1 has no property section at all
+    }
+    properties = parseProperties(buffer + offset, length - offset, nullptr, context).first;
+}
+
 PubackPacket Frame::parsePuback(const uint8_t *buffer, size_t length) {
     auto puback = PubackPacket();
-    size_t offset = 0;
-    // Parse packet identifier
     puback.packetId = parsePacketId(buffer, length);
-    offset += 2;
-
-    // A packet with only a packet identifier carries neither properties nor a reason code
-    if (offset >= length) {
-        return puback;
-    }
-
-    // Parse properties
-    if(version == Version::MQTT5) {
-        auto [properties, propLength] = parseProperties(buffer+offset, length - offset, nullptr,
-                                                        PropertyContext::PUBACK);
-        puback.properties = properties;
-        offset += propLength;
-    }
-        
-    // Parse reason code (only present when there is data left after the properties)
-    if (offset < length) {
-        puback.reasonCode = static_cast<ReasonCode>(buffer[offset]);
-    }  
-
+    parseAckReasonAndProperties(buffer, length, /*offset=*/2, PropertyContext::PUBACK,
+                                puback.reasonCode, puback.properties);
     return puback;
 }
 
 PubrecPacket Frame::parsePubrec(const uint8_t *buffer, size_t length) {
     auto pubrec = PubrecPacket();
-    size_t offset = 0;
-    // Parse packet identifier      
     pubrec.packetId = parsePacketId(buffer, length);
-    offset += 2;
-
-    // A packet with only a packet identifier carries neither properties nor a reason code
-    if (offset >= length) {
-        return pubrec;
-    }
-    // Parse properties
-    if(version == Version::MQTT5) {
-        auto [properties, propLength] = parseProperties(buffer+offset, length - offset, nullptr,
-                                                        PropertyContext::PUBREC);
-        pubrec.properties = properties;
-        offset += propLength;
-    }
-    // Parse reason code (only present when there is data left after the properties)
-    if (offset < length) {
-        pubrec.reasonCode = static_cast<ReasonCode>(buffer[offset]);
-    }
+    parseAckReasonAndProperties(buffer, length, /*offset=*/2, PropertyContext::PUBREC,
+                                pubrec.reasonCode, pubrec.properties);
     return pubrec;
 }
 
 PubrelPacket Frame::parsePubrel(const uint8_t *buffer, size_t length) {
     auto pubrel = PubrelPacket();
-    size_t offset = 0;
-    // Parse packet identifier
     pubrel.packetId = parsePacketId(buffer, length);
-    offset += 2;
-
-    // A packet with only a packet identifier carries neither properties nor a reason code
-    if (offset >= length) {
-        return pubrel;
-    }
-    // Parse properties
-    if(version == Version::MQTT5) {
-        auto [properties, propLength] = parseProperties(buffer+offset, length - offset, nullptr,
-                                                        PropertyContext::PUBREL);
-        pubrel.properties = properties;
-        offset += propLength;
-    }
-    // Parse reason code (only present when there is data left after the properties)
-    if (offset < length) {
-        pubrel.reasonCode = static_cast<ReasonCode>(buffer[offset]);
-    }   
+    parseAckReasonAndProperties(buffer, length, /*offset=*/2, PropertyContext::PUBREL,
+                                pubrel.reasonCode, pubrel.properties);
     return pubrel;
 }
 
 PubcompPacket Frame::parsePubcomp(const uint8_t *buffer, size_t length) {
     auto pubcomp = PubcompPacket();
-    size_t offset = 0;
-    // Parse packet identifier  
     pubcomp.packetId = parsePacketId(buffer, length);
-    offset += 2;
-
-    // A packet with only a packet identifier carries neither properties nor a reason code
-    if (offset >= length) {
-        return pubcomp;
-    }  
-    
-    // Parse properties
-    if(version == Version::MQTT5) {
-        auto [properties, propLength] = parseProperties(buffer+offset, length - offset, nullptr,
-                                                        PropertyContext::PUBCOMP);
-        pubcomp.properties = properties;
-        offset += propLength;
-    }
-
-    // Parse reason code (only present when there is data left after the properties)
-    if (offset < length) {
-        pubcomp.reasonCode = static_cast<ReasonCode>(buffer[offset]);
-    }
-
+    parseAckReasonAndProperties(buffer, length, /*offset=*/2, PropertyContext::PUBCOMP,
+                                pubcomp.reasonCode, pubcomp.properties);
     return pubcomp;
 }
 

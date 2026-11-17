@@ -88,7 +88,14 @@ public:
     //! with Success and No Subscription Existed respectively, MQTT-3.11.3).
     bool unsubscribe(const std::string& topic);
     void puback(uint16_t packetId);
-    ReasonCode pubrec(uint16_t packetId);
+    //! Handle the client's PUBREC for an outbound QoS 2 PUBLISH. Returns the
+    //! Reason Code to carry in the PUBREL, or nullopt when no PUBREL may be sent
+    //! because the client rejected the message with a Reason Code of 0x80 or
+    //! greater. A sender only sends PUBREL for a PUBREC below 0x80 (MQTT-4.3.3),
+    //! and such a rejection acknowledges the PUBLISH, which must then never be
+    //! retransmitted and whose identifier is immediately reusable (MQTT-4.4.0-2).
+    std::optional<ReasonCode> pubrec(uint16_t packetId,
+                                     ReasonCode clientReason = ReasonCode::SUCCESS);
     ReasonCode pubrel(uint16_t packetId);
     void pubcomp(uint16_t packetId);
 

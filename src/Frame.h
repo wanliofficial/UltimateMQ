@@ -119,6 +119,14 @@ public:
     PubrecPacket parsePubrec(const uint8_t *buffer, size_t length);
     PubrelPacket parsePubrel(const uint8_t *buffer, size_t length);
     PubcompPacket parsePubcomp(const uint8_t *buffer, size_t length);
+    //! Parse the tail of a PUBACK / PUBREC / PUBREL / PUBCOMP variable header,
+    //! which every one of those packets lays out as Packet Identifier, then
+    //! Reason Code, then Properties (MQTT-3.4.2 / 3.5.2 / 3.6.2 / 3.7.2). A
+    //! Remaining Length of 2 has neither trailing field (Reason Code 0x00); a
+    //! length of 3 has the Reason Code but no Property Length.
+    void parseAckReasonAndProperties(const uint8_t *buffer, size_t length, size_t offset,
+                                     PropertyContext context, ReasonCode &reasonCode,
+                                     Properties &properties);
     SubscribePacket parseSubscribe(const uint8_t *buffer, size_t length);
     SubackPacket parseSuback(const uint8_t *buffer, size_t length);
     UnsubscribePacket parseUnsubscribe(const uint8_t *buffer, size_t length);

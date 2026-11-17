@@ -1014,8 +1014,15 @@ void Connection::handlePubrec(std::shared_ptr<PubrecPacket> pubrec) {
     if (!session) {
         return;
     }
-    ReasonCode reason = session->pubrec(pubrec->packetId);
-    PubrelPacket pubrel{pubrec->packetId, reason};
+    auto reason = session->pubrec(pubrec->packetId, pubrec->reasonCode);
+    if (!reason) {
+        // The client rejected the PUBLISH (Reason Code >= 0x80). No PUBREL may
+        // follow (MQTT-4.3.3) and the message is not retransmitted (MQTT-4.4.0-2);
+        // the freed window slot may release a flow-controlled message.
+        session->flush();
+        return;
+    }
+    PubrelPacket pubrel{pubrec->packetId, *reason};
     sendPacket(pubrel);
 }
 

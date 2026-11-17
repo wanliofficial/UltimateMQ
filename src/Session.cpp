@@ -244,22 +244,36 @@ void Session::puback(uint16_t packetId) {
     }
 }
 
-ReasonCode Session::pubrec(uint16_t packetId) {
+std::optional<ReasonCode> Session::pubrec(uint16_t packetId, ReasonCode clientReason) {
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
+    // A PUBREC with a Reason Code of 0x80 or greater means the client refused the
+    // message. The flow ends there: the PUBLISH counts as acknowledged and must
+    // never be retransmitted, so the identifier is released at once, no PUBREL is
+    // sent, and nothing is remembered for a resume (MQTT-4.3.3 / MQTT-4.4.0-2).
+    const bool rejected = static_cast<uint8_t>(clientReason) >= 0x80;
     if (inflightMessages.erase(packetId) > 0) {
         inflightIdentifiers.erase(packetId);
         // The PUBLISH is acknowledged; from now on only the PUBREL/PUBCOMP leg
         // of the QoS 2 flow is outstanding. Remember it so a resume can re-send
         // the PUBREL if the connection drops before the PUBCOMP (MQTT-4.4.0-1).
-        pendingPubrel.insert(packetId);
+        // A rejected message has no such leg, so its id is not remembered.
+        if (!rejected) {
+            pendingPubrel.insert(packetId);
+        }
         notifyMutation();
         releaseBlocked();
+        if (rejected) {
+            return std::nullopt;
+        }
         return ReasonCode::SUCCESS;
     }
     // No such outstanding QoS 2 delivery: MQTT-4.3.3-5 expects
     // PACKET_IDENTIFIER_NOT_FOUND. The PUBREL is still sent so the client can
     // complete (or abandon) its flow; a client that sent a stale PUBREC simply
-    // gets the matching PUBCOMP below.
+    // gets the matching PUBCOMP below. A rejected stale PUBREC needs no answer.
+    if (rejected) {
+        return std::nullopt;
+    }
     return ReasonCode::PACKET_IDENTIFIER_NOT_FOUND;
 }
 
