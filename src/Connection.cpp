@@ -884,6 +884,26 @@ void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
         state = State::DISCONNECTED;
         return;
     }
+    // MQTT-3.3.2-14: the Response Topic is used as the Topic Name of a response
+    // message, so it must be a legal Topic Name - no wildcard characters, and
+    // not empty (§4.7.3 / MQTT-4.7.3-1). A violation is a Protocol Error
+    // (MQTT-4.13.1-1): PUBACK/PUBREC define no reason code for it, so every QoS
+    // is reported with DISCONNECT 0x82 rather than an ack that would be rejected
+    // as an out-of-range reason code.
+    if (frame.getVersion() == Version::MQTT5) {
+        auto responseTopic = publish->properties.find(PropertyID::RESPONSE_TOPIC);
+        if (responseTopic != publish->properties.end() &&
+            std::holds_alternative<std::string>(responseTopic->second) &&
+            !Topic::isValidTopicName(std::get<std::string>(responseTopic->second))) {
+            logDebug("client %s: Response Topic %s is not a valid topic name",
+                     session->getClientId().c_str(),
+                     std::get<std::string>(responseTopic->second).c_str());
+            DisconnectPacket disconnect{ReasonCode::PROTOCOL_ERROR};
+            sendPacket(disconnect);
+            state = State::DISCONNECTED;
+            return;
+        }
+    }
     // A PUBLISH topic must be a legal topic name: wildcards are never allowed
     // (MQTT-3.3.2-1). QoS 1/2 get the reason code in the ack; MQTT 5 QoS 0 is
     // reported with a DISCONNECT (MQTT-5.4.1-1), 3.1.1 is simply dropped.

@@ -126,4 +126,43 @@ TEST_F(ConnectionStateTests, AuthWithoutMethodIsAProtocolError)
         << std::hex << static_cast<int>(static_cast<uint8_t>(buffer[2]));
 }
 
+TEST_F(ConnectionStateTests, PublishWithWildcardResponseTopicIsAProtocolError)
+{
+    // MQTT-3.3.2-14: the Response Topic is used as the Topic Name of the reply,
+    // so it MUST NOT contain wildcard characters. It is a Protocol Error
+    // (MQTT-4.13.1-1), reported with DISCONNECT 0x82 for every QoS because no
+    // PUBACK/PUBREC reason code exists for it.
+    SocketPairConnection pair(&broker);
+    auto connect = std::make_shared<ConnectPacket>();
+    connect->protocolName = "MQTT";
+    connect->protocolVersion = Version::MQTT5;
+    connect->clientId = "wildcard-response-topic";
+    connect->cleanStart = true;
+    connect->keepAlive = 60;
+    connect->willFlag = false;
+    connect->willQos = QoS::QOS_0;
+    connect->willRetain = false;
+    pair.connection->handleIncoming(connect);
+    ASSERT_TRUE(pair.connection->isConnected()) << "the CONNECT was refused";
+
+    char buffer[64];
+    ASSERT_GT(pair.readPeer(buffer, sizeof(buffer)), 0u) << "no CONNACK";
+
+    // QoS 1 so a per-message rejection would have to be a PUBACK; a wildcard
+    // Response Topic is a Protocol Error instead, so the connection must close.
+    auto publish = std::make_shared<PublishPacket>(
+        "a/b", std::vector<uint8_t>{'x'}, QoS::QOS_1, false, /*packetId=*/1);
+    publish->properties[PropertyID::RESPONSE_TOPIC] = std::string("reply/#");
+    pair.connection->handleIncoming(publish);
+    EXPECT_FALSE(pair.connection->isConnected())
+        << "a PUBLISH with a wildcard Response Topic was accepted";
+
+    const size_t size = pair.readPeer(buffer, sizeof(buffer));
+    ASSERT_GE(size, 3u) << "the broker sent no DISCONNECT";
+    EXPECT_EQ(static_cast<uint8_t>(buffer[0]), 0xE0) << "expected a DISCONNECT packet";
+    EXPECT_EQ(static_cast<uint8_t>(buffer[2]), 0x82)
+        << "expected Protocol Error (0x82), got 0x"
+        << std::hex << static_cast<int>(static_cast<uint8_t>(buffer[2]));
+}
+
 } // namespace MQTT
