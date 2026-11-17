@@ -207,6 +207,42 @@ TEST_F(SessionLifecycleTest, SweepPurgesExpiredRetainedMessage)
     EXPECT_EQ(broker.getRetainedCount(), 0u);
 }
 
+TEST_F(SessionLifecycleTest, PacketIdsAreNotReusedWhileStillInFlight)
+{
+    // MQTT-2.2.1-4: a Server MUST assign a non-zero Packet Identifier that is
+    // *currently unused* to every new QoS>0 PUBLISH it sends. The identifier
+    // space is 1..65535 and wraps, so the allocator must skip identifiers that
+    // are still unacknowledged: handing one out again would make the client's
+    // PUBACK ambiguous and could silently drop a message.
+    auto session = std::make_shared<Session>(&broker, "wrap");
+    session->connect(session, /*persistent=*/true);
+    auto client = test::attach(*session);
+    session->subscribe("wrap/t", optionsFor(QoS::QOS_1));
+
+    // Walk the counter up to the very end of the identifier space, then leave a
+    // message outstanding at 65535 while the counter wraps back to 1.
+    session->setNextPacketIdForTest(65534);
+    broker.publish(Message("wrap/t", "a", QoS::QOS_1));   // id 65534
+    broker.publish(Message("wrap/t", "b", QoS::QOS_1));   // id 65535
+    session->flush();
+    ASSERT_EQ(client->size(), 2u);
+    const uint16_t firstId = client->packetIds[0];
+    const uint16_t secondId = client->packetIds[1];
+    EXPECT_EQ(firstId, 65534u);
+    EXPECT_EQ(secondId, 65535u);
+
+    // Acknowledge 65534 but leave 65535 outstanding, then force the counter to
+    // wrap past it. The next identifier must skip the still-in-flight one.
+    session->puback(firstId);
+    session->setNextPacketIdForTest(65535);
+    broker.publish(Message("wrap/t", "c", QoS::QOS_1));
+    session->flush();
+    ASSERT_EQ(client->size(), 3u);
+    EXPECT_NE(client->packetIds[2], secondId)
+        << "the allocator reused a Packet Identifier that is still in flight";
+    EXPECT_NE(client->packetIds[2], 0);
+}
+
 TEST_F(SessionLifecycleTest, ResumeRetransmitsUnackedMessagesWithDup)
 {
     auto session = std::make_shared<Session>(&broker, "q1");

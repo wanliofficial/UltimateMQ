@@ -662,10 +662,25 @@ void Session::releaseInflight(uint16_t packetId) {
 }
 
 uint16_t Session::nextPacketId() {
-    if (packetId == 0) {
-        packetId = 1;
+    // MQTT-2.2.1-4: every new QoS>0 PUBLISH must carry a Packet Identifier that
+    // is currently unused. The 1..65535 space wraps, so walking the counter
+    // blindly would hand out an identifier that is still awaiting its PUBACK /
+    // PUBREC / PUBCOMP. Skip those; the inflight set is at most Receive Maximum
+    // (65535) entries, so a free identifier always exists for a new message and
+    // the scan terminates well inside one turn of the loop.
+    for (uint32_t tries = 0; tries < 65535; ++tries) {
+        if (packetId == 0) {
+            packetId = 1;
+        }
+        const uint16_t candidate = packetId++;
+        if (inflightMessages.count(candidate) == 0 &&
+            pendingPubrel.count(candidate) == 0) {
+            return candidate;
+        }
     }
-    return packetId++;
+    // Unreachable in practice: it would need all 65535 identifiers to be
+    // outstanding, which the flow-control window already forbids.
+    return packetId == 0 ? (packetId = 1) : packetId++;
 }
 
 } // namespace MQTT

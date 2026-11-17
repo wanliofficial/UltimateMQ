@@ -169,6 +169,9 @@ public:
     //! may keep outstanding (sent, unacknowledged) to this client. Defaults to
     //! the protocol default of 65535, i.e. no effective limit.
     void setReceiveMaximum(uint16_t limit) { receiveMaximum = limit; }
+    //! Test hook: position the outgoing Packet Identifier counter, so a test can
+    //! reach the wrap-around of the 16-bit space without sending 65k messages.
+    void setNextPacketIdForTest(uint16_t id) { packetId = id; }
 
 private:
     struct Delivery {
