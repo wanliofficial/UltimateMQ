@@ -34,6 +34,28 @@ bool Topic::isValid(const std::string &topic) {
         return false;
     }
 
+    // A shared subscription has the shape "$share/{ShareName}/{filter}"
+    // (§4.8.2). Its ShareName is not a topic level: it must be at least one
+    // character long and must not contain '/', '+' or '#' (MQTT-4.8.2-1 /
+    // MQTT-4.8.2-2), and a '/' followed by a real Topic Filter must come after
+    // it. Without this check "$share//t" and "$share/g" were accepted as
+    // ordinary filters that simply never match, and a wildcard in the
+    // ShareName was treated as one.
+    const std::string sharedPrefix = "$share/";
+    if (topic.compare(0, sharedPrefix.size(), sharedPrefix) == 0) {
+        const size_t secondSlash = topic.find('/', sharedPrefix.size());
+        if (secondSlash == std::string::npos || secondSlash == sharedPrefix.size()) {
+            return false;
+        }
+        const std::string shareName = topic.substr(sharedPrefix.size(),
+                                                   secondSlash - sharedPrefix.size());
+        if (shareName.find_first_of("+#") != std::string::npos) {
+            return false;
+        }
+        // The remainder is an ordinary Topic Filter and is validated as one.
+        return isValid(topic.substr(secondSlash + 1));
+    }
+
     // Split the topic into levels
     std::vector<std::string> levels = split(topic);
 

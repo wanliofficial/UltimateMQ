@@ -35,6 +35,34 @@ TEST(TopicTest, IsValid)
     EXPECT_FALSE(Topic::isValid("a/#/b"));       // '#' not last
 }
 
+TEST(TopicTest, IsValidSharedSubscription)
+{
+    // MQTT-4.8.2-1: a shared subscription must start with "$share/" and its
+    // ShareName must be at least one character long. MQTT-4.8.2-2: the ShareName
+    // must not contain '/', '+' or '#', and must be followed by '/' and a real
+    // Topic Filter. A bogus "$share/..." is not an ordinary filter: accepting it
+    // grants a subscription that can never match, and a wildcard in the
+    // ShareName would silently be matched as a topic level.
+    EXPECT_TRUE(Topic::isValid("$share/group/topic"));
+    EXPECT_TRUE(Topic::isValid("$share/g/a/+"));
+    EXPECT_TRUE(Topic::isValid("$share/g/#"));
+    EXPECT_TRUE(Topic::isValid("$share/g/a//b"));
+
+    EXPECT_FALSE(Topic::isValid("$share//t"));      // empty ShareName
+    EXPECT_FALSE(Topic::isValid("$share/"));        // no ShareName, no filter
+    EXPECT_FALSE(Topic::isValid("$share/g"));       // ShareName not followed by '/'
+    EXPECT_FALSE(Topic::isValid("$share/g/"));      // empty filter
+    EXPECT_FALSE(Topic::isValid("$share/+/t"));     // '+' in ShareName
+    EXPECT_FALSE(Topic::isValid("$share/#"));       // '#' in ShareName
+    EXPECT_FALSE(Topic::isValid("$share/g+/t"));    // '+' inside ShareName
+    EXPECT_FALSE(Topic::isValid("$share/g/a/#/b")); // '#' not last in the filter
+    EXPECT_FALSE(Topic::isValid("$share/g/a/b#"));  // '#' inside a filter level
+
+    // "$share" without the trailing '/' is an ordinary first level.
+    EXPECT_TRUE(Topic::isValid("$shared/x"));
+    EXPECT_TRUE(Topic::isValid("$share"));
+}
+
 TEST(TopicTest, IsValidTopicNameForbidsWildcards)
 {
     // A PUBLISH topic (or Will topic) must carry no wildcards at all

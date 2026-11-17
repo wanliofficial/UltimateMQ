@@ -312,6 +312,10 @@ TEST_F(BrokerTest, SharedSubscriptionMatchesWildcardFilter)
 
     broker->publish(MQTT::Message("sensors/a", "yes"));
     broker->publish(MQTT::Message("sensors/a/b", "no"));
+    // The ShareName is not a topic level (MQTT-4.8.2-2): the filter part is
+    // "sensors/+", so a topic literally starting with the group name must not
+    // match, even though the subscription string begins with "$share/g/".
+    broker->publish(MQTT::Message("g/sensors/a", "no"));
 
     EXPECT_EQ(member.client->size(), 1u)
         << "only the single-level match should be delivered";
