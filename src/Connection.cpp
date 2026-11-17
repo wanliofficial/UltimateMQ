@@ -418,7 +418,7 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     // session, learn about its messages, or publish a Will message.
     //
     // Enhanced authentication is not implemented, so a CONNECT that asks for an
-    // authentication method must be refused up front (MQTT-4.12.1-2) rather
+    // authentication method must be refused up front (MQTT-4.12.0-1) rather
     // than silently falling back to username/password. A method name plus data
     // without a method is also a protocol error (MQTT-3.1.2-17).
     if (frame.getVersion() == Version::MQTT5) {
@@ -1194,16 +1194,19 @@ void Connection::handleDisconnect(std::shared_ptr<DisconnectPacket> disconnect) 
 }
 
 void Connection::handleAuth(std::shared_ptr<AuthPacket> auth) {
-    // The broker implements only username/password authentication, so it
-    // supports no enhanced authentication method. Replying SUCCESS to an AUTH
-    // would tell the client a method it never agreed to had completed; the
-    // correct answer is BAD_AUTHENTICATION_METHOD (MQTT-4.12.1-2), after which
-    // the connection is closed (MQTT-4.12.1-1).
-    logDebug("client %s: refusing AUTH (no enhanced authentication)", 
+    // The broker implements only username/password authentication and always
+    // refuses a CONNECT that carries an Authentication Method, so no enhanced
+    // authentication can be in progress on this connection. [MQTT-4.12.0-7]
+    // then forbids the Client from sending AUTH at all, and an AUTH that was
+    // never expected is a Protocol Error, answered with DISCONNECT 0x82
+    // (§4.13.1). Answering with an AUTH packet is wrong twice over: a Server
+    // sends AUTH only inside a running enhanced-authentication exchange, and
+    // AUTH's Reason Code may only be 0x00, 0x18 or 0x19 (MQTT-3.15.2-1), so the
+    // 0x8C that used to be sent here was itself a protocol violation.
+    (void)auth;
+    logDebug("client %s: AUTH without an enhanced authentication method",
              session ? session->getClientId().c_str() : "?");
-    AuthPacket authResp{ReasonCode::BAD_AUTHENTICATION_METHOD};
-    sendPacket(authResp);
-    state = State::DISCONNECTED;
+    closeWithReason(ReasonCode::PROTOCOL_ERROR);
 }
 
 bool Connection::deliver(const Message &message, uint16_t packetId, QoS qos,

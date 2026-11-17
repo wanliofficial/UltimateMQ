@@ -41,6 +41,13 @@ struct SocketPairConnection {
         ssize_t got = ::recv(peer, buffer, size, 0);
         return got < 0 ? 0 : static_cast<size_t>(got);
     }
+
+    //! Read what the broker has already written without closing its end, so a
+    //! second packet can be inspected afterwards.
+    size_t readPeer(char *buffer, size_t size) {
+        ssize_t got = ::recv(peer, buffer, size, 0);
+        return got < 0 ? 0 : static_cast<size_t>(got);
+    }
 };
 } // namespace
 
@@ -80,6 +87,43 @@ TEST_F(ConnectionStateTests, SubscribeBeforeConnectIsRefused)
     char buffer[64];
     EXPECT_EQ(pair.readBack(buffer, sizeof(buffer)), 0u)
         << "a pre-CONNECT SUBSCRIBE was answered";
+}
+
+TEST_F(ConnectionStateTests, AuthWithoutMethodIsAProtocolError)
+{
+    // The broker refuses every Authentication Method, so no enhanced
+    // authentication can be running and [MQTT-4.12.0-7] forbids the client from
+    // sending AUTH. The answer must be DISCONNECT 0x82 (§4.13.1): a Server only
+    // sends AUTH inside an agreed exchange, and AUTH's Reason Code is limited to
+    // 0x00/0x18/0x19 (MQTT-3.15.2-1), so the old AUTH 0x8C reply was invalid.
+    SocketPairConnection pair(&broker);
+    auto connect = std::make_shared<ConnectPacket>();
+    connect->protocolName = "MQTT";
+    connect->protocolVersion = Version::MQTT5;
+    connect->clientId = "auth-no-method";
+    connect->cleanStart = true;
+    connect->keepAlive = 60;
+    connect->willFlag = false;
+    connect->willQos = QoS::QOS_0;
+    connect->willRetain = false;
+    pair.connection->handleIncoming(connect);
+    ASSERT_TRUE(pair.connection->isConnected()) << "the CONNECT was refused";
+
+    char buffer[64];
+    ASSERT_GT(pair.readPeer(buffer, sizeof(buffer)), 0u) << "no CONNACK";
+
+    // A syntactically legal AUTH (Reason Code 0x19, Re-authenticate) is still
+    // invalid on a connection without an authentication method.
+    auto auth = std::make_shared<AuthPacket>(ReasonCode::REAUTHENTICATE);
+    pair.connection->handleIncoming(auth);
+    EXPECT_FALSE(pair.connection->isConnected());
+
+    const size_t size = pair.readPeer(buffer, sizeof(buffer));
+    ASSERT_GE(size, 3u) << "the broker sent no DISCONNECT";
+    EXPECT_EQ(static_cast<uint8_t>(buffer[0]), 0xE0) << "expected a DISCONNECT packet";
+    EXPECT_EQ(static_cast<uint8_t>(buffer[2]), 0x82)
+        << "expected Protocol Error (0x82), got 0x"
+        << std::hex << static_cast<int>(static_cast<uint8_t>(buffer[2]));
 }
 
 } // namespace MQTT
