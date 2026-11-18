@@ -111,8 +111,10 @@ void Connection::run() {
         // or MQTT 3.1.1 Clean Session 1). A persistent session merely goes
         // dormant: its Will Delay runs in full, and when it *does* end (the
         // sweeper discarding it at the Session Expiry) the Will goes out then.
-        const bool persistentSession = session->isPersistent();
-        if (willDelay > 0 && session && persistentSession) {
+        // `session` is checked because a CONNECT refused before the session is
+        // assigned must not turn this teardown into a null dereference.
+        const bool persistentSession = session && session->isPersistent();
+        if (willDelay > 0 && persistentSession) {
             // MQTT-3.1.3.2: the Will Delay Interval is measured from the moment
             // this Network Connection closes, so arm the Will on the broker now
             // (at disconnect). The sweeper publishes it once the delay elapses,
@@ -130,6 +132,16 @@ void Connection::run() {
     // DISCONNECT may override it with a value carried in the DISCONNECT, and a
     // zero interval discards the session at once. A non-zero interval keeps the
     // session resumable for that long, whether the close was graceful or not.
+    releaseSession();
+    closeSocket();
+}
+
+void Connection::releaseSession() {
+    // Connection and Session hold strong references to each other while the
+    // session is bound (Connection::session and Session::client), so somebody
+    // has to break the cycle explicitly. In normal operation this is the end of
+    // run(); detach() calls it too so a Connection driven directly by a test
+    // does not leak itself and its session.
     if (session) {
         std::shared_ptr<Session> owned;
         {
@@ -163,7 +175,6 @@ void Connection::run() {
             }
         }
     }
-    closeSocket();
 }
 
 void Connection::scheduleReadTimeout() {
@@ -385,7 +396,15 @@ void Connection::handleIncoming(std::shared_ptr<Packet> packet) {
 
 void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     if (state != State::IDLE) {
-        throw std::runtime_error("Bad connect packet");
+        // MQTT-3.1.0-2: "The Server MUST process a second CONNECT packet sent
+        // from a Client as a Protocol Error and close the Network Connection."
+        // The packet parses perfectly - it just contradicts the state the
+        // Server is already in - so §1.5.6/§4.13 make this a Protocol Error
+        // (0x82), not a Malformed Packet (0x81). Throwing the generic
+        // std::runtime_error here fell through to run()'s catch-all and was
+        // reported to the client as MALFORMED_PACKET.
+        throw Frame::ProtocolViolation("a second CONNECT on the same Network Connection "
+                                       "(MQTT-3.1.0-2)");
     }
     frame.setVersion(connect->protocolVersion);
     // Topic Alias mappings are scoped to a single network connection, so a fresh

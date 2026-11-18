@@ -126,6 +126,75 @@ TEST_F(ConnectionStateTests, AuthWithoutMethodIsAProtocolError)
         << std::hex << static_cast<int>(static_cast<uint8_t>(buffer[2]));
 }
 
+TEST_F(ConnectionStateTests, SecondConnectOnTheSameConnectionIsAProtocolError)
+{
+    // MQTT-3.1.0-2: "The Server MUST process a second CONNECT packet sent from a
+    // Client as a Protocol Error and close the Network Connection." The second
+    // CONNECT parses perfectly, so §1.5.6/§4.13 make it 0x82 Protocol Error, not
+    // 0x81 Malformed Packet. It used to reach run()'s catch-all (a plain
+    // std::runtime_error) and was reported as MALFORMED_PACKET.
+    SocketPairConnection pair(&broker);
+    auto connect = std::make_shared<ConnectPacket>();
+    connect->protocolName = "MQTT";
+    connect->protocolVersion = Version::MQTT5;
+    connect->clientId = "second-connect";
+    connect->cleanStart = true;
+    connect->keepAlive = 60;
+    connect->willFlag = false;
+    connect->willQos = QoS::QOS_0;
+    connect->willRetain = false;
+    pair.connection->handleIncoming(connect);
+    ASSERT_TRUE(pair.connection->isConnected()) << "the first CONNECT was refused";
+
+    char buffer[64];
+    ASSERT_GT(pair.readPeer(buffer, sizeof(buffer)), 0u) << "no CONNACK";
+
+    // The forbidden second CONNECT. handleIncoming() does not gate it (the
+    // connection is already CONNECTED), so handleConnect() must refuse it.
+    auto second = std::make_shared<ConnectPacket>(*connect);
+    EXPECT_THROW(pair.connection->handleIncoming(second), Frame::ProtocolViolation)
+        << "a second CONNECT was not reported as a Protocol Error";
+}
+
+TEST_F(ConnectionStateTests, SecondConnectIsReportedAsProtocolErrorOnTheWire)
+{
+    // The same violation as seen by the client: run() maps ProtocolViolation to
+    // DISCONNECT 0x82. Reached through closeWithReason() here so the mapping is
+    // asserted without a network thread.
+    SocketPairConnection pair(&broker);
+    auto connect = std::make_shared<ConnectPacket>();
+    connect->protocolName = "MQTT";
+    connect->protocolVersion = Version::MQTT5;
+    connect->clientId = "second-connect-wire";
+    connect->cleanStart = true;
+    connect->keepAlive = 60;
+    connect->willFlag = false;
+    connect->willQos = QoS::QOS_0;
+    connect->willRetain = false;
+    pair.connection->handleIncoming(connect);
+    ASSERT_TRUE(pair.connection->isConnected()) << "the CONNECT was refused";
+
+    char buffer[64];
+    ASSERT_GT(pair.readPeer(buffer, sizeof(buffer)), 0u) << "no CONNACK";
+
+    auto second = std::make_shared<ConnectPacket>(*connect);
+    try {
+        pair.connection->handleIncoming(second);
+        FAIL() << "a second CONNECT was accepted";
+    } catch (const Frame::ProtocolViolation &) {
+        // Exactly what run() catches and turns into DISCONNECT PROTOCOL_ERROR.
+    }
+    pair.connection->closeWithReason(ReasonCode::PROTOCOL_ERROR);
+    EXPECT_FALSE(pair.connection->isConnected());
+
+    const size_t size = pair.readPeer(buffer, sizeof(buffer));
+    ASSERT_GE(size, 3u) << "the broker sent no DISCONNECT";
+    EXPECT_EQ(static_cast<uint8_t>(buffer[0]), 0xE0) << "expected a DISCONNECT packet";
+    EXPECT_EQ(static_cast<uint8_t>(buffer[2]), 0x82)
+        << "expected Protocol Error (0x82), got 0x"
+        << std::hex << static_cast<int>(static_cast<uint8_t>(buffer[2]));
+}
+
 TEST_F(ConnectionStateTests, PublishWithWildcardResponseTopicIsAProtocolError)
 {
     // MQTT-3.3.2-14: the Response Topic is used as the Topic Name of the reply,

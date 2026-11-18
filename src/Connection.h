@@ -61,8 +61,11 @@ public:
     //! Stop the loop and tear the socket down. Used by tests that drive the
     //! packet handlers directly: closing the socket unblocks a read loop left
     //! waiting on it, so the object can be destroyed without a dangling thread.
+    //! run() is not on that path, so the Session is released here as well -
+    //! otherwise the Connection <-> Session reference cycle keeps both alive.
     void detach() {
         state = State::DISCONNECTED;
+        releaseSession();
         closeSocket();
     }
     void handleDisconnect(std::shared_ptr<DisconnectPacket> packet);
@@ -93,6 +96,10 @@ public:
 private:
     void runReadLoop();
     void closeSocket();
+    //! Break the Connection <-> Session reference cycle and settle whether the
+    //! session survives this connection (MQTT-3.14.4-2 / 3.1.2-23). Called at
+    //! the end of run() and from detach().
+    void releaseSession();
     void publishWill();
     //! Stamps the Will's Message Expiry Interval onto \p will as a deadline
     //! starting now (MQTT-3.3.2-9). No-op when the CONNECT carried no interval.
