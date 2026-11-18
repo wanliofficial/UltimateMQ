@@ -22,6 +22,18 @@ uint32_t readU32BE(const uint8_t *p) {
            (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
 }
 
+//! Bounds check before reading a fixed-width field (§2.1.2). Every variable
+//! header ends with one or more fields whose size is known only after the
+//! preceding ones have been parsed, so "is there enough left for this field?"
+//! has to be asked explicitly: the earlier code indexed `buffer[offset]` after
+//! a variable-length field and read past the end of the packet whenever the
+//! body was truncated there. Reachable from the network, so it must be a check.
+void requireBytes(size_t offset, size_t need, size_t length, const char *what) {
+    if (need > length || offset > length - need) {
+        throw std::runtime_error(std::string("Malformed packet: truncated ") + what);
+    }
+}
+
 //! Append a Variable Byte Integer (MQTT-1.5.5): least significant 7-bit group
 //! first, continuation bit set while more groups follow, no length byte.
 void appendVariableByteInteger(std::vector<uint8_t> &buffer, uint32_t value) {
@@ -647,6 +659,10 @@ ConnectPacket Frame::parseConnect(const uint8_t *buffer, size_t length) {
     std::string protoName = parseString(buffer, length);
     offset += protoName.length() + 2;
 
+    // §3.1.2: the Protocol Version, Connect Flags and Keep Alive follow the
+    // Protocol Name and are all fixed-width. A CONNECT that stops inside them is
+    // a Malformed Packet (MQTT-3.1.4-1), not a licence to read past the body.
+    requireBytes(offset, 1, length, "CONNECT protocol version");
     Version protoVersion = static_cast<Version>(buffer[offset]);
     connect.protocolName = protoName;
     connect.protocolVersion = protoVersion;
@@ -655,8 +671,9 @@ ConnectPacket Frame::parseConnect(const uint8_t *buffer, size_t length) {
     if (!connect.isValidProtocol()) {
         throw std::runtime_error("Invalid protocol name or version");
     }
-    
-    // Parse connect flags  
+
+    // Parse connect flags
+    requireBytes(offset, 1, length, "CONNECT flags");
     ConnectFlags flags(buffer[offset]);
     connect.cleanStart = flags.cleanStart;
     connect.willFlag = flags.willFlag;
@@ -666,6 +683,7 @@ ConnectPacket Frame::parseConnect(const uint8_t *buffer, size_t length) {
     offset += 1;
 
     // Parse keep alive
+    requireBytes(offset, 2, length, "CONNECT keep alive");
     connect.keepAlive = (buffer[offset] << 8) | buffer[offset + 1];
     offset += 2;    
     logDebug("CONNECT keepAlive=%u cleanStart=%d", connect.keepAlive, (int)connect.cleanStart);
@@ -833,6 +851,10 @@ SubscribePacket Frame::parseSubscribe(const uint8_t *buffer, size_t length) {
         std::string topicFilter = parseString(buffer+offset, length-offset);
         offset += topicFilter.length() + 2;
 
+        // §3.8.3: every Topic Filter is followed by a Subscription Options byte.
+        // A SUBSCRIBE whose body ends after a filter has no options byte at all;
+        // reading one there used to run past the end of the packet.
+        requireBytes(offset, 1, length, "SUBSCRIBE subscription options");
         uint8_t options = buffer[offset];
         SubscriptionOptions subOptions; 
         subOptions.maximumQos = static_cast<MQTT::QoS>(options & 0x03);

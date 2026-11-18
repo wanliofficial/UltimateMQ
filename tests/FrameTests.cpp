@@ -3,6 +3,8 @@
 #include <vector>
 #include <set>
 #include <stdexcept>
+#include <functional>
+#include <string>
 
 namespace MQTT {
 
@@ -1279,6 +1281,145 @@ TEST_F(FrameTest, ASubscribeStillRejectsARepeatedSubscriptionIdentifier)
         0x00,                       // options: QoS 0
     };
     EXPECT_THROW(mqtt5.parseSubscribe(payload.data(), payload.size()), std::runtime_error);
+}
+
+//! A packet whose Remaining Length is honest but whose body stops in the middle
+//! of a fixed-width field must be rejected by an explicit bounds check (§2.1.3:
+//! the Remaining Length delimits the packet). The parsers below used to read
+//! `buffer[offset]` right after a variable-length field, so a truncated CONNECT
+//! or SUBSCRIBE made them read past the end of the packet - reachable from the
+//! network by anyone who can open a socket. Every truncation point is covered
+//! because each of them used to overrun a different field.
+namespace {
+
+//! CONNECT/MQTT 5 with a Will: protocol name, version, flags, keep alive,
+//! property length, client id, will property length, will topic, will payload.
+const std::vector<uint8_t> kFullConnect = {
+    0x00, 0x04, 'M', 'Q', 'T', 'T',  // Protocol name
+    0x05,                            // Protocol version
+    0x06,                            // Connect flags: Will flag + clean start
+    0x00, 0x3C,                      // Keep alive
+    0x00,                            // Property length
+    0x00, 0x03, 'a', 'b', 'c',       // Client ID
+    0x00,                            // Will property length
+    0x00, 0x01, 'w',                 // Will topic
+    0x00, 0x02, 'h', 'i',            // Will payload
+};
+
+//! SUBSCRIBE/MQTT 5: packet id, property length, filter, options.
+const std::vector<uint8_t> kFullSubscribe = {
+    0x00, 0x01,                      // Packet id
+    0x00,                            // Property length
+    0x00, 0x03, 'a', '/', '#',       // Topic filter
+    0x01,                            // Subscription options
+};
+
+//! Assert every truncation point is rejected rather than parsed. Silence would
+//! mean the body was accepted with fields read from beyond its end.
+void expectEveryTruncationRejected(const std::function<void(size_t)> &parseAt, size_t fullSize,
+                                   const char *what) {
+    for (size_t cut = 0; cut < fullSize; ++cut) {
+        EXPECT_THROW(parseAt(cut), std::runtime_error)
+            << what << " accepted a body truncated to " << cut << " of " << fullSize << " bytes";
+    }
+}
+
+//! Assert the rejection at a specific truncation point names the truncated
+//! field, proving the bounds check ran instead of the parser indexing past the
+//! end of the packet (where it would have read whatever followed the buffer).
+void expectTruncatedField(const std::function<void(size_t)> &parseAt, size_t cut,
+                          const char *what) {
+    try {
+        parseAt(cut);
+        ADD_FAILURE() << what << " accepted a body truncated to " << cut << " bytes";
+    } catch (const std::runtime_error &e) {
+        EXPECT_NE(std::string(e.what()).find("truncated"), std::string::npos)
+            << what << " cut=" << cut << " was rejected as \"" << e.what()
+            << "\" instead of a truncated field: the parser read past the end of "
+               "the packet before noticing";
+    }
+}
+
+} // namespace
+
+TEST_F(FrameTest, ATruncatedConnectIsRejectedBeforeReadingPastTheBody)
+{
+    Frame mqtt5(Version::MQTT5);
+    expectEveryTruncationRejected(
+        [&](size_t cut) {
+            mqtt5.parseConnect(kFullConnect.data(), cut);
+        },
+        kFullConnect.size(), "CONNECT");
+}
+
+TEST_F(FrameTest, ATruncatedMqtt311ConnectIsRejectedBeforeReadingPastTheBody)
+{
+    // Same fields minus the two property-length bytes, so the truncation points
+    // fall on different offsets.
+    std::vector<uint8_t> body = {
+        0x00, 0x04, 'M', 'Q', 'T', 'T',  // Protocol name
+        0x04,                            // Protocol version
+        0x02,                            // Connect flags: clean session
+        0x00, 0x3C,                      // Keep alive
+        0x00, 0x03, 'a', 'b', 'c',       // Client ID
+    };
+    Frame v311(Version::MQTT311);
+    expectEveryTruncationRejected(
+        [&](size_t cut) {
+            v311.parseConnect(body.data(), cut);
+        },
+        body.size(), "CONNECT 3.1.1");
+}
+
+TEST_F(FrameTest, ATruncatedSubscribeIsRejectedBeforeReadingPastTheBody)
+{
+    Frame mqtt5(Version::MQTT5);
+    auto parse = [&](size_t cut) { mqtt5.parseSubscribe(kFullSubscribe.data(), cut); };
+    // A body that stops inside the packet identifier, the property length or the
+    // filter is malformed. The one exception is a cut right after the property
+    // section: there the payload is simply empty, which the parser reports as an
+    // empty subscription list and handleSubscribe refuses (MQTT-3.8.3-2).
+    const size_t emptyPayload = 3;  // packet id (2) + property length (1)
+    for (size_t cut = 0; cut < kFullSubscribe.size(); ++cut) {
+        if (cut == emptyPayload) {
+            auto empty = mqtt5.parseSubscribe(kFullSubscribe.data(), cut);
+            EXPECT_TRUE(empty.subscriptions.empty())
+                << "an empty SUBSCRIBE payload must parse as zero filters";
+            continue;
+        }
+        EXPECT_THROW(mqtt5.parseSubscribe(kFullSubscribe.data(), cut), std::runtime_error)
+            << "SUBSCRIBE accepted a body truncated to " << cut << " of "
+            << kFullSubscribe.size() << " bytes";
+    }
+}
+
+TEST_F(FrameTest, TheConnectFixedWidthFieldsReportATruncatedField)
+{
+    // The exact offsets that used to overrun, one per fixed-width field:
+    // the protocol version (right after the protocol name, offset 6), the
+    // connect flags (7), and the two-byte keep alive (8..9).
+    Frame mqtt5(Version::MQTT5);
+    auto parse = [&](size_t cut) { mqtt5.parseConnect(kFullConnect.data(), cut); };
+    expectTruncatedField(parse, 6, "CONNECT protocol version");
+    expectTruncatedField(parse, 7, "CONNECT flags");
+    expectTruncatedField(parse, 8, "CONNECT keep alive");
+    expectTruncatedField(parse, 9, "CONNECT keep alive");
+}
+
+TEST_F(FrameTest, ASubscribeWithoutTheOptionsByteIsMalformed)
+{
+    // §3.8.3: each Topic Filter is followed by a Subscription Options byte. A
+    // body that ends after the filter is Malformed - it used to be read as if
+    // the next byte of the buffer were the options.
+    Frame mqtt5(Version::MQTT5);
+    std::vector<uint8_t> payload = {
+        0x00, 0x01,                // packet id
+        0x00,                      // property length
+        0x00, 0x03, 'a', '/', '#', // filter, and then nothing
+    };
+    expectTruncatedField(
+        [&](size_t) { mqtt5.parseSubscribe(payload.data(), payload.size()); }, 0,
+        "SUBSCRIBE options byte");
 }
 
 } // namespace MQTT
