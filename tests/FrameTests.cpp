@@ -688,6 +688,38 @@ TEST_F(FrameTest, SerializeConnackForMqtt311MapsFailureCodes)
     EXPECT_EQ(v4.serialize(badProtocol), (std::vector<uint8_t>{0x20, 0x02, 0x00, 0x01}));
 }
 
+TEST_F(FrameTest, SerializeConnackForMqtt311SetsTheSessionPresentFlag)
+{
+    // MQTT 3.1.1 CONNACK bit 0 is the Session Present flag exactly as in MQTT 5
+    // (MQTT-3.2.2-3): a resumed session must report 1, otherwise the client
+    // re-subscribes over a session that was in fact restored.
+    Frame v4(Version::MQTT311);
+    ConnackPacket resumed(true, ReasonCode::SUCCESS);
+    EXPECT_EQ(v4.serialize(resumed), (std::vector<uint8_t>{0x20, 0x02, 0x01, 0x00}));
+}
+
+TEST_F(FrameTest, SerializeConnackForMqtt31HasNoSessionPresentFlag)
+{
+    // MQTT 3.1 (MQIsdp) has no Session Present bit: byte 1 is reserved and must
+    // stay 0, so a resumed session still emits flags 0x00.
+    Frame v3(Version::MQTT31);
+    ConnackPacket resumed(true, ReasonCode::SUCCESS);
+    EXPECT_EQ(v3.serialize(resumed), (std::vector<uint8_t>{0x20, 0x02, 0x00, 0x00}));
+}
+
+TEST_F(FrameTest, SerializeConnackForMqtt311NeverEmitsAV5ReasonCode)
+{
+    // The MQTT 3.1.1 return code table only spans 0x00-0x05. A v5-only reason
+    // code (here TOPIC_NAME_INVALID 0x90) must not leak onto a 3.1.1 CONNACK:
+    // the client would read an undefined return code.
+    Frame v4(Version::MQTT311);
+    ConnackPacket badWillTopic(false, ReasonCode::TOPIC_NAME_INVALID);
+    auto data = v4.serialize(badWillTopic);
+    ASSERT_EQ(data.size(), 4u);
+    EXPECT_LE(data[3], 0x05) << "a 3.1.1 CONNACK carried the out-of-range code 0x"
+                             << std::hex << static_cast<int>(data[3]);
+}
+
 TEST_F(FrameTest, SerializeConnackForMqtt5KeepsV5ReasonCode)
 {
     Frame v5(Version::MQTT5);

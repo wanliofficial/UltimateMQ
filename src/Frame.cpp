@@ -1052,9 +1052,12 @@ std::vector<uint8_t> Frame::serializeConnack(const ConnackPacket &packet) {
     std::vector<uint8_t> buffer;
     buffer.push_back(static_cast<uint8_t>(PacketType::CONNACK) << 4);
 
-    // Variable header, byte 1: Connect Acknowledge Flags
+    // Variable header, byte 1: Connect Acknowledge Flags. Bit 0 is the Session
+    // Present flag, in MQTT 3.1.1 (MQTT-3.2.2-3) exactly as in MQTT 5
+    // (MQTT-3.2.2-3 / 3.2.2.2): the Server sets it when it resumed existing
+    // Session State. MQTT 3.1 has no such flag, so it stays 0 there.
     uint8_t connAckFlags = 0;
-    if (version != Version::MQTT311 && packet.sessionPresent) {
+    if (version != Version::MQTT31 && packet.sessionPresent) {
         connAckFlags |= 0x01;
     }
 
@@ -1082,6 +1085,13 @@ std::vector<uint8_t> Frame::serializeConnack(const ConnackPacket &packet) {
             break;
         default:
             code = packet.reasonCode == ReasonCode::SUCCESS ? 0x00 : static_cast<uint8_t>(packet.reasonCode);
+            // The MQTT 3.1.1 return code table spans 0x00-0x05 only. Any other
+            // value (a v5-only reason code such as TOPIC_NAME_INVALID 0x90) is
+            // undefined for a 3.x client, so it must never reach the wire: report
+            // the generic "Server unavailable" code instead of an invalid one.
+            if (code > 0x05) {
+                code = 0x03;
+            }
             break;
         }
     }

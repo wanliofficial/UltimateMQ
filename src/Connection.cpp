@@ -137,17 +137,28 @@ void Connection::run() {
             owned = session;
             session.reset();
         }
-        if (sessionExpirySeconds == 0) {
-            // The client asked to end the session (or is MQTT 3.1.1 with clean
-            // session): drop it rather than leaving it resumable.
+        // Whether the session outlives this Network Connection. MQTT 3.1.x has no
+        // Session Expiry Interval, so its Clean Session flag is the whole story:
+        // CleanSession=0 keeps the session until a later CleanSession=1 replaces
+        // it, and there is no deadline to arm. MQTT 5 uses the interval instead,
+        // which a DISCONNECT may lower - down to 0, which ends the session at
+        // once (MQTT-3.14.4-2). Reading it as "sessionExpirySeconds == 0 means
+        // discard" dropped every MQTT 3.1.1 persistent session, because that
+        // field is only ever set for MQTT 5.
+        const bool expiryEndsSession = frame.getVersion() == Version::MQTT5 &&
+                                       sessionExpirySeconds == 0;
+        if (!owned->isPersistent() || expiryEndsSession) {
+            // The client asked to end the session (MQTT 3.1.1 Clean Session 1, or
+            // an MQTT 5 Session Expiry Interval of 0): drop it rather than
+            // leaving it resumable.
             owned->discard();
         } else {
             owned->close(shared_from_this());
-            // A kept session must be dropped if it is not resumed before the
-            // Session Expiry Interval elapses (MQTT-3.14.4-2). Only a persistent
-            // session was kept by close(); the background sweeper enforces the
-            // deadline.
-            if (owned->isPersistent()) {
+            // MQTT 5 only: a kept session must be dropped if it is not resumed
+            // before the Session Expiry Interval elapses (MQTT-3.14.4-2). A
+            // 3.1.x persistent session has no deadline; the sweeper only sees
+            // the ones that were given one.
+            if (frame.getVersion() == Version::MQTT5 && sessionExpirySeconds > 0) {
                 owned->armExpiry(std::chrono::seconds(sessionExpirySeconds));
             }
         }
@@ -546,9 +557,15 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     if (connect->willFlag && connect->willTopic && !Topic::isValidTopicName(*connect->willTopic)) {
         logInfo("rejecting client %s: will topic %s contains a wildcard",
                 connect->clientId.c_str(), connect->willTopic->c_str());
-        ConnackPacket connack{false, ReasonCode::TOPIC_NAME_INVALID};
-        connackSent = true;
-        sendPacket(connack);
+        if (frame.getVersion() == Version::MQTT5) {
+            ConnackPacket connack{false, ReasonCode::TOPIC_NAME_INVALID};
+            connackSent = true;
+            sendPacket(connack);
+        }
+        // MQTT 3.1.1's return code table only spans 0x00-0x05, so a v5 reason
+        // code would be an undefined value on the wire. [MQTT-3.1.4-1] requires a
+        // CONNECT that does not conform to be answered by closing the Network
+        // Connection, which is what the other v3 CONNECT rejections do too.
         state = State::DISCONNECTED;
         return;
     }
