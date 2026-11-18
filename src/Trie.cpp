@@ -63,7 +63,14 @@ std::vector<std::string> Trie::match(const std::string &topic)
 
         // Check for '#' wildcard
         it = node->children.find("#");
-        if (it != node->children.end()) {
+        if (it != node->children.end() && it->second->topicFilter.has_value()) {
+            // A '#' node must carry its own filter to be reportable. It normally
+            // does: a '#' is only ever the last level, so the node it hangs on
+            // is the leaf that insert() stamped. Guard the optional anyway, for
+            // the same reason the level-end branch above does - a filter that
+            // skipped validation (a restored state file) can leave a '#' node
+            // with children but no filter of its own, and calling .value() on it
+            // threw std::bad_optional_access out of a plain publish.
             matches.push_back(it->second->topicFilter.value());
         }
     };

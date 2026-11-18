@@ -62,6 +62,18 @@ void Broker::restoreState(const PersistedState &state) {
             // while it is offline (they are buffered until it reconnects)
             for (const auto &entry : persisted.subscriptions) {
                 const std::string &filter = entry.first;
+                // MQTT-3.8.3-1 / §4.7: a restored filter never went through the
+                // SUBSCRIBE validation that rejects a misplaced wildcard, and a
+                // hand-written or damaged state file can therefore hold one that
+                // is not a legal Topic Filter at all. Inserting it puts an
+                // unreachable node in the routing trie that makes every publish
+                // through it fail, so drop it here and say so instead.
+                if (!Topic::isValid(filter)) {
+                    logError("state file: dropping session %s subscription with an invalid "
+                             "topic filter: %s",
+                             persisted.clientId.c_str(), filter.c_str());
+                    continue;
+                }
                 if (Topic::isShared(filter)) {
                     auto [group, realFilter] = Topic::splitShared(filter);
                     sharedSubscriptions[realFilter][group].push_back(
@@ -296,7 +308,19 @@ void Broker::unsubscribe(const std::string &clientId, const std::string &topicFi
     it->second.erase(clientId);
 
     if (it->second.empty()) {
-        trie->remove(topicFilter);
+        // §4.8.2: a Shared Subscription lasts as long as it is associated with
+        // at least one Session, and "survives when the Session that originally
+        // created it unsubscribes, unless there are no other Sessions left".
+        // Plain and shared subscriptions on the same Topic Filter share one
+        // trie entry, so dropping the last plain subscriber must not take the
+        // shared group's routing entry with it - exactly the guard
+        // sharedUnsubscribe() already applies in the other direction. Without
+        // it the group stayed registered in sharedSubscriptions but was no
+        // longer reachable from the trie, so it silently stopped receiving
+        // every later message until the broker restarted.
+        if (sharedSubscriptions.find(topicFilter) == sharedSubscriptions.end()) {
+            trie->remove(topicFilter);
+        }
         subscriptions.erase(it);
     }
 }

@@ -94,4 +94,19 @@ TEST_F(TrieTest, SingleLevelWildcardMatchesATrailingEmptyLevel) {
     EXPECT_TRUE(trie.match("sport").empty());
 }
 
+TEST_F(TrieTest, AHashNodeWithoutItsOwnFilterIsSkippedNotDereferenced)
+{
+    // Every filter that goes through SUBSCRIBE validation has its '#' as the
+    // last level, so a '#' node is always a leaf carrying its own filter. A
+    // restored state file can hold a filter that never went through that
+    // validation ("a/#/b"), which leaves a '#' node with children but no filter
+    // of its own. Matching a topic through it must skip the node rather than
+    // call value() on an empty optional and throw out of a plain publish.
+    trie.insert("a/#/b");
+
+    std::vector<std::string> matches;
+    ASSERT_NO_THROW(matches = trie.match("a/x")) << "matching threw instead of skipping";
+    EXPECT_TRUE(matches.empty()) << "an unreportable '#' node produced a bogus match";
+}
+
 // Add more tests as needed

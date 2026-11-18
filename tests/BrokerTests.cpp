@@ -372,6 +372,31 @@ TEST_F(BrokerTest, RemovingASharedGroupKeepsAPlainSubscriptionOnTheSameFilter)
     EXPECT_EQ(shared.client->size(), 0u);
 }
 
+TEST_F(BrokerTest, RemovingTheLastPlainSubscriberKeepsASharedGroupOnTheSameFilter)
+{
+    // The mirror image of the test above, and the direction that used to fail.
+    // §4.8.2: a Shared Subscription "survives when the Session that originally
+    // created it unsubscribes, unless there are no other Sessions left". Plain
+    // and shared subscriptions on one filter share a single trie entry, so
+    // removing the last plain subscriber used to delete that entry and leave
+    // the group registered but unreachable: it silently received nothing more
+    // until the broker restarted.
+    auto plain = std::make_shared<MQTT::Session>(broker, "plain-gone");
+    plain->connect(plain, /*persistent=*/false);
+    auto plainClient = MQTT::test::attach(*plain);
+    plain->subscribe("mixed/x", MQTT::SubscriptionOptions{MQTT::QoS::QOS_0, false, false,
+                                                         MQTT::RetainHandling::DO_NOT_SEND_RETAINED_MESSAGES});
+
+    auto shared = makeSharedMember(broker, "grp-kept", "$share/g/mixed/x");
+    EXPECT_TRUE(plain->unsubscribe("mixed/x")) << "the plain subscription was not registered";
+
+    broker->publish(MQTT::Message("mixed/x", "still here"));
+
+    EXPECT_EQ(plainClient->size(), 0u) << "an unsubscribed client still received the message";
+    EXPECT_EQ(shared.client->size(), 1u)
+        << "the shared group lost its routing entry when the last plain subscriber left";
+}
+
 TEST_F(BrokerTest, SharedRoundRobinSkipsDeletedMembers)
 {
     // A member whose session has been torn down must not consume a turn.

@@ -314,6 +314,40 @@ TEST(BrokerStoreTest, RestoredSharedGroupsStillRoute)
 
 namespace MQTT {
 
+TEST(BrokerStoreTest, AnInvalidRestoredFilterIsDroppedInsteadOfBreakingRouting)
+{
+    // A filter in a state file never went through the SUBSCRIBE validation that
+    // rejects a misplaced wildcard, so a hand-written or damaged file can hold
+    // one that is not a legal Topic Filter at all. Registering it used to leave
+    // an unreachable node in the routing trie that made every publish through it
+    // fail; it must simply be dropped, and the rest of the session must survive.
+    MQTT::Broker source;
+    MQTT::PersistedSession snapshot;
+    snapshot.clientId = "restored";
+    snapshot.subscriptions["a/#/b"] = optionsFor(MQTT::QoS::QOS_0);   // illegal
+    snapshot.subscriptions["good/topic"] = optionsFor(MQTT::QoS::QOS_0);
+    auto session = std::make_shared<MQTT::Session>(&source, "restored", /*cleanStart=*/false);
+    session->restore(snapshot);
+    source.insertSession("restored", session);
+    const MQTT::PersistedState persisted = source.snapshotState();
+
+    MQTT::Broker restored;
+    ASSERT_NO_THROW(restored.restoreState(persisted));
+
+    auto restoredSession = restored.findSession("restored");
+    ASSERT_NE(restoredSession, nullptr) << "the whole session was lost";
+    auto subscriber = MQTT::test::attach(*restoredSession);
+
+    // The legal subscription still works...
+    ASSERT_NO_THROW(restored.publish(messageFor("good/topic", "hi", MQTT::QoS::QOS_0)));
+    restoredSession->flush();
+    EXPECT_EQ(subscriber->size(), 1U) << "the legal restored filter stopped routing";
+
+    // ...and publishing through the poisoned subtree is harmless.
+    ASSERT_NO_THROW(restored.publish(messageFor("a/x", "poison", MQTT::QoS::QOS_0)));
+    restoredSession->flush();
+}
+
 TEST(StoreTest, RoundTripsForwardedMessageProperties)
 {
     // MQTT 5 properties travel with the publication, so a restored retained or
