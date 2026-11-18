@@ -1,7 +1,17 @@
 #include <gtest/gtest.h>
 #include "../src/TLS.h"
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 
 namespace MQTT {
 
@@ -14,6 +24,84 @@ bool fixturesAvailable() {
     std::ifstream cert(testCert());
     std::ifstream key(testKey());
     return cert.good() && key.good();
+}
+
+//! A file path inside the system temporary directory, unique per test.
+std::string tempPath(const std::string &stem, const std::string &role) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path dir = fs::temp_directory_path(ec);
+    if (ec) {
+        dir = fs::path("/tmp");
+    }
+    return (dir / ("flowmq_tls_test_" + std::to_string(::getpid()) + "_" + stem + "_" +
+                   role + ".pem")).string();
+}
+
+//! Add a v3 extension to \p cert, signed by \p issuer.
+bool addExtension(X509 *cert, X509 *issuer, int nid, const char *value) {
+    X509V3_CTX context;
+    X509V3_set_ctx_nodb(&context);
+    X509V3_set_ctx(&context, issuer, cert, nullptr, nullptr, 0);
+    X509_EXTENSION *extension = X509V3_EXT_conf_nid(nullptr, &context, nid, value);
+    if (!extension) {
+        return false;
+    }
+    X509_add_ext(cert, extension, -1);
+    X509_EXTENSION_free(extension);
+    return true;
+}
+
+//! Write a self-signed certificate that is valid both as a TLS server
+//! certificate and as a client certificate, so one file pair can stand in for
+//! every role in a mutual-TLS handshake. Also usable as its own CA file.
+bool generatePki(const std::string &certPath, const std::string &keyPath) {
+    EVP_PKEY *pkey = EVP_RSA_gen(2048);
+    if (!pkey) {
+        return false;
+    }
+    X509 *cert = X509_new();
+    if (!cert) {
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+
+    bool ok = true;
+    X509_set_version(cert, 2);
+    ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
+    X509_gmtime_adj(X509_getm_notBefore(cert), 0);
+    X509_gmtime_adj(X509_getm_notAfter(cert), 3600);
+    X509_set_pubkey(cert, pkey);
+    X509_NAME *name = X509_get_subject_name(cert);
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                               reinterpret_cast<const unsigned char *>("localhost"), -1, -1, 0);
+    X509_set_issuer_name(cert, name);
+    ok = ok && addExtension(cert, cert, NID_basic_constraints, "critical,CA:TRUE");
+    ok = ok && addExtension(cert, cert, NID_key_usage,
+                            "critical,digitalSignature,keyEncipherment,keyCertSign");
+    ok = ok && addExtension(cert, cert, NID_ext_key_usage, "serverAuth,clientAuth");
+    ok = ok && addExtension(cert, cert, NID_subject_alt_name, "DNS:localhost");
+    ok = ok && X509_sign(cert, pkey, EVP_sha256()) > 0;
+
+    if (ok) {
+        FILE *file = std::fopen(certPath.c_str(), "w");
+        ok = file != nullptr && PEM_write_X509(file, cert) == 1;
+        if (file) {
+            std::fclose(file);
+        }
+    }
+    if (ok) {
+        FILE *file = std::fopen(keyPath.c_str(), "w");
+        ok = file != nullptr &&
+             PEM_write_PrivateKey(file, pkey, nullptr, nullptr, 0, nullptr, nullptr) == 1;
+        if (file) {
+            std::fclose(file);
+        }
+    }
+
+    X509_free(cert);
+    EVP_PKEY_free(pkey);
+    return ok;
 }
 } // namespace
 
@@ -100,6 +188,119 @@ TEST(TLSPeerIdentityTest, ATLSTransportWithoutAPeerCannotBeVerified)
     SecureTransport transport(-1, context, 1000);
     EXPECT_FALSE(transport.peerVerified());
     EXPECT_TRUE(transport.peerIdentity().empty());
+}
+
+// A completed mutual-TLS handshake with a certificate that verifies. This is
+// the only test that makes peerVerified() return true, and therefore the only
+// one that reaches the peer-certificate lookup; under a LeakSanitizer build it
+// also pins down that lookup's reference handling (the broker asks this
+// question on every CONNECT when the certificate is used as the username, so a
+// leaked reference would accumulate one X509 per client connection).
+TEST(TLSPeerIdentityTest, AVerifiedPeerReportsItsCertificateCommonName)
+{
+    const std::string certPath = tempPath("verify", "cert");
+    const std::string keyPath = tempPath("verify", "key");
+    ASSERT_TRUE(generatePki(certPath, keyPath))
+        << "could not write the test certificate to " << certPath;
+
+    std::string error;
+    // The certificate signs itself, so it doubles as the client CA.
+    auto context = TLSContext::load(certPath, keyPath, /*verifyClients=*/true, certPath, &error);
+    ASSERT_NE(context, nullptr) << error;
+
+    int fds[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    SecureTransport server(fds[0], context, /*writeTimeoutMs=*/3000);
+
+    SSL_CTX *clientContext = SSL_CTX_new(TLS_client_method());
+    ASSERT_NE(clientContext, nullptr);
+    ASSERT_EQ(SSL_CTX_use_certificate_file(clientContext, certPath.c_str(), SSL_FILETYPE_PEM), 1);
+    ASSERT_EQ(SSL_CTX_use_PrivateKey_file(clientContext, keyPath.c_str(), SSL_FILETYPE_PEM), 1);
+    SSL *clientSsl = SSL_new(clientContext);
+    ASSERT_NE(clientSsl, nullptr);
+    SSL_set_fd(clientSsl, fds[1]);
+
+    bool serverOk = false;
+    std::string serverError;
+    std::thread handshaker([&] { serverOk = server.handshake(&serverError); });
+    const int clientRc = SSL_connect(clientSsl);
+    handshaker.join();
+
+    ASSERT_EQ(clientRc, 1);
+    ASSERT_TRUE(serverOk) << serverError;
+
+    EXPECT_TRUE(server.peerVerified());
+    EXPECT_EQ(server.peerIdentity(), "localhost");
+    // Repeated queries must stay consistent (and must not accumulate references
+    // to the peer certificate).
+    EXPECT_TRUE(server.peerVerified());
+    EXPECT_EQ(server.peerIdentity(), "localhost");
+
+    SSL_shutdown(clientSsl);
+    SSL_free(clientSsl);
+    SSL_CTX_free(clientContext);
+    ::close(fds[1]);
+}
+
+// A TLS peer that vanishes must not take the process down with it.
+//
+// The plaintext write path passes MSG_NOSIGNAL, but a TLS session writes through
+// OpenSSL's socket BIO, which uses a plain write(2): the resulting SIGPIPE had
+// the default disposition, so one client closing abruptly while a message was in
+// flight for it killed the whole broker. The transport now blocks SIGPIPE for
+// the duration of the OpenSSL call. Without that guard this test does not fail -
+// the test binary itself dies with SIGPIPE (exit 141).
+TEST(TLSSigPipeTest, WritingToADepartedTLSPeerDoesNotRaiseSIGPIPE)
+{
+    const std::string certPath = tempPath("sigpipe", "cert");
+    const std::string keyPath = tempPath("sigpipe", "key");
+    ASSERT_TRUE(generatePki(certPath, keyPath));
+
+    std::string error;
+    auto context = TLSContext::load(certPath, keyPath, /*verifyClients=*/false,
+                                    std::string(), &error);
+    ASSERT_NE(context, nullptr) << error;
+
+    int fds[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    SecureTransport server(fds[0], context, /*writeTimeoutMs=*/2000);
+
+    SSL_CTX *clientContext = SSL_CTX_new(TLS_client_method());
+    ASSERT_NE(clientContext, nullptr);
+    SSL_CTX_set_verify(clientContext, SSL_VERIFY_NONE, nullptr);
+    SSL *clientSsl = SSL_new(clientContext);
+    ASSERT_NE(clientSsl, nullptr);
+    SSL_set_fd(clientSsl, fds[1]);
+
+    bool serverOk = false;
+    std::string serverError;
+    std::thread handshaker([&] { serverOk = server.handshake(&serverError); });
+    const int clientRc = SSL_connect(clientSsl);
+    handshaker.join();
+    ASSERT_EQ(clientRc, 1);
+    ASSERT_TRUE(serverOk) << serverError;
+
+    // The peer disappears without a close_notify, so the next write has nowhere
+    // to go.
+    SSL_free(clientSsl);
+    SSL_CTX_free(clientContext);
+    ::close(fds[1]);
+
+    const uint8_t payload[] = {'x', 'y', 'z'};
+    // Repeated writes: the first may still be buffered by OpenSSL, a later one
+    // must observe the dead socket. Any of them raising SIGPIPE would end this
+    // process, so reaching the assertion is the point of the test.
+    bool alive = true;
+    for (int i = 0; i < 8 && alive; ++i) {
+        alive = server.writeAll(payload, sizeof(payload));
+    }
+    EXPECT_FALSE(alive);
+
+    // A clean shutdown must be equally safe.
+    server.teardown();
+    ::close(fds[0]);
 }
 
 } // namespace MQTT

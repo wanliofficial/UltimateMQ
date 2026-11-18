@@ -5,6 +5,8 @@
 #include <cstring>
 #include <vector>
 #include <poll.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <openssl/err.h>
@@ -13,6 +15,45 @@
 #include <openssl/x509v3.h>
 
 namespace MQTT {
+
+namespace {
+
+//! The SIGPIPE mask as a reusable constant.
+sigset_t &sigPipeMask() {
+    static sigset_t mask = [] {
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGPIPE);
+        return set;
+    }();
+    return mask;
+}
+
+/*!
+ * Stops the calling thread from ever being killed by SIGPIPE.
+ *
+ * The plaintext write path passes MSG_NOSIGNAL, but a TLS session goes through
+ * OpenSSL's socket BIO, which issues a plain write(2). Writing to a peer that
+ * has vanished (an abortive close, an RST) therefore raises SIGPIPE, and with
+ * the default disposition that terminates the entire broker: a single client
+ * disappearing while a message was in flight for it was enough to kill the
+ * process. Blocking the signal for this thread turns such a write into the
+ * EPIPE the caller already handles and leaves every other thread unaffected.
+ *
+ * The mask is installed once per thread (a connection thread does many TLS
+ * writes, and a mask switch per write would cost two syscalls each time). A
+ * blocked SIGPIPE merely becomes pending - standard signals do not queue, so at
+ * most one instance can ever be outstanding - and is discarded when the thread
+ * exits, so leaving it blocked for the thread's lifetime is safe.
+ */
+void suppressSigPipe() {
+    thread_local const bool installed = [] {
+        return ::pthread_sigmask(SIG_BLOCK, &sigPipeMask(), nullptr) == 0;
+    }();
+    (void)installed;
+}
+
+} // namespace
 
 TLSContext::~TLSContext() {
     if (ctx_) {
@@ -128,7 +169,10 @@ bool SecureTransport::handshake(std::string *error) {
         return true;
     }
     // The socket is blocking, so SSL_accept drives the handshake to completion
-    // (including any renegotiation round trips) without spinning.
+    // (including any renegotiation round trips) without spinning. It writes the
+    // server hello, so a peer that vanished mid-handshake must not raise
+    // SIGPIPE here either.
+    suppressSigPipe();
     int rc = SSL_accept(ssl_);
     if (rc == 1) {
         return true;
@@ -149,7 +193,16 @@ bool SecureTransport::peerVerified() const {
     // SSL_get_verify_result reports X509_V_OK only when the peer presented a
     // certificate that chained to our CA; with SSL_VERIFY_NONE an absent
     // certificate is also reported as OK, so require a certificate too.
-    if (SSL_get_peer_certificate(ssl_) == nullptr) {
+    //
+    // SSL_get_peer_certificate is a macro for SSL_get1_peer_certificate in
+    // OpenSSL 3.0: it *increments* the reference count and hands the caller a
+    // reference it owns. Dropping that reference without X509_free() leaked one
+    // certificate per call, so a broker running with FLOWMQ_TLS_CERT_AS_USERNAME
+    // (which asks this question on every CONNECT) grew by one X509 per client
+    // connection. SSL_get0_peer_certificate borrows the session's reference,
+    // which is all this check needs.
+    X509 *cert = SSL_get0_peer_certificate(ssl_);
+    if (cert == nullptr) {
         return false;
     }
     return SSL_get_verify_result(ssl_) == X509_V_OK;
@@ -159,8 +212,10 @@ std::string SecureTransport::peerIdentity() const {
     if (!peerVerified()) {
         return std::string();
     }
-    // The reference is owned by us and must be freed.
-    X509 *cert = SSL_get_peer_certificate(ssl_);
+    // SSL_get0_peer_certificate returns a borrowed pointer: the session keeps
+    // the only reference and frees it when the SSL object is freed, so this must
+    // not be X509_free()d here.
+    X509 *cert = SSL_get0_peer_certificate(ssl_);
     if (!cert) {
         return std::string();
     }
@@ -186,7 +241,6 @@ std::string SecureTransport::peerIdentity() const {
             }
         }
     }
-    X509_free(cert);
     return identity;
 }
 
@@ -214,6 +268,9 @@ ssize_t SecureTransport::readSome(uint8_t *buf, size_t max) {
         return ::read(fd_, buf, max);
     }
     for (;;) {
+        // SSL_read can write as well: alerts, renegotiation, and session
+        // tickets all go out through the same socket BIO.
+        suppressSigPipe();
         int n = SSL_read(ssl_, buf, static_cast<int>(max));
         if (n > 0) {
             return n;
@@ -253,6 +310,9 @@ bool SecureTransport::writeAll(const uint8_t *buf, size_t len) {
             sent += static_cast<size_t>(n);
             continue;
         }
+        // OpenSSL writes through a plain write(2), so a departed peer must be
+        // turned into EPIPE rather than SIGPIPE (see suppressSigPipe()).
+        suppressSigPipe();
         int n = SSL_write(ssl_, buf + sent, static_cast<int>(len - sent));
         if (n > 0) {
             sent += static_cast<size_t>(n);
@@ -279,7 +339,9 @@ void SecureTransport::teardown() {
     if (!ssl_) {
         return;
     }
-    // Best-effort close_notify; ignore errors, the fd is closed by the owner
+    // Best-effort close_notify; the fd is closed by the owner. Guarded for the
+    // same reason as writeAll(): the peer may already be gone.
+    suppressSigPipe();
     SSL_shutdown(ssl_);
     SSL_free(ssl_);
     ssl_ = nullptr;
