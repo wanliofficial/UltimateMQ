@@ -12,6 +12,10 @@
 #include "Auth.h"
 #include "Store.h"
 #include "TLS.h"
+#include "MQTTSN.h"
+#if defined(FLOWMQ_WITH_QUIC)
+#include "QUIC.h"
+#endif
 
 namespace MQTT {
 
@@ -38,6 +42,9 @@ public:
 
 private:
     void run();
+    //! Accept one WebSocket client and start serving it. Called when the
+    //! optional WebSocket listener has an incoming connection.
+    void acceptWebSocket();
     //! Register a connection and start the thread that serves it. Returns false
     //! (and starts nothing) once shutdown has begun.
     bool startClientThread(int clientSocket, const std::shared_ptr<Connection>& connection);
@@ -56,6 +63,16 @@ private:
     std::shared_ptr<TLSContext> TLS;
     std::unique_ptr<Store> store;
     std::unique_ptr<Listener> listener;
+    //! MQTT over WebSocket listener, created only when FLOWMQ_WEBSOCKET_PORT is
+    //! set. Speaks WSS when a TLS certificate is configured, plain WS otherwise.
+    std::unique_ptr<Listener> websocketListener;
+    //! MQTT-SN gateway (UDP), created only when FLOWMQ_MQTT_SN_PORT is set.
+    std::unique_ptr<MQTTSN::Gateway> mqttSnGateway;
+#if defined(FLOWMQ_WITH_QUIC)
+    //! MQTT over QUIC listener, created only when FLOWMQ_QUIC_PORT is set.
+    //! Built only when libmsquic is available (CMake option).
+    std::unique_ptr<QUICListener> quicListener;
+#endif
     std::atomic<bool> running{false};
     std::atomic<size_t> maxConnections;
     mutable std::mutex connectionsMutex;

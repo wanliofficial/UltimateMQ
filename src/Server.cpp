@@ -1,7 +1,11 @@
 #include "Topic.h"
 #include "Server.h"
 #include "Connection.h"
+#include "WebSocket.h"
 #include <csignal>
+#if defined(FLOWMQ_WITH_QUIC)
+#include "QUIC.h"
+#endif
 #include <stdexcept>
 #include <cstring>
 #include <cstdlib>
@@ -47,6 +51,23 @@ Server::Server(int port, size_t maxConnections)
     }
     listener = std::make_unique<Listener>(port);
     auth = std::make_unique<Auth>();
+
+    // MQTT over WebSocket (opt-in). Without FLOWMQ_WEBSOCKET_PORT the server
+    // opens no extra listener and behaves exactly as before; with it, MQTT
+    // packets ride in WebSocket binary frames on that port (plain WS, or WSS
+    // when a TLS certificate is configured).
+    const char* websocketPort = getenv("FLOWMQ_WEBSOCKET_PORT");
+    if (websocketPort && *websocketPort) {
+        char* end = nullptr;
+        long parsed = std::strtol(websocketPort, &end, 10);
+        if (end == websocketPort || *end != '\0' || parsed <= 0 || parsed > 65535) {
+            throw std::runtime_error(std::string("invalid FLOWMQ_WEBSOCKET_PORT: ") +
+                                     websocketPort);
+        }
+        websocketListener = std::make_unique<Listener>(static_cast<int>(parsed));
+        logInfo("websocket listener on port %d", static_cast<int>(parsed));
+    }
+
     std::string error;
     const char* passwordFile = getenv("FLOWMQ_PASSWORD_FILE");
     if (passwordFile && *passwordFile) {
@@ -95,6 +116,66 @@ Server::Server(int port, size_t maxConnections)
     }
 
     broker = new Broker(auth.get(), store.get());
+
+    // MQTT-SN gateway (opt-in). Without FLOWMQ_MQTT_SN_PORT no UDP socket is
+    // opened and the broker behaves exactly as before; with it, MQTT-SN 1.2
+    // clients are served on that UDP port and share sessions with MQTT clients.
+    const char* mqttSnPort = getenv("FLOWMQ_MQTT_SN_PORT");
+    if (mqttSnPort && *mqttSnPort) {
+        char* end = nullptr;
+        long parsed = std::strtol(mqttSnPort, &end, 10);
+        if (end == mqttSnPort || *end != '\0' || parsed <= 0 || parsed > 65535) {
+            throw std::runtime_error(std::string("invalid FLOWMQ_MQTT_SN_PORT: ") +
+                                     mqttSnPort);
+        }
+        // Predefined topic ids (opt-in): "1=sensors/temp,2=home/#"
+        std::map<uint16_t, std::string> predefinedTopics;
+        const char* predefined = getenv("FLOWMQ_MQTT_SN_PREDEFINED_TOPICS");
+        if (predefined && *predefined) {
+            const std::string spec(predefined);
+            size_t start = 0;
+            while (start < spec.size()) {
+                size_t comma = spec.find(',', start);
+                size_t endPos = comma == std::string::npos ? spec.size() : comma;
+                std::string entry = spec.substr(start, endPos - start);
+                size_t equals = entry.find('=');
+                if (equals != std::string::npos) {
+                    unsigned long id = std::strtoul(entry.substr(0, equals).c_str(),
+                                                    nullptr, 10);
+                    if (id > 0 && id <= 65535) {
+                        predefinedTopics[static_cast<uint16_t>(id)] =
+                            entry.substr(equals + 1);
+                    }
+                }
+                if (comma == std::string::npos) {
+                    break;
+                }
+                start = comma + 1;
+            }
+            logInfo("MQTT-SN predefined topics: %zu", predefinedTopics.size());
+        }
+        mqttSnGateway = std::make_unique<MQTTSN::Gateway>(broker,
+                                                          static_cast<uint16_t>(parsed),
+                                                          predefinedTopics);
+        logInfo("mqtt-sn gateway on UDP port %d", static_cast<int>(parsed));
+    }
+
+#if defined(FLOWMQ_WITH_QUIC)
+    // MQTT over QUIC (opt-in). Without FLOWMQ_QUIC_PORT no UDP socket is
+    // opened; with it, QUIC clients speak MQTT on their first stream.
+    const char* quicPort = getenv("FLOWMQ_QUIC_PORT");
+    if (quicPort && *quicPort) {
+        char* end = nullptr;
+        long parsed = std::strtol(quicPort, &end, 10);
+        if (end == quicPort || *end != '\0' || parsed <= 0 || parsed > 65535) {
+            throw std::runtime_error(std::string("invalid FLOWMQ_QUIC_PORT: ") +
+                                     quicPort);
+        }
+        quicListener = std::make_unique<QUICListener>(broker, static_cast<uint16_t>(parsed));
+        logInfo("quic listener on UDP port %d", static_cast<int>(parsed));
+    }
+#endif
+
 
     // Maximum packet size (opt-in). Bounds per-connection buffering so a client
     // cannot stall the broker with a huge packet. The default keeps historical
@@ -234,6 +315,17 @@ Server::~Server() {
 
 void Server::start() {
     listener->start();
+    if (websocketListener) {
+        websocketListener->start();
+    }
+    if (mqttSnGateway) {
+        mqttSnGateway->start();
+    }
+#if defined(FLOWMQ_WITH_QUIC)
+    if (quicListener) {
+        quicListener->start();
+    }
+#endif
     // Start the background writer only once the state has been restored
     store->start([this]() { return broker->snapshotState(); });
     running = true;
@@ -271,15 +363,34 @@ void Server::run() {
             if (broker) {
                 broker->sweepExpiredSessions();
             }
+            // The MQTT-SN gateway reaps timed-out UDP peers and broadcasts
+            // ADVERTISE on the same cadence.
+            if (mqttSnGateway) {
+                mqttSnGateway->tick();
+            }
             lastSweep = std::chrono::steady_clock::now();
         }
         // Wait for either a new client, the periodic wake-up, or the shutdown
         // wake-up pipe
-        struct pollfd fds[2];
+        struct pollfd fds[4];
         int count = 0;
         fds[count].fd = listener->fd();
         fds[count].events = POLLIN;
         ++count;
+        int websocketFdIndex = -1;
+        if (websocketListener) {
+            websocketFdIndex = count;
+            fds[count].fd = websocketListener->fd();
+            fds[count].events = POLLIN;
+            ++count;
+        }
+        int mqttSnFdIndex = -1;
+        if (mqttSnGateway) {
+            mqttSnFdIndex = count;
+            fds[count].fd = mqttSnGateway->fd();
+            fds[count].events = POLLIN;
+            ++count;
+        }
         if (gWakePipe[0] >= 0) {
             fds[count].fd = gWakePipe[0];
             fds[count].events = POLLIN;
@@ -305,11 +416,19 @@ void Server::run() {
             break;
         }
         // A wake-up byte means a signal arrived: leave the loop so that the
-        // caller can shut down and flush the state
-        bool signalled = count > 1 && (fds[1].revents & POLLIN) != 0;
+        // caller can shut down and flush the state. The pipe is always the
+        // last entry registered, whatever listeners are active.
+        bool signalled = gWakePipe[0] >= 0 && (fds[count - 1].revents & POLLIN) != 0;
         if (signalled) {
             logInfo("shutdown requested");
             break;
+        }
+        if (websocketFdIndex >= 0 && (fds[websocketFdIndex].revents & POLLIN) != 0) {
+            acceptWebSocket();
+        }
+        if (mqttSnFdIndex >= 0 && (fds[mqttSnFdIndex].revents & POLLIN) != 0) {
+            // Never blocks: drains every queued datagram, then returns.
+            mqttSnGateway->handleReadable();
         }
         if ((fds[0].revents & POLLIN) == 0) {
             continue;
@@ -342,6 +461,36 @@ void Server::run() {
             close(clientSocket);
             break;
         }
+    }
+}
+
+void Server::acceptWebSocket() {
+    int clientSocket = websocketListener->acceptConnection();
+    if (clientSocket < 0) {
+        if (!running) {
+            return;
+        }
+        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            logError("failed to accept websocket connection: %s", std::strerror(errno));
+        }
+        return;
+    }
+    if (getActiveConnections() >= maxConnections) {
+        logError("too many connections, rejecting websocket client");
+        close(clientSocket);
+        return;
+    }
+    // The HTTP Upgrade handshake (and any TLS handshake for WSS) runs inside
+    // Connection::run() through the transport's handshake() hook.
+    auto websocket = std::make_unique<WebSocketTransport>(
+        std::make_unique<SecureTransport>(
+            clientSocket, TLS,
+            broker ? broker->getWriteTimeoutMs()
+                   : SecureTransport::WRITE_STALL_TIMEOUT_MS));
+    auto connection = std::make_shared<Connection>(clientSocket, broker,
+                                                   std::move(websocket));
+    if (!startClientThread(clientSocket, connection)) {
+        close(clientSocket);
     }
 }
 
@@ -440,6 +589,17 @@ void Server::stop() {
     if (listener) {
         listener->stop();
     }
+    if (websocketListener) {
+        websocketListener->stop();
+    }
+    if (mqttSnGateway) {
+        mqttSnGateway->stop();
+    }
+#if defined(FLOWMQ_WITH_QUIC)
+    if (quicListener) {
+        quicListener->stop();
+    }
+#endif
 
     std::map<int, std::shared_ptr<Connection>> open;
     {

@@ -14,14 +14,29 @@ add_library(flowmq_lib STATIC
     src/Message.cpp
     src/SysTopics.cpp
     src/Broker.cpp
-    src/Server.cpp  
+    src/Server.cpp
     src/Listener.cpp
     src/Connection.cpp
     src/Session.cpp
     src/Auth.cpp
     src/Store.cpp
     src/TLS.cpp
+    src/WebSocket.cpp
+    src/MQTTSN.cpp
 )
+
+# MQTT over QUIC (opt-in). Built only when libmsquic is available; without it
+# the broker compiles and runs exactly as before, minus the FLOWMQ_QUIC_PORT
+# listener.
+find_library(MSQUIC_LIBRARY msquic)
+if(MSQUIC_LIBRARY)
+    message(STATUS "libmsquic found: ${MSQUIC_LIBRARY} - MQTT over QUIC enabled")
+    target_sources(flowmq_lib PRIVATE src/QUIC.cpp)
+    target_compile_definitions(flowmq_lib PUBLIC FLOWMQ_WITH_QUIC)
+    target_link_libraries(flowmq_lib PUBLIC ${MSQUIC_LIBRARY})
+else()
+    message(STATUS "libmsquic not found - MQTT over QUIC disabled")
+endif()
 
 # Set include directories for the library
 target_include_directories(flowmq_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)

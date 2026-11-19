@@ -15,6 +15,7 @@
 #include "Frame.h"
 #include "Session.h"
 #include "Auth.h"
+#include "Transport.h"
 #include "TLS.h"
 
 namespace MQTT {
@@ -34,8 +35,14 @@ class Connection : public Client, public std::enable_shared_from_this<Connection
     };
 
 public:
+    //! A plain (or TLS-wrapped) socket connection: the transport is built here.
     explicit Connection(int sockfd, Broker* broker,
                         std::shared_ptr<TLSContext> TLS = nullptr);
+    //! A connection over a transport the listener already prepared (WebSocket,
+    //! QUIC stream): the transport is handed over whole. \p sockfd may be -1
+    //! when the transport has no poll()-able descriptor of its own.
+    Connection(int sockfd, Broker* broker,
+               std::unique_ptr<ClientTransport> transport);
     ~Connection();
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
@@ -176,7 +183,7 @@ private:
     bool willHasExpiry = false;
     uint32_t willExpiryInterval = 0;
     std::function<void()> disconnectCallback;
-    std::unique_ptr<SecureTransport> transport;
+    std::unique_ptr<ClientTransport> transport;
     static const int BUFFER_SIZE = 4096;
     uint8_t buffer[BUFFER_SIZE];
 };

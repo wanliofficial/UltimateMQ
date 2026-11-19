@@ -726,7 +726,12 @@ TEST_F(FrameTest, SerializeConnackForMqtt5KeepsV5ReasonCode)
 {
     Frame v5(Version::MQTT5);
     ConnackPacket badCredentials(false, ReasonCode::BAD_USERNAME_OR_PASSWORD);
-    EXPECT_EQ(v5.serialize(badCredentials), (std::vector<uint8_t>{0x20, 0x02, 0x00, 0x86}));
+    // §2.2.2: the Property Length is part of every MQTT 5 CONNACK, even when
+    // there are no properties - the empty section is one 0 byte. The rejection
+    // paths answer with a property-less CONNACK, so the field must be present
+    // there too or strict clients reject the packet as malformed.
+    EXPECT_EQ(v5.serialize(badCredentials),
+              (std::vector<uint8_t>{0x20, 0x03, 0x00, 0x86, 0x00}));
 }
 
 TEST_F(FrameTest, SerializeConnackForMqtt5AdvertisesMaximumPacketSize)

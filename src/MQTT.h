@@ -224,7 +224,11 @@ struct FixedHeader {
         // Check specific rules for different packet types
         switch (type) {
         case PacketType::PUBLISH:
-            // PUBLISH can have any combination of flags
+            // MQTT-3.3.1-1: the DUP flag MUST be 0 for all QoS 0 messages, so a
+            // QoS 0 PUBLISH with DUP set is malformed (MQTT-4.13).
+            if (qos == QoS::QOS_0 && dup) {
+                return false;
+            }
             return true;
         case PacketType::PUBREL:
         case PacketType::SUBSCRIBE:

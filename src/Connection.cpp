@@ -49,11 +49,19 @@ std::string generateClientId() {
 }
 
 Connection::Connection(int sockfd, Broker* broker, std::shared_ptr<TLSContext> TLS)
+    : Connection(sockfd, broker,
+                 std::make_unique<SecureTransport>(
+                     sockfd, std::move(TLS),
+                     broker ? broker->getWriteTimeoutMs()
+                            : SecureTransport::WRITE_STALL_TIMEOUT_MS)) {}
+
+Connection::Connection(int sockfd, Broker* broker,
+                       std::unique_ptr<ClientTransport> ownedTransport)
     : sockfd(sockfd), state(State::IDLE), broker(broker),
       writeTimeoutMs(broker ? broker->getWriteTimeoutMs()
                             : SecureTransport::WRITE_STALL_TIMEOUT_MS),
       auth(broker ? broker->getAuth() : nullptr),
-      transport(std::make_unique<SecureTransport>(sockfd, std::move(TLS), writeTimeoutMs)),
+      transport(std::move(ownedTransport)),
       lastActivity(std::chrono::steady_clock::now()) {
     // Cap the packet size before any byte (including the first CONNECT) is read.
     // The version is fixed later, but the limit does not depend on it.
@@ -89,12 +97,27 @@ void Connection::run() {
         // MQTT-4.13: a packet above the limit is reported as PACKET_TOO_LARGE,
         // not as a malformed one, so the client knows to send smaller packets.
         closeWithReason(ReasonCode::PACKET_TOO_LARGE);
-    } catch (const Frame::ProtocolViolation &e) {
-        logError("dropping connection: %s", e.what());
-        // MQTT-4.13: the packet parsed cleanly but its content breaks a rule, so
-        // the client is told PROTOCOL_ERROR rather than MALFORMED_PACKET.
-        closeWithReason(ReasonCode::PROTOCOL_ERROR);
-    } catch (const std::exception &e) {
+        } catch (const Frame::ProtocolViolation &e) {
+            logError("dropping connection: %s", e.what());
+            // MQTT-4.13: the packet parsed cleanly but its content breaks a rule, so
+            // the client is told PROTOCOL_ERROR rather than MALFORMED_PACKET.
+            closeWithReason(ReasonCode::PROTOCOL_ERROR);
+        } catch (const Frame::UnsupportedProtocol &e) {
+            logError("dropping connection: %s", e.what());
+            // §3.1.2.1: answer UNSUPPORTED_PROTOCOL_VERSION in the encoding of the
+            // version the client asked for - 0x84 on an MQTT 5 framing, 0x01 on the
+            // shared MQTT 3.1.x framing (whose return code table stops at 0x05).
+            // For an unknown version byte there is no encoding both sides agree
+            // on, so the Network Connection simply closes, as MQTT-3.1.2-1 allows.
+            if (e.detected >= 3 && e.detected <= 5) {
+                frame.setVersion(e.detected == 5 ? Version::MQTT5
+                                                 : (e.detected == 3 ? Version::MQTT31
+                                                                    : Version::MQTT311));
+                ConnackPacket connack{false, ReasonCode::UNSUPPORTED_PROTOCOL_VERSION};
+                connackSent = true;
+                sendPacket(connack);
+            }
+        } catch (const std::exception &e) {
         logError("dropping connection: %s", e.what());
         // Anything else the broker cannot parse is malformed (MQTT-4.13): tell
         // an MQTT 5 client which error ended the connection instead of vanishing.
@@ -421,6 +444,14 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
         if (connect->reservedFlagSet) {
             badFlags = true;
             why = "reserved CONNECT flag bit is set";
+        }
+        // MQTT-3.1.2-2 (MQTT 3.1.x only): the Password Flag may only be set when
+        // the User Name Flag is set. MQTT 5 dropped that restriction, so a v5
+        // Password without a User Name stays legal here.
+        else if (frame.getVersion() != Version::MQTT5 && connect->password &&
+                 !connect->username) {
+            badFlags = true;
+            why = "Password Flag set without the User Name Flag";
         }
         // MQTT-3.1.2-13 / MQTT-3.1.2-14: when the Will Flag is 0 the Will QoS must
         // be 0; when it is 1 the Will QoS may be 0, 1 or 2 but never 3.
@@ -1368,7 +1399,9 @@ void Connection::closeWithReason(ReasonCode reason) {
 
 bool Connection::sendPacket(Packet &packet) {
     std::lock_guard<std::recursive_mutex> lock(writeMutex);
-    if (sockfd < 0) {
+    // Not sockfd-based: a QUIC connection has no descriptor. A closed or dead
+    // transport reports failure through writeAll below.
+    if (!transport) {
         return false;
     }
     auto data = frame.serialize(packet);

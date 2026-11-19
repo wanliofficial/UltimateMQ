@@ -669,7 +669,11 @@ ConnectPacket Frame::parseConnect(const uint8_t *buffer, size_t length) {
     logDebug("CONNECT protocol name=%s version=%d", protoName.c_str(), (int)protoVersion);
     offset += 1;
     if (!connect.isValidProtocol()) {
-        throw std::runtime_error("Invalid protocol name or version");
+        // §3.1.2.1: an unsupported Protocol Name / Version pair is answered with
+        // UNSUPPORTED_PROTOCOL_VERSION, not with MALFORMED_PACKET, so the caller
+        // needs to know which version the client asked for.
+        throw UnsupportedProtocol("unsupported protocol name or version",
+                                  static_cast<uint8_t>(protoVersion));
     }
 
     // Parse connect flags
@@ -1124,12 +1128,15 @@ std::vector<uint8_t> Frame::serializeConnack(const ConnackPacket &packet) {
     body.push_back(connAckFlags);
     body.push_back(code);
     if (version == Version::MQTT5) {
+        // §2.2.2: every MQTT 5 CONNACK carries the Property Length field, even
+        // when there are no properties - the field itself is a single 0 byte.
+        // Omitting it produced a Remaining Length 2 CONNACK that strict clients
+        // reject as malformed; the CONNECT rejection paths in
+        // Connection::handleConnect all answer with a property-less CONNACK.
         auto propertiesBuffer = serializeProperties(packet.properties);
-        if (!propertiesBuffer.empty()) {
-            auto propertyLengthBytes = encodeRemainingLength(propertiesBuffer.size());
-            body.insert(body.end(), propertyLengthBytes.begin(), propertyLengthBytes.end());
-            body.insert(body.end(), propertiesBuffer.begin(), propertiesBuffer.end());
-        }
+        auto propertyLengthBytes = encodeRemainingLength(propertiesBuffer.size());
+        body.insert(body.end(), propertyLengthBytes.begin(), propertyLengthBytes.end());
+        body.insert(body.end(), propertiesBuffer.begin(), propertiesBuffer.end());
     }
 
     // Fixed header: type byte, remaining length, then the variable header body.
@@ -1473,46 +1480,45 @@ std::vector<uint8_t> Frame::serializePingresp(const PingrespPacket &packet) {
 std::vector<uint8_t> Frame::serializeDisconnect(const DisconnectPacket &packet) {
     std::vector<uint8_t> buffer;
     buffer.push_back(static_cast<uint8_t>(PacketType::DISCONNECT) << 4);
-    // Calculate remaining length
-    uint32_t remainingLength = 0;
-    if (packet.reasonCode != ReasonCode::NORMAL_DISCONNECTION) {
-        remainingLength += 1; // Reason Code (1 byte)
-    }
-    if (!packet.properties.empty()) {
+    // §3.14.2.1: a Remaining Length of 0 means Reason Code 0x00 with no
+    // properties. Whenever anything follows the fixed header, the Reason Code
+    // comes first and the Property Length precedes the properties (§3.14.2.2 /
+    // §3.14.2.2.1) - so the two fields are written together, even for a normal
+    // disconnection that carries properties.
+    std::vector<uint8_t> body;
+    if (packet.reasonCode != ReasonCode::NORMAL_DISCONNECTION ||
+        !packet.properties.empty()) {
+        body.push_back(static_cast<uint8_t>(packet.reasonCode));
         std::vector<uint8_t> propertiesBytes = serializeProperties(packet.properties);
-        remainingLength += propertiesBytes.size() + 1; // Properties + Property Length
+        auto propertyLengthBytes = encodeRemainingLength(propertiesBytes.size());
+        body.insert(body.end(), propertyLengthBytes.begin(), propertyLengthBytes.end());
+        body.insert(body.end(), propertiesBytes.begin(), propertiesBytes.end());
     }
-
-    // Serialize remaining length
-    std::vector<uint8_t> remainingLengthBytes = encodeRemainingLength(remainingLength);
+    auto remainingLengthBytes = encodeRemainingLength(body.size());
     buffer.insert(buffer.end(), remainingLengthBytes.begin(), remainingLengthBytes.end());
-
-    // Serialize Reason Code if not NORMAL_DISCONNECTION
-    if (packet.reasonCode != ReasonCode::NORMAL_DISCONNECTION) {
-        buffer.push_back(static_cast<uint8_t>(packet.reasonCode));
-    }
-
-    // Serialize Properties if not empty
-    if (!packet.properties.empty()) {
-        std::vector<uint8_t> propertiesBytes = serializeProperties(packet.properties);
-        buffer.insert(buffer.end(), propertiesBytes.begin(), propertiesBytes.end());
-    }
+    buffer.insert(buffer.end(), body.begin(), body.end());
     return buffer;
 }
 
 std::vector<uint8_t> Frame::serializeAuth(const AuthPacket &packet) {
     std::vector<uint8_t> buffer;
     buffer.push_back(static_cast<uint8_t>(PacketType::AUTH) << 4);
-    // Serialize remaining length
-    std::vector<uint8_t> remainingLength = encodeRemainingLength(2 + packet.properties.size());
-    buffer.insert(buffer.end(), remainingLength.begin(), remainingLength.end());
-
-    // Serialize reason code
-    buffer.push_back(static_cast<uint8_t>(packet.reasonCode));
-
-    // Serialize properties
-    std::vector<uint8_t> properties = serializeProperties(packet.properties);
-    buffer.insert(buffer.end(), properties.begin(), properties.end());
+    // §3.15.2.1: the Reason Code and Property Length may be omitted only when
+    // the Remaining Length is 0 (Reason Code 0x00, no properties). Otherwise the
+    // packet is Reason Code, Property Length, then the properties. The earlier
+    // code added the property *count* to the Remaining Length instead of the
+    // encoded byte size and skipped the Property Length byte entirely.
+    std::vector<uint8_t> body;
+    if (packet.reasonCode != ReasonCode::SUCCESS || !packet.properties.empty()) {
+        body.push_back(static_cast<uint8_t>(packet.reasonCode));
+        std::vector<uint8_t> propertiesBytes = serializeProperties(packet.properties);
+        auto propertyLengthBytes = encodeRemainingLength(propertiesBytes.size());
+        body.insert(body.end(), propertyLengthBytes.begin(), propertyLengthBytes.end());
+        body.insert(body.end(), propertiesBytes.begin(), propertiesBytes.end());
+    }
+    auto remainingLengthBytes = encodeRemainingLength(body.size());
+    buffer.insert(buffer.end(), remainingLengthBytes.begin(), remainingLengthBytes.end());
+    buffer.insert(buffer.end(), body.begin(), body.end());
     return buffer;
 }
 

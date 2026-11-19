@@ -17,7 +17,7 @@ set(TEST_SOURCES
     TLSTests.cpp
     SysTopicsTests.cpp
     Utf8Tests.cpp
-    # Add more test files here as you create them
+    MQTTSNTests.cpp
 )
 
 # Create the test executable

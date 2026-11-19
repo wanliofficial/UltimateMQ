@@ -47,9 +47,51 @@ All configuration is read from environment variables at startup.
 | `FLOWMQ_TLS_CA` | unset | CA bundle used to verify client certificates |
 | `FLOWMQ_TLS_VERIFY_CLIENTS` | unset | When set, a client certificate signed by `FLOWMQ_TLS_CA` is required |
 | `FLOWMQ_TLS_CERT_AS_USERNAME` | unset | With mutual TLS, authorise a client that sends no MQTT username under its certificate CN |
+| `FLOWMQ_WEBSOCKET_PORT` | unset | Additional TCP port serving MQTT over WebSocket (`ws://`, or `wss://` when TLS is configured) |
+| `FLOWMQ_MQTT_SN_PORT` | unset | UDP port serving MQTT-SN 1.2 clients through the built-in gateway |
+| `FLOWMQ_MQTT_SN_PREDEFINED_TOPICS` | unset | Predefined MQTT-SN topic ids, e.g. `1=sensors/temp,2=home/#` |
+| `FLOWMQ_QUIC_PORT` | unset | UDP port serving MQTT over QUIC; requires a build with libmsquic (see below) |
+
+#### MQTT over WebSocket (`FLOWMQ_WEBSOCKET_PORT`)
+
+When the variable is set the broker opens an additional TCP listener that
+speaks the OASIS MQTT-over-WebSocket binding: the client performs the standard
+HTTP Upgrade handshake offering the `mqtt` subprotocol, then carries ordinary
+MQTT 3.1.1/5 packets in WebSocket binary frames. With a TLS certificate
+configured the same listener speaks WSS. Everything else (sessions, retained
+messages, QoS, ACLs) is shared with plain TCP clients.
+
+#### MQTT-SN gateway (`FLOWMQ_MQTT_SN_PORT`)
+
+When the variable is set the broker serves MQTT-SN 1.2 clients on that UDP
+port. The gateway maps MQTT-SN datagrams onto ordinary broker sessions, so
+sensor clients share subscriptions, retained messages and QoS 1/2 flows with
+MQTT clients. Supported: CONNECT with the WILLTOPIC/WILLMSG handshake,
+REGISTER with gateway-assigned topic ids, PUBLISH by topic id / predefined id
+/ short name, SUBSCRIBE by topic name / predefined id / short name, QoS 0/1/2,
+retained messages, keep alive (1.5× duration), sleeping DISCONNECT with a
+duration, SEARCHGW/GWINFO and periodic ADVERTISE broadcasts. Notes: an
+MQTT-SN PUBLISH never carries a topic name, so clients must REGISTER a topic
+name first and then publish by its topic id; the gateway serves anonymous
+deployments only (a broker with `FLOWMQ_PASSWORD_FILE` refuses SN connects);
+predefined topic ids come from `FLOWMQ_MQTT_SN_PREDEFINED_TOPICS`
+(`id=topic` pairs, comma separated).
+
+#### MQTT over QUIC (`FLOWMQ_QUIC_PORT`)
+
+Built only when libmsquic is found at configure time (otherwise the feature is
+compiled out and the variable is unknown). When enabled and the variable is
+set, one QUIC connection is one MQTT network connection: the client opens its
+first bidirectional stream and speaks ordinary MQTT 3.1.1/5 on it. QUIC always
+speaks TLS 1.3, reusing `FLOWMQ_TLS_CERT`/`FLOWMQ_TLS_KEY` when configured;
+without them the listener generates an ephemeral self-signed certificate for
+development, which clients should connect to with certificate verification
+disabled or pinning.
 
 When neither file is set the broker stays fully open (every client may
-connect and use every topic), which keeps the historical behaviour.#### Users (`FLOWMQ_PASSWORD_FILE`)
+connect and use every topic), which keeps the historical behaviour.
+
+#### Users (`FLOWMQ_PASSWORD_FILE`)
 
 One entry per line, `#` starts a comment:
 

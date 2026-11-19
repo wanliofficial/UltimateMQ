@@ -70,6 +70,18 @@ public:
     public:
         explicit MalformedString(const std::string &what) : std::runtime_error(what) {}
     };
+    //! A CONNECT whose Protocol Name / Version pair this server does not speak
+    //! (§3.1.2.1). Distinct from a generic parse failure so the connection can
+    //! answer with UNSUPPORTED_PROTOCOL_VERSION (0x84 on MQTT 5, 0x01 on
+    //! MQTT 3.1.x) in the encoding the client asked for, instead of reporting
+    //! MALFORMED_PACKET (0x81) - a value outside the 3.1.x return-code table.
+    class UnsupportedProtocol : public std::runtime_error {
+    public:
+        UnsupportedProtocol(const std::string &what, uint8_t detected)
+            : std::runtime_error(what), detected(detected) {}
+        //! The Protocol Version byte exactly as the client sent it.
+        uint8_t detected;
+    };
 
     static constexpr size_t MAX_MULTIPLIER = 128 * 128 * 128;
     static constexpr size_t MAX_LENGTH = 268435455; 

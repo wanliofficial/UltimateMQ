@@ -2,6 +2,7 @@
 #define TLS_H
 #pragma once
 
+#include "Transport.h"
 #include <memory>
 #include <string>
 #include <sys/time.h>
@@ -55,7 +56,7 @@ private:
  * The transport does not own the socket descriptor: the connection still
  * opens and closes it. It owns only the SSL object (if any).
  */
-class SecureTransport {
+class SecureTransport : public ClientTransport {
 public:
     //! How long a single write may make no progress before the connection is
     //! treated as stalled and dropped. Bounds how long one slow or absent reader
@@ -71,11 +72,11 @@ public:
     SecureTransport(const SecureTransport &) = delete;
     SecureTransport &operator=(const SecureTransport &) = delete;
 
-    int fd() const { return fd_; }
-    bool TLSEnabled() const { return ssl_ != nullptr; }
+    int fd() const override { return fd_; }
+    bool TLSEnabled() const override { return ssl_ != nullptr; }
 
     //! Perform the TLS handshake (a no-op for a plaintext connection)
-    bool handshake(std::string *error = nullptr);
+    bool handshake(std::string *error = nullptr) override;
 
     //! The identity of the verified client certificate, for authorisation when
     //! the client sends no MQTT username. Returns the certificate's Common
@@ -83,24 +84,24 @@ public:
     //! and carries a CN; an empty string for a plaintext connection, a client
     //! without a certificate, or an unverified certificate. Requires the
     //! handshake to have completed.
-    std::string peerIdentity() const;
+    std::string peerIdentity() const override;
     //! Whether the peer's certificate was presented and verified (X509_V_OK).
     //! Always false for a plaintext connection.
-    bool peerVerified() const;
+    bool peerVerified() const override;
 
     //! Wait until the peer has data ready (or timeoutMs elapses).
     //! Returns 1 when data is ready, 0 on timeout, -1 to retry (EINTR).
-    int readable(int timeoutMs);
+    int readable(int timeoutMs) override;
 
     //! Read up to \p max bytes. Returns bytes read (>0), 0 on orderly close,
     //! -1 on error.
-    ssize_t readSome(uint8_t *buf, size_t max);
+    ssize_t readSome(uint8_t *buf, size_t max) override;
 
     //! Write all of \p len bytes. Returns false if the peer is gone.
-    bool writeAll(const uint8_t *buf, size_t len);
+    bool writeAll(const uint8_t *buf, size_t len) override;
 
     //! Send a TLS close_notify and release the SSL object (a no-op if plaintext)
-    void teardown();
+    void teardown() override;
 
 private:
     int fd_;
