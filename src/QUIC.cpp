@@ -10,8 +10,10 @@
 #include <cstring>
 #include <thread>
 #include <unistd.h>
+#include <cerrno>
 #include <sys/stat.h>
 #include <vector>
+#include <functional>
 
 namespace MQTT {
 
@@ -27,6 +29,14 @@ struct QUICStreamState {
     std::atomic<bool> closed{false};
     HQUIC stream = nullptr;
     HQUIC connection = nullptr;
+    //! Set when a peer-initiated stream has finished starting. msquic forbids
+    //! sending before QUIC_STREAM_EVENT_START_COMPLETE, so the serving thread
+    //! waits for this instead of writing straight out of PEER_STREAM_STARTED.
+    std::atomic<bool> started{false};
+    //! Spawns the Connection that serves this stream. Set when the connection
+    //! accepts the peer stream; invoked once from START_COMPLETE so the thread
+    //! never writes before msquic allows it.
+    std::function<void()> startServing;
 };
 
 //! The msquic API table, opened once per process. msquic expects the table to
@@ -57,13 +67,22 @@ struct EphemeralCertificate {
         FILE *certFile = nullptr;
         FILE *keyFile = nullptr;
         do {
-            if (!ctx || EVP_PKEY_keygen_init(ctx) <= 0 ||
-                EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) <= 0 ||
-                EVP_PKEY_keygen(ctx, &pkey) <= 0 || !pkey) {
+            if (!ctx) {
+                logError("QUIC cert: EVP_PKEY_CTX_new_id failed");
+                break;
+            }
+            if (EVP_PKEY_keygen_init(ctx) <= 0 ||
+                EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) <= 0) {
+                logError("QUIC cert: RSA key parameter setup failed");
+                break;
+            }
+            if (EVP_PKEY_keygen(ctx, &pkey) <= 0 || !pkey) {
+                logError("QUIC cert: RSA key generation failed");
                 break;
             }
             x509 = X509_new();
             if (!x509) {
+                logError("QUIC cert: X509_new failed");
                 break;
             }
             ASN1_INTEGER_set(X509_get_serialNumber(x509), 1);
@@ -80,34 +99,38 @@ struct EphemeralCertificate {
             X509_NAME_free(name);
             X509_set_pubkey(x509, pkey);
             if (!X509_sign(x509, pkey, EVP_sha256())) {
+                logError("QUIC cert: X509_sign failed");
                 break;
             }
-            certPath = "/tmp/flowmq-quic-cert-XXXXXX.pem";
-            keyPath = "/tmp/flowmq-quic-key-XXXXXX.pem";
-            std::vector<char> certBuf(certPath.begin(), certPath.end());
-            std::vector<char> keyBuf(keyPath.begin(), keyPath.end());
-            certBuf.push_back('\0');
-            keyBuf.push_back('\0');
-            int certFd = mkstemp(certBuf.data());
-            int keyFd = mkstemp(keyBuf.data());
-            if (certFd < 0 || keyFd < 0) {
-                if (certFd >= 0) {
-                    close(certFd);
-                }
-                if (keyFd >= 0) {
-                    close(keyFd);
-                }
+            // mkstemp requires the XXXXXX suffix to be the last six characters
+            // of the template, so the extension follows a fresh template and
+            // the resulting descriptor is simply renamed-into-place below.
+            // A single unique base keeps the two files related and avoids
+            // collisions with stale files from an earlier run.
+            std::vector<char> baseBuf;
+            const std::string baseTemplate = "/tmp/flowmq-quic-XXXXXX";
+            baseBuf.assign(baseTemplate.begin(), baseTemplate.end());
+            baseBuf.push_back('\0');
+            char *base = mkdtemp(baseBuf.data());
+            if (!base) {
+                logError("QUIC cert: mkdtemp failed: %s", std::strerror(errno));
                 break;
             }
-            close(certFd);
-            close(keyFd);
-            certPath.assign(certBuf.data());
-            keyPath.assign(keyBuf.data());
+            certPath = std::string(base) + "/cert.pem";
+            keyPath = std::string(base) + "/key.pem";
             certFile = fopen(certPath.c_str(), "wb");
             keyFile = fopen(keyPath.c_str(), "wb");
-            if (!certFile || !keyFile || PEM_write_X509(certFile, x509) <= 0 ||
-                PEM_write_PrivateKey(keyFile, pkey, nullptr, nullptr, 0, nullptr,
+            if (!certFile || !keyFile) {
+                logError("QUIC cert: fopen failed");
+                break;
+            }
+            if (PEM_write_X509(certFile, x509) <= 0) {
+                logError("QUIC cert: PEM_write_X509 failed");
+                break;
+            }
+            if (PEM_write_PrivateKey(keyFile, pkey, nullptr, nullptr, 0, nullptr,
                                      nullptr) <= 0) {
+                logError("QUIC cert: PEM_write_PrivateKey failed");
                 break;
             }
             fclose(certFile);
@@ -139,6 +162,12 @@ struct EphemeralCertificate {
         if (ok) {
             unlink(certPath.c_str());
             unlink(keyPath.c_str());
+            // The files live in a private directory created by mkdtemp; drop
+            // it once both are gone.
+            const size_t slash = certPath.rfind('/');
+            if (slash != std::string::npos) {
+                rmdir(certPath.substr(0, slash).c_str());
+            }
         }
     }
 };
@@ -227,6 +256,16 @@ public:
         if (len == 0) {
             return true;
         }
+        // msquic answers StreamSend with INVALID_STATE before the stream's
+        // START_COMPLETE, so the very first packet (CONNACK) would be lost.
+        // Wait for the start instead of racing it.
+        {
+            std::unique_lock<std::mutex> lock(state_->mutex);
+            state_->condition.wait_for(lock, std::chrono::seconds(5), [&] {
+                return state_->started.load(std::memory_order_acquire) ||
+                       state_->closed.load(std::memory_order_acquire);
+            });
+        }
         if (state_->closed.load(std::memory_order_acquire)) {
             return false;
         }
@@ -237,8 +276,15 @@ public:
         QUIC_BUFFER quicBuffer;
         quicBuffer.Buffer = copy;
         quicBuffer.Length = static_cast<uint32_t>(len);
-        if (QUIC_FAILED(quicApi()->StreamSend(state_->stream, &quicBuffer, 1,
-                                                     QUIC_SEND_FLAG_NONE, copy))) {
+        // The first write carries START: msquic then starts the stream and
+        // sends the buffer in one step, which is the only ordering that both
+        // starts the stream and gets the first packet (CONNACK) on the wire.
+        const QUIC_SEND_FLAGS sendFlags =
+            state_->started.load(std::memory_order_acquire) ? QUIC_SEND_FLAG_NONE
+                                                            : QUIC_SEND_FLAG_START;
+        QUIC_STATUS sendStatus = quicApi()->StreamSend(state_->stream, &quicBuffer, 1,
+                                                       sendFlags, copy);
+        if (QUIC_FAILED(sendStatus)) {
             delete[] copy;
             state_->closed.store(true, std::memory_order_release);
             return false;
@@ -350,7 +396,11 @@ QUIC_STATUS QUIC_API connectionCallback(HQUIC connection, void *context,
             quicApi()->SetCallbackHandler(event->PEER_STREAM_STARTED.Stream,
                                           reinterpret_cast<void *>(streamCallback),
                                           conn->state.get());
-            serveConnection(conn);
+            // A peer-initiated stream receives as soon as the client sends,
+            // but msquic only transmits what is written to it after the start
+            // completes. The serving thread is spawned from the
+            // START_COMPLETE event, and the first write carries
+            // QUIC_SEND_FLAG_START so the two cannot race.
         } else {
             // Exactly one MQTT stream per connection; extra streams are
             // aborted rather than half-served.
@@ -391,6 +441,15 @@ QUIC_STATUS QUIC_API streamCallback(HQUIC stream, void *context,
         }
         break;
     }
+    case QUIC_STREAM_EVENT_START_COMPLETE:
+        // The stream is ready for sends only now; hand it to the serving
+        // thread.
+        state->started.store(true, std::memory_order_release);
+        state->condition.notify_all();
+        if (state->startServing) {
+            state->startServing();
+        }
+        break;
     case QUIC_STREAM_EVENT_SEND_COMPLETE:
         // The payload handed to StreamSend is copied per send and released
         // here, when msquic no longer references it.
@@ -423,8 +482,9 @@ QUIC_STATUS QUIC_API listenerCallback(HQUIC /*listener*/, void *context,
         conn->accept = accept;
         quicApi()->SetCallbackHandler(event->NEW_CONNECTION.Connection,
                                       reinterpret_cast<void *>(connectionCallback), conn);
-        if (QUIC_FAILED(quicApi()->ConnectionSetConfiguration(
-                event->NEW_CONNECTION.Connection, accept->impl->configuration))) {
+        QUIC_STATUS setStatus = quicApi()->ConnectionSetConfiguration(
+            event->NEW_CONNECTION.Connection, accept->impl->configuration);
+        if (QUIC_FAILED(setStatus)) {
             // The shutdown completion fires on the worker thread, closes the
             // handle and deletes the context installed above.
             quicApi()->ConnectionShutdown(event->NEW_CONNECTION.Connection,
@@ -459,8 +519,9 @@ void QUICListener::start() {
     }
     QUIC_REGISTRATION_CONFIG registrationConfig{"flowmq",
                                                 QUIC_EXECUTION_PROFILE_LOW_LATENCY};
-    if (QUIC_FAILED(api->RegistrationOpen(&registrationConfig,
-                                                 &impl->registration))) {
+    QUIC_STATUS regStatus = api->RegistrationOpen(&registrationConfig,
+                                                  &impl->registration);
+    if (QUIC_FAILED(regStatus)) {
         throw std::runtime_error("failed to open the msquic registration");
     }
 
@@ -512,6 +573,19 @@ void QUICListener::start() {
         impl->ephemeralCertificate.reset();
         api->RegistrationClose(impl->registration);
         throw std::runtime_error("failed to open the msquic configuration");
+    }
+    // msquic 2.6 keeps the credential passed to ConfigurationOpen pending until
+    // it is loaded explicitly. Without this call the listener accepts the QUIC
+    // handshake but every ConnectionSetConfiguration answers INVALID_PARAMETER,
+    // so the client is refused before any stream exists.
+    if (QUIC_FAILED(api->ConfigurationLoadCredential(impl->configuration,
+                                                     &credentialConfig))) {
+        api->ConfigurationClose(impl->configuration);
+        impl->configuration = nullptr;
+        impl->ephemeralCertificate.reset();
+        api->RegistrationClose(impl->registration);
+        impl->registration = nullptr;
+        throw std::runtime_error("failed to load the QUIC credential");
     }
 
     if (QUIC_FAILED(api->ListenerOpen(impl->registration, listenerCallback,

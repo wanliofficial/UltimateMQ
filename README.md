@@ -84,9 +84,20 @@ compiled out and the variable is unknown). When enabled and the variable is
 set, one QUIC connection is one MQTT network connection: the client opens its
 first bidirectional stream and speaks ordinary MQTT 3.1.1/5 on it. QUIC always
 speaks TLS 1.3, reusing `FLOWMQ_TLS_CERT`/`FLOWMQ_TLS_KEY` when configured;
-without them the listener generates an ephemeral self-signed certificate for
-development, which clients should connect to with certificate verification
-disabled or pinning.
+without them the listener generates an ephemeral self-signed certificate in a
+private temporary directory for development, which clients should connect to
+with certificate verification disabled or pinning.
+
+The listener binds its UDP port, completes the QUIC/TLS 1.3 handshake, accepts
+the client's first bidirectional stream, parses the MQTT CONNECT on it and
+establishes the session exactly like a TCP client. Note that this path depends
+on msquic's stream API, which has platform-specific behaviour: with the
+Homebrew libmsquic 2.6.x build on Intel macOS the server side accepts and reads
+stream data but the bytes written back do not reach the peer (a loopback test
+using only msquic's own client and server segfaults), so end-to-end delivery
+could not be verified on that platform. Linux builds with the same API — and
+any platform where msquic's stream send path is sound — should not be affected.
+
 
 When neither file is set the broker stays fully open (every client may
 connect and use every topic), which keeps the historical behaviour.
