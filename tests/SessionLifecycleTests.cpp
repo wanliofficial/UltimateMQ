@@ -866,4 +866,121 @@ TEST_F(SessionLifecycleTest, ResumeRetransmitsEverySubscriptionIdentifier)
         << "the retransmission must repeat the same identifier list";
 }
 
+TEST_F(SessionLifecycleTest, ResumeDoesNotDuplicateOfflineBufferedQos1Messages)
+{
+    // A QoS>0 message buffered while the session is offline lives in BOTH
+    // inflightMessages and pendingDeliveries. resume() must re-queue it only
+    // once, otherwise the reconnecting client receives a duplicate copy.
+    auto session = std::make_shared<Session>(&broker, "offline-dup");
+    session->connect(session, /*persistent=*/true);
+    auto first = test::attach(*session);
+    session->subscribe("od/t", optionsFor(QoS::QOS_1));
+    session->close(first);  // offline: client unbound, queue retained
+
+    broker.publish(Message("od/t", "m1", QoS::QOS_1));
+    broker.publish(Message("od/t", "m2", QoS::QOS_1));
+
+    auto second = std::make_shared<RecordingClient>();
+    session->resume(second, Version::MQTT5);
+    session->flush();
+
+    ASSERT_EQ(second->size(), 2u) << "each buffered message must arrive exactly once";
+    EXPECT_EQ(std::string(second->delivered[0].payload.begin(), second->delivered[0].payload.end()),
+              "m1");
+    EXPECT_EQ(std::string(second->delivered[1].payload.begin(), second->delivered[1].payload.end()),
+              "m2");
+    EXPECT_NE(second->packetIds[0], second->packetIds[1]);
+}
+
+TEST_F(SessionLifecycleTest, ResumeKeepsUnackedRetransmissionAlongsideOfflineBuffer)
+{
+    // The duplicate fix must not drop the other half of resume(): a message
+    // that WAS sent but never acknowledged still needs a DUP retransmission,
+    // while one buffered offline is a first delivery (DUP=0).
+    auto session = std::make_shared<Session>(&broker, "mixed");
+    session->connect(session, /*persistent=*/true);
+    auto first = test::attach(*session);
+    session->subscribe("mix/t", optionsFor(QoS::QOS_1));
+
+    broker.publish(Message("mix/t", "live", QoS::QOS_1));
+    ASSERT_EQ(first->size(), 1u);
+    uint16_t liveId = first->packetIds[0];
+    session->close(first);  // dropped before the PUBACK
+
+    broker.publish(Message("mix/t", "offline", QoS::QOS_1));
+
+    auto second = std::make_shared<RecordingClient>();
+    session->resume(second, Version::MQTT5);
+    session->flush();
+
+    ASSERT_EQ(second->size(), 2u);
+    bool liveSeen = false;
+    bool offlineSeen = false;
+    for (size_t i = 0; i < second->size(); ++i) {
+        const auto &delivered = second->delivered[i];
+        const std::string payload(delivered.payload.begin(), delivered.payload.end());
+        if (payload == "live") {
+            liveSeen = true;
+            EXPECT_EQ(second->packetIds[i], liveId);
+            EXPECT_TRUE(delivered.dup) << "an unacknowledged sent message is a retransmission";
+        } else {
+            offlineSeen = true;
+            EXPECT_FALSE(delivered.dup) << "a message buffered offline is a first transmission";
+        }
+    }
+    EXPECT_TRUE(liveSeen);
+    EXPECT_TRUE(offlineSeen);
+}
+
+TEST_F(SessionLifecycleTest, ReceiveMaximumCountsQos2AwaitingPubcomp)
+{
+    // MQTT-4.9: a QoS 2 PUBLISH is outstanding until PUBCOMP, not PUBREC. With
+    // Receive Maximum 1, the second PUBLISH must stay blocked while the first
+    // is in the PUBREL/PUBCOMP leg.
+    auto session = std::make_shared<Session>(&broker, "q2-window");
+    session->connect(session, /*persistent=*/true);
+    auto client = test::attach(*session);
+    session->subscribe("q2w/t", optionsFor(QoS::QOS_2));
+    session->setReceiveMaximum(1);
+
+    broker.publish(Message("q2w/t", "a", QoS::QOS_2));
+    broker.publish(Message("q2w/t", "b", QoS::QOS_2));
+    session->flush();
+    ASSERT_EQ(client->size(), 1u);
+    uint16_t idA = client->packetIds[0];
+
+    session->pubrec(idA, ReasonCode::SUCCESS);  // PUBCOMP still outstanding
+    session->flush();
+    EXPECT_EQ(client->size(), 1u) << "PUBREC must not free the Receive Maximum slot";
+
+    session->pubcomp(idA);
+    session->flush();
+    ASSERT_EQ(client->size(), 2u);
+    EXPECT_EQ(std::string(client->delivered[1].payload.begin(), client->delivered[1].payload.end()),
+              "b");
+}
+
+TEST_F(SessionLifecycleTest, ReceiveMaximumSlotFreedByRejectedPubrec)
+{
+    // A rejected PUBREC (>=0x80) ends the QoS 2 flow immediately, so it must
+    // free the slot and let the next blocked message through.
+    auto session = std::make_shared<Session>(&broker, "q2-reject");
+    session->connect(session, /*persistent=*/true);
+    auto client = test::attach(*session);
+    session->subscribe("q2r/t", optionsFor(QoS::QOS_2));
+    session->setReceiveMaximum(1);
+
+    broker.publish(Message("q2r/t", "a", QoS::QOS_2));
+    broker.publish(Message("q2r/t", "b", QoS::QOS_2));
+    session->flush();
+    ASSERT_EQ(client->size(), 1u);
+    uint16_t idA = client->packetIds[0];
+
+    session->pubrec(idA, static_cast<ReasonCode>(0x80));
+    session->flush();
+    ASSERT_EQ(client->size(), 2u);
+    EXPECT_EQ(std::string(client->delivered[1].payload.begin(), client->delivered[1].payload.end()),
+              "b");
+}
+
 } // namespace MQTT

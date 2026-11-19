@@ -72,7 +72,9 @@ bool generatePki(const std::string &certPath, const std::string &keyPath) {
     X509_gmtime_adj(X509_getm_notBefore(cert), 0);
     X509_gmtime_adj(X509_getm_notAfter(cert), 3600);
     X509_set_pubkey(cert, pkey);
-    X509_NAME *name = X509_get_subject_name(cert);
+    // OpenSSL 4 returns a const X509_NAME*, but the freshly created local
+    // certificate below is mutated through this name, so cast away the const.
+    X509_NAME *name = const_cast<X509_NAME *>(X509_get_subject_name(cert));
     X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
                                reinterpret_cast<const unsigned char *>("localhost"), -1, -1, 0);
     X509_set_issuer_name(cert, name);

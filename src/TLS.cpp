@@ -222,7 +222,8 @@ std::string SecureTransport::peerIdentity() const {
     std::string identity;
     // Prefer the Common Name (CN) of the subject, the conventional client
     // identity. Fall back to the whole subject DN if there is no CN.
-    X509_NAME *subject = X509_get_subject_name(cert);
+    // OpenSSL 4 returns a const X509_NAME*; all calls below take const.
+    const X509_NAME *subject = X509_get_subject_name(cert);
     if (subject) {
         int cn = X509_NAME_get_text_by_NID(subject, NID_commonName,
                                            nullptr, 0);

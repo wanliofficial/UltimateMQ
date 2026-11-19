@@ -379,10 +379,25 @@ void Session::resume(const std::shared_ptr<Client>& client, Version protocolVers
         // connected again (a resumed session must count as an active client).
         hasExpiry = false;
         connected = true;
+        // A QoS>0 message buffered while the session was offline is already in
+        // BOTH inflightMessages and pendingDeliveries. Re-queueing it below
+        // would hand the new client two copies (the original plus a DUP).
+        // Remember the ids that still have an undelivered copy and leave those
+        // alone: only a message that left the queue (was sent) but was never
+        // acknowledged needs a DUP retransmission.
+        std::set<uint16_t> queuedIds;
+        for (const auto& delivery : pendingDeliveries) {
+            if (delivery.qos != QoS::QOS_0) {
+                queuedIds.insert(delivery.packetId);
+            }
+        }
         // Retransmit every QoS>0 message that was delivered but never
         // acknowledged, keeping the original packet id and setting DUP=1
         // (MQTT-3.3.1-8 / MQTT-4.4.0-1)
         for (const auto& [id, stored] : inflightMessages) {
+            if (queuedIds.count(id) > 0) {
+                continue;
+            }
             Message outgoing = *stored;
             outgoing.dup = true;
             // Echo the original subscription identifiers on the retransmitted
@@ -575,7 +590,12 @@ void Session::pushDelivery(const Message &message, QoS qos,
     // that it is parked in blockedDeliveries (no packet id yet) and released as
     // the client acknowledges earlier messages. QoS 0 has no acknowledgement and
     // is therefore never flow-controlled.
-    if (qos != QoS::QOS_0 && inflightMessages.size() >= receiveMaximum) {
+    // A QoS 2 PUBLISH stays outstanding until the client's PUBCOMP, not its
+    // PUBREC: pubrec() moves the id from inflightMessages to pendingPubrel.
+    // Both sets must be counted, or the window silently admits extra messages
+    // during the PUBREL/PUBCOMP leg (MQTT-4.9).
+    if (qos != QoS::QOS_0 &&
+        inflightMessages.size() + pendingPubrel.size() >= receiveMaximum) {
         logDebug("session %s: receive maximum reached (%u), blocking message on %s",
                  clientId.c_str(), receiveMaximum, message.topic.c_str());
         blockedDeliveries.emplace_back(std::move(outgoing), /*packetId=*/0, qos,
@@ -602,9 +622,11 @@ void Session::releaseBlocked() {
     // Called with deliveryMutex held after an inflight slot freed up. Promote
     // as many blocked QoS>0 messages as the window now allows: assign a packet
     // id, record it as inflight and enqueue it for sending. Any remaining stay
-    // blocked until a later acknowledgement frees another slot.
+    // blocked until a later acknowledgement frees another slot. As in
+    // pushDelivery(), pendingPubrel counts toward the window because a QoS 2
+    // message awaiting PUBCOMP is still outstanding.
     while (!blockedDeliveries.empty() &&
-           inflightMessages.size() < receiveMaximum &&
+           inflightMessages.size() + pendingPubrel.size() < receiveMaximum &&
            pendingDeliveries.size() < MAX_QUEUED_MESSAGES) {
         Delivery blocked = std::move(blockedDeliveries.front());
         blockedDeliveries.erase(blockedDeliveries.begin());

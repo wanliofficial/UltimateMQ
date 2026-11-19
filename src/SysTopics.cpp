@@ -4,7 +4,9 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#ifdef __linux__
 #include <sys/sysinfo.h>
+#endif
 #include <sys/types.h>
 #include <unistd.h>
 
