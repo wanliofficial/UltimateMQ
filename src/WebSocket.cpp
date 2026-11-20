@@ -335,6 +335,18 @@ bool WebSocketTransport::nextFrame() {
             closedByPeer_ = true;
             return false;
         }
+        // Enforce the per-message byte cap before buffering the payload, so a
+        // peer cannot make the broker wait for (and buffer) an advertised length
+        // larger than the cap by dribbling the bytes in. Checking it only after
+        // the fill loop below left MAX_MESSAGE_BYTES unenforced.
+        if (length > MAX_MESSAGE_BYTES ||
+            message_.size() + length > MAX_MESSAGE_BYTES) {
+            logDebug("websocket: message over the %zu-byte cap, closing (1009)",
+                     MAX_MESSAGE_BYTES);
+            sendClose(1009);
+            closedByPeer_ = true;
+            return false;
+        }
         while (raw_.size() < offset + 4) {
             if (!fillRawBuffer()) {
                 return false;
@@ -347,15 +359,6 @@ bool WebSocketTransport::nextFrame() {
             if (!fillRawBuffer()) {
                 return false;
             }
-        }
-
-        if (length > MAX_MESSAGE_BYTES ||
-            message_.size() + length > MAX_MESSAGE_BYTES) {
-            logDebug("websocket: message over the %zu-byte cap, closing (1009)",
-                     MAX_MESSAGE_BYTES);
-            sendClose(1009);
-            closedByPeer_ = true;
-            return false;
         }
 
         const uint8_t *payload = raw_.data() + offset;
