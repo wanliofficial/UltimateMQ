@@ -130,10 +130,14 @@ bool parseUnsigned(const std::string &text, unsigned long long &out) {
         if (c < '0' || c > '9') {
             return false;
         }
-        out = out * 10 + static_cast<unsigned long long>(c - '0');
-        if (out > 0xFFFFFFFFull) {
+        // Reject before the multiply so a long corrupt field cannot wrap the
+        // accumulator: once out would exceed 0xFFFFFFFF (the widest value any
+        // field here is stored into), stop.
+        const unsigned digit = static_cast<unsigned>(c - '0');
+        if (out > (0xFFFFFFFFull - digit) / 10) {
             return false;
         }
+        out = out * 10 + digit;
     }
     return true;
 }
