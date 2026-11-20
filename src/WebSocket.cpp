@@ -335,6 +335,16 @@ bool WebSocketTransport::nextFrame() {
             closedByPeer_ = true;
             return false;
         }
+        // RFC 6455 §5.5.1: control frames (0x08 CLOSE, 0x09 PING, 0x0A PONG) must
+        // not be fragmented, so a control frame with the FIN bit clear is a
+        // protocol error rather than the start of a control-frame sequence.
+        const bool isControl = opcode == 0x08 || opcode == 0x09 || opcode == 0x0A;
+        if (isControl && !fin) {
+            logDebug("websocket: fragmented control frame, closing (1002)");
+            sendClose(1002);
+            closedByPeer_ = true;
+            return false;
+        }
         // Enforce the per-message byte cap before buffering the payload, so a
         // peer cannot make the broker wait for (and buffer) an advertised length
         // larger than the cap by dribbling the bytes in. Checking it only after
