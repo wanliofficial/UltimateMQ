@@ -287,16 +287,16 @@ struct ConnectFlags {
 
 struct ConnectPacket : Packet {
     std::string protocolName;
-    Version protocolVersion;
+    Version protocolVersion = Version::MQTT5;
     std::string clientId;
-    uint16_t keepAlive;
-    bool cleanStart;
+    uint16_t keepAlive = 0;
+    bool cleanStart = false;
     bool isBridge = false;
     std::optional<std::string> username;
     std::optional<std::string> password;
-    bool willFlag;
-    QoS willQos;
-    bool willRetain;
+    bool willFlag = false;
+    QoS willQos = QoS::QOS_0;
+    bool willRetain = false;
     //! MQTT-3.1.2-3: the reserved CONNECT flags bit was set (protocol error).
     bool reservedFlagSet = false;
     std::optional<std::string> willTopic;
@@ -348,7 +348,7 @@ struct PublishPacket : Packet {
     //! matching subscription (MQTT-3.3.4-3/-4). Kept out of `properties`
     //! because the property may repeat.
     SubscriptionIdentifiers subscriptionIdentifiers;
-    PublishPacket() : Packet(PacketType::PUBLISH) {};
+    PublishPacket() : Packet(PacketType::PUBLISH), packetId(0) {};
     PublishPacket(const std::string& topic, const std::vector<uint8_t>& payload, QoS qos = QoS::QOS_0, bool retain = false, uint16_t packetId = 0)
         : Packet(PacketType::PUBLISH), topicName(topic), payload(payload), qos(qos), retain(retain), packetId(packetId) {}
     ~PublishPacket() = default;
@@ -429,17 +429,17 @@ enum class RetainHandling {
 };
 
 struct SubscriptionOptions {
-    QoS maximumQos;
-    bool noLocal;
-    bool retainAsPublished;
-    RetainHandling retainHandling;
+    QoS maximumQos = QoS::QOS_0;
+    bool noLocal = false;
+    bool retainAsPublished = false;
+    RetainHandling retainHandling = RetainHandling::SEND_RETAINED_MESSAGES_AT_SUBSCRIBE;
     //! MQTT 5 Subscription Identifier (MQTT-3.8.2.1.2): 0 when the client set
     //! none. It travels back on every PUBLISH this subscription causes.
     uint32_t subscriptionIdentifier = 0;
 };
 
 struct SubscribePacket : Packet {
-    uint16_t packetId;
+    uint16_t packetId = 0;
     std::vector<std::pair<std::string, SubscriptionOptions>> subscriptions;
     SubscribePacket() : Packet(PacketType::SUBSCRIBE) {};
     ~SubscribePacket() = default;
@@ -449,7 +449,7 @@ struct SubscribePacket : Packet {
 };
 
 struct SubackPacket : Packet {
-    uint16_t packetId;
+    uint16_t packetId = 0;
     std::vector<ReasonCode> reasonCodes;
     SubackPacket() : Packet(PacketType::SUBACK) {};
     SubackPacket(uint16_t id) : Packet(PacketType::SUBACK), packetId(id) {}
@@ -460,7 +460,7 @@ struct SubackPacket : Packet {
 };
 
 struct UnsubscribePacket : Packet {
-    uint16_t packetId;
+    uint16_t packetId = 0;
     std::vector<std::string> topicFilters;
     UnsubscribePacket() : Packet(PacketType::UNSUBSCRIBE) {};
     explicit UnsubscribePacket(uint16_t id) : Packet(PacketType::UNSUBSCRIBE), packetId(id) {}
@@ -471,7 +471,7 @@ struct UnsubscribePacket : Packet {
 };
 
 struct UnsubackPacket : Packet {
-    uint16_t packetId;
+    uint16_t packetId = 0;
     std::vector<ReasonCode> reasonCodes;
     UnsubackPacket() : Packet(PacketType::UNSUBACK) {};
     explicit UnsubackPacket(uint16_t id) : Packet(PacketType::UNSUBACK), packetId(id) {}
