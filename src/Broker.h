@@ -98,6 +98,13 @@ class Broker {
     size_t maxSharedSubscriptions = DEFAULT_MAX_SUBSCRIPTIONS;
     bool sharedQuotaExplicit = false;
 
+    //! Upper bound on the number of retained messages the broker holds, so one
+    //! client cannot exhaust memory by retaining a stream of distinct topics.
+    //! 0 means unlimited (the historical behaviour); tunable via
+    //! FLOWMQ_MAX_RETAINED. Replacing an existing topic's retained message is
+    //! always allowed, since it does not grow the set.
+    size_t maxRetained = 0;
+
     //! Per-client inbound PUBLISH rate, in messages per second. 0 disables the
     //! limit. A publisher that exceeds it is disconnected, so a single client
     //! cannot saturate the broker's fan-out path with an unbounded burst.
@@ -159,6 +166,11 @@ public:
     //! not, sessions fall back to their ordinary subscription limit, so raising
     //! FLOWMQ_MAX_SUBSCRIPTIONS also raises the shared quota.
     bool hasExplicitSharedQuota() const { return sharedQuotaExplicit; }
+
+    //! Configure the maximum number of retained messages held (0 = unlimited).
+    //! Must be set before any client connects.
+    void setMaxRetained(size_t limit) { maxRetained = limit; }
+    size_t getMaxRetained() const { return maxRetained; }
 
     //! Configure the per-client inbound PUBLISH rate (messages/second; 0 means
     //! unlimited, the default). Must be set before any client connects.

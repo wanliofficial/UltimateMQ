@@ -452,6 +452,14 @@ void Broker::collectTargets(
             // receive.
             logDebug("broker: not retaining %s, message already expired", message.topic.c_str());
             retainedMessages.erase(message.topic);
+        } else if (retainedMessages.find(message.topic) == retainedMessages.end() &&
+                   maxRetained != 0 && retainedMessages.size() >= maxRetained) {
+            // Bounded so a client cannot pin broker memory by retaining an
+            // unbounded set of distinct topics. A new topic over the cap is not
+            // stored (the live fan-out above is unaffected); replacing an
+            // existing topic always falls through to the assignment below.
+            logDebug("broker: retained set full (%zu), not retaining %s", maxRetained,
+                     message.topic.c_str());
         } else {
             retainedMessages[message.topic] = message;
         }

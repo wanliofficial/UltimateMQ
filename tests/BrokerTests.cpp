@@ -96,6 +96,40 @@ TEST_F(BrokerTest, EmptyRetainedPayloadRemovesMessage)
     EXPECT_EQ(broker->getRetainedCount(), 0u);
 }
 
+TEST_F(BrokerTest, RetainedMessagesAreUnboundedByDefault)
+{
+    // The historical behaviour: with no cap configured, retaining on distinct
+    // topics keeps every one.
+    for (int i = 0; i < 50; ++i) {
+        broker->publish(MQTT::Message("t/" + std::to_string(i), "v", MQTT::QoS::QOS_0, true));
+    }
+    EXPECT_EQ(broker->getRetainedCount(), 50u);
+}
+
+TEST_F(BrokerTest, RetainedCapDropsDistinctTopicsButKeepsReplacements)
+{
+    broker->setMaxRetained(3);
+
+    // Three distinct topics fill the cap.
+    broker->publish(MQTT::Message("t/1", "a", MQTT::QoS::QOS_0, true));
+    broker->publish(MQTT::Message("t/2", "b", MQTT::QoS::QOS_0, true));
+    broker->publish(MQTT::Message("t/3", "c", MQTT::QoS::QOS_0, true));
+    ASSERT_EQ(broker->getRetainedCount(), 3u);
+
+    // A fourth distinct topic is dropped: the live fan-out still happens, but
+    // the retained set does not grow.
+    broker->publish(MQTT::Message("t/4", "d", MQTT::QoS::QOS_0, true));
+    EXPECT_EQ(broker->getRetainedCount(), 3u);
+
+    // Replacing an existing topic's retained message is always allowed even at
+    // the cap, because it does not grow the set.
+    broker->publish(MQTT::Message("t/2", "updated", MQTT::QoS::QOS_0, true));
+    EXPECT_EQ(broker->getRetainedCount(), 3u);
+    auto retained = broker->snapshotRetained();
+    const auto &replaced = retained.at("t/2").payload;
+    EXPECT_EQ(std::string(replaced.begin(), replaced.end()), "updated");
+}
+
 TEST_F(BrokerTest, LiveForwardedMessageHasRetainFlagCleared)
 {
     auto session = std::make_shared<MQTT::Session>(broker, "sub");

@@ -246,6 +246,24 @@ Server::Server(int port, size_t maxConnections)
                 broker->getMaxSharedSubscriptions());
     }
 
+    // Retained-message cap (opt-in). Bounds how many distinct topics may hold a
+    // retained message, so a client cannot exhaust broker memory by retaining an
+    // unbounded stream of topics. 0 (the default) leaves the historical
+    // unlimited behaviour unchanged.
+    const char* maxRetained = getenv("FLOWMQ_MAX_RETAINED");
+    if (maxRetained && *maxRetained) {
+        char* end = nullptr;
+        unsigned long long parsed = std::strtoull(maxRetained, &end, 10);
+        if (end == maxRetained || *end != '\0' || *maxRetained == '-' || parsed == 0) {
+            delete broker;
+            broker = nullptr;
+            throw std::runtime_error(std::string("invalid FLOWMQ_MAX_RETAINED: ") +
+                                     maxRetained);
+        }
+        broker->setMaxRetained(static_cast<size_t>(parsed));
+        logInfo("max retained messages: %zu", broker->getMaxRetained());
+    }
+
     // Per-client inbound PUBLISH rate limit (opt-in). Bounds how many messages
     // one publisher may inject per second, so a single client cannot saturate
     // the broker's fan-out path with an unbounded burst.

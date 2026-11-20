@@ -40,6 +40,7 @@ All configuration is read from environment variables at startup.
 | `FLOWMQ_WRITE_TIMEOUT_MS` | `5000` (5 s) | How long a single write may make no progress before the connection is dropped (bounds a stalled reader) |
 | `FLOWMQ_MAX_SUBSCRIPTIONS` | `1024` | Maximum number of topic filters a single session may hold; further filters are rejected |
 | `FLOWMQ_MAX_SHARED_SUBSCRIPTIONS` | `FLOWMQ_MAX_SUBSCRIPTIONS` | Maximum number of shared (`$share/...`) subscriptions a single session may hold |
+| `FLOWMQ_MAX_RETAINED` | unlimited | Maximum number of distinct topics that may hold a retained message; further distinct-topic retains are dropped. Replacing an existing topic's retained message is always allowed |
 | `FLOWMQ_MAX_PUBLISH_RATE` | unlimited | Per-client inbound `PUBLISH` rate in messages/second; a publisher that exceeds it is disconnected |
 | `FLOWMQ_SERVER_KEEP_ALIVE` | unset | Preferred keep alive in seconds; MQTT 5 clients asking for more (or for none) are told this value in CONNACK |
 | `FLOWMQ_SYS_TOPICS` | unset | Publish the optional `$SYS/broker` monitoring tree (see below); off by default |
