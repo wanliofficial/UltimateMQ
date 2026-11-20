@@ -119,6 +119,7 @@ bool parse(const uint8_t *data, size_t length, Parsed *out) {
     switch (out->type) {
     case MsgType::CONNECT:
     case MsgType::WILLTOPIC:
+    case MsgType::WILLTOPICUPD:
     case MsgType::PUBLISH:
     case MsgType::SUBSCRIBE:
     case MsgType::UNSUBSCRIBE:
@@ -165,6 +166,14 @@ bool parse(const uint8_t *data, size_t length, Parsed *out) {
     case MsgType::WILLTOPIC:
         out->topic.assign(reinterpret_cast<const char *>(rest), restLength);
         return true;
+    case MsgType::WILLTOPICUPD:
+        // §5.3.17: flags (already consumed) + the new Will Topic
+        out->topic.assign(reinterpret_cast<const char *>(rest), restLength);
+        return true;
+    case MsgType::WILLMSGUPD:
+        // §5.3.18: the new Will payload
+        out->data.assign(rest, rest + restLength);
+        return true;
     case MsgType::WILLMSG:
         out->data.assign(rest, rest + restLength);
         return true;
@@ -198,7 +207,7 @@ bool parse(const uint8_t *data, size_t length, Parsed *out) {
         }
         out->topicId = readU16(rest);
         out->msgId = readU16(rest + 2);
-        out->radius = rest[4]; // Return Code; parked in radius for transport
+        out->returnCode = static_cast<ReturnCode>(rest[4]); // §5.3.6
         return true;
     case MsgType::PUBCOMP:
     case MsgType::PUBREC:
@@ -242,13 +251,21 @@ bool parse(const uint8_t *data, size_t length, Parsed *out) {
     case MsgType::CONNACK:
     case MsgType::WILLTOPICREQ:
     case MsgType::WILLMSGREQ:
+    case MsgType::WILLTOPICRESP:
+    case MsgType::WILLMSGRESP:
     case MsgType::REGACK:
     case MsgType::SUBACK:
     case MsgType::UNSUBACK:
     case MsgType::PINGRESP:
-        // Gateway->client messages: nothing to parse inbound
-        return restLength == 0 ||
-               (out->type == MsgType::CONNACK && restLength == 1);
+        // Gateway->client messages: nothing to parse inbound. CONNACK and the
+        // will-update answers carry a single return code byte.
+        if (restLength == 1 &&
+            (out->type == MsgType::CONNACK || out->type == MsgType::WILLTOPICRESP ||
+             out->type == MsgType::WILLMSGRESP)) {
+            out->returnCode = static_cast<ReturnCode>(rest[0]);
+            return true;
+        }
+        return restLength == 0;
     default:
         return false;
     }
@@ -483,6 +500,11 @@ void Gateway::sendSuback(const sockaddr_in &addr, const Flags &flags, uint16_t t
     sendTo(addr, encode(MsgType::SUBACK, body));
 }
 
+void Gateway::sendWillResp(const sockaddr_in &addr, MsgType type, ReturnCode code) {
+    std::vector<uint8_t> body{static_cast<uint8_t>(code)};
+    sendTo(addr, encode(type, body));
+}
+
 void Gateway::dispatch(const sockaddr_in &addr, const Parsed &p) {
     switch (p.type) {
     case MsgType::CONNECT:
@@ -490,6 +512,12 @@ void Gateway::dispatch(const sockaddr_in &addr, const Parsed &p) {
         return;
     case MsgType::WILLTOPIC:
         handleWillTopic(addr, p);
+        return;
+    case MsgType::WILLTOPICUPD:
+        handleWillTopicUpdate(addr, p);
+        return;
+    case MsgType::WILLMSGUPD:
+        handleWillMessageUpdate(addr, p);
         return;
     case MsgType::WILLMSG:
         handleWillMessage(addr, p);
@@ -522,10 +550,17 @@ void Gateway::dispatch(const sockaddr_in &addr, const Parsed &p) {
     case MsgType::PUBACK: {
         auto peer = peerAt(addr);
         if (peer && peer->session) {
-            // PUBACK's third byte is the return code; only an accept advances
-            // the flow (§5.3.6: a rejection answers the sender's publish).
-            peer->session->puback(p.msgId);
-            peer->session->flush();
+            // §5.3.6: only an Accepted return code completes the flow. A
+            // rejected publish (e.g. congestion) is retransmitted with DUP
+            // instead, keeping the identifier outstanding until the client
+            // accepts it.
+            if (p.returnCode == ReturnCode::ACCEPTED) {
+                peer->session->puback(p.msgId);
+                peer->session->flush();
+            } else {
+                peer->session->retransmitInflight(p.msgId);
+                peer->session->flush();
+            }
         }
         return;
     }
@@ -643,6 +678,37 @@ void Gateway::handleWillMessage(const sockaddr_in &addr, const Parsed &p) {
     peer->willPayload = p.data;
     peer->willStage = Peer::WillStage::NONE;
     finishConnect(peer, peer->cleanSession);
+}
+
+void Gateway::handleWillTopicUpdate(const sockaddr_in &addr, const Parsed &p) {
+    auto peer = peerAt(addr);
+    if (!peer || !peer->session) {
+        return; // only a connected client has a will to update
+    }
+    // §5.3.17: an empty new Will Topic deletes the will, exactly as in the
+    // WILLTOPIC handshake. A non-empty one must be a legal topic name; its own
+    // flag byte carries the new Will QoS and Will Retain bits.
+    if (!p.topic.empty() && !Topic::isValidTopicName(p.topic)) {
+        sendWillResp(addr, MsgType::WILLTOPICRESP, ReturnCode::INVALID_TOPIC_ID);
+        return;
+    }
+    peer->hasWill = !p.topic.empty();
+    peer->willTopic = p.topic;
+    peer->willQos = static_cast<QoS>(p.flags.qos & 0x03);
+    peer->willRetain = p.flags.retain;
+    peer->willPayload.clear();
+    sendWillResp(addr, MsgType::WILLTOPICRESP, ReturnCode::ACCEPTED);
+}
+
+void Gateway::handleWillMessageUpdate(const sockaddr_in &addr, const Parsed &p) {
+    auto peer = peerAt(addr);
+    if (!peer || !peer->session) {
+        return;
+    }
+    // §5.3.18: the new will payload; the topic was fixed (or deleted) by the
+    // preceding WILLTOPICUPD.
+    peer->willPayload = p.data;
+    sendWillResp(addr, MsgType::WILLMSGRESP, ReturnCode::ACCEPTED);
 }
 
 void Gateway::finishConnect(const std::shared_ptr<Peer> &peer, bool clean) {

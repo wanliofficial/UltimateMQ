@@ -539,10 +539,42 @@ TEST_F(FrameTest, SerializeConnectPacket)
 
     auto serialized = frame->serializeConnect(packet);
 
-    ASSERT_EQ(serialized.size(), 24);
+    ASSERT_EQ(serialized.size(), 25);
     EXPECT_EQ(serialized[0], 0x10);  // CONNECT packet type
-    EXPECT_EQ(serialized[1], 22);    // Remaining length
+    EXPECT_EQ(serialized[1], 23);    // Remaining length
     // ... Add more specific checks for the serialized packet
+}
+
+TEST_F(FrameTest, SerializeConnectPacketWithV5PropertiesRoundTrips)
+{
+    ConnectPacket packet;
+    packet.type = PacketType::CONNECT;
+    packet.protocolName = "MQTT";
+    packet.protocolVersion = Version::MQTT5;
+    packet.cleanStart = true;
+    packet.keepAlive = 30;
+    packet.clientId = "abc";
+    packet.properties[PropertyID::SESSION_EXPIRY_INTERVAL] = static_cast<uint32_t>(60);
+
+    auto serialized = frame->serializeConnect(packet);
+
+    // Body: protocol name (6) + version (1) + flags (1) + keep alive (2) +
+    // property length (1) + property (1 + 4) + client id (2 + 3) = 21, so the
+    // property bytes are preceded by their length exactly as §2.2.2 requires.
+    ASSERT_EQ(serialized.size(), 23);
+    EXPECT_EQ(serialized[12], 0x05);              // Property Length
+    EXPECT_EQ(serialized[13], 0x11);              // SESSION_EXPIRY_INTERVAL id
+    EXPECT_EQ(serialized[14], 0x00);              // ... four-byte value ...
+    EXPECT_EQ(serialized[15], 0x00);
+    EXPECT_EQ(serialized[16], 0x00);
+    EXPECT_EQ(serialized[17], 0x3C);              // ... 60
+
+    auto parsed = frame->parse(serialized.data(), serialized.size());
+    auto *connect = dynamic_cast<ConnectPacket *>(parsed.get());
+    ASSERT_NE(connect, nullptr);
+    auto it = connect->properties.find(PropertyID::SESSION_EXPIRY_INTERVAL);
+    ASSERT_NE(it, connect->properties.end());
+    EXPECT_EQ(std::get<uint32_t>(it->second), 60u);
 }
 
 TEST_F(FrameTest, SerializePublishPacket) 

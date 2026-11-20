@@ -48,6 +48,10 @@ enum class MsgType : uint8_t {
     PINGREQ = 0x16,
     PINGRESP = 0x17,
     DISCONNECT = 0x18,
+    WILLTOPICUPD = 0x1A,
+    WILLTOPICRESP = 0x1B,
+    WILLMSGUPD = 0x1C,
+    WILLMSGRESP = 0x1D,
 };
 
 //! Gateway return codes (§5.3.9): accepted, rejected, unknown topic, unknown
@@ -97,6 +101,7 @@ struct Parsed {
     uint8_t radius = 0;          //!< SEARCHGW
     uint16_t topicId = 0;        //!< REGISTER/PUBLISH/PUBACK/SUBACK/UNSUBSCRIBE
     uint16_t msgId = 0;          //!< REGISTER/ack flows/SUBSCRIBE/UNSUBSCRIBE
+    ReturnCode returnCode = ReturnCode::ACCEPTED; //!< PUBACK / will-update responses
     std::string topic;           //!< REGISTER / SUBSCRIBE / UNSUBSCRIBE / WILLTOPIC
     std::vector<uint8_t> data;   //!< PUBLISH payload / WILLMSG
 };
@@ -145,11 +150,14 @@ private:
     void sendConnack(const sockaddr_in &addr, ReturnCode code);
     void sendSuback(const sockaddr_in &addr, const Flags &flags, uint16_t topicId,
                     uint16_t msgId, ReturnCode code);
+    void sendWillResp(const sockaddr_in &addr, MsgType type, ReturnCode code);
 
     void dispatch(const sockaddr_in &addr, const Parsed &parsed);
     void handleConnect(const sockaddr_in &addr, const Parsed &parsed);
     void handleWillTopic(const sockaddr_in &addr, const Parsed &parsed);
     void handleWillMessage(const sockaddr_in &addr, const Parsed &parsed);
+    void handleWillTopicUpdate(const sockaddr_in &addr, const Parsed &parsed);
+    void handleWillMessageUpdate(const sockaddr_in &addr, const Parsed &parsed);
     void handleRegister(const sockaddr_in &addr, const Parsed &parsed);
     void handlePublish(const sockaddr_in &addr, const Parsed &parsed);
     void handleSubscribe(const sockaddr_in &addr, const Parsed &parsed);

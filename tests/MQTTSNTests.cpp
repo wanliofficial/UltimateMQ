@@ -149,3 +149,57 @@ TEST(MQTTSNCodecTest, DisconnectWithAndWithoutDuration)
     ASSERT_TRUE(parse(sleeping.data(), sleeping.size(), &parsed));
     EXPECT_EQ(parsed.duration, 500); // 0x01F4: asleep for 500 seconds
 }
+
+TEST(MQTTSNCodecTest, WillTopicUpdateCarriesFlagsAndTopic)
+{
+    // Flags 0x10 (Will Retain, QoS 0), topic "sensor1/will"
+    const std::vector<uint8_t> wire = datagramOf(
+        {0x0F, static_cast<uint8_t>(MsgType::WILLTOPICUPD), 0x10,
+         's', 'e', 'n', 's', 'o', 'r', '1', '/', 'w', 'i', 'l', 'l'});
+    Parsed parsed;
+    ASSERT_TRUE(parse(wire.data(), wire.size(), &parsed));
+    EXPECT_EQ(parsed.type, MsgType::WILLTOPICUPD);
+    EXPECT_TRUE(parsed.flags.retain);
+    EXPECT_EQ(parsed.flags.qos, 0);
+    EXPECT_EQ(parsed.topic, "sensor1/will");
+}
+
+TEST(MQTTSNCodecTest, WillMessageUpdateCarriesPayload)
+{
+    const std::vector<uint8_t> wire = datagramOf(
+        {0x09, static_cast<uint8_t>(MsgType::WILLMSGUPD),
+         'o', 'f', 'f', 'l', 'i', 'n', 'e'});
+    Parsed parsed;
+    ASSERT_TRUE(parse(wire.data(), wire.size(), &parsed));
+    EXPECT_EQ(parsed.type, MsgType::WILLMSGUPD);
+    EXPECT_EQ(parsed.data, std::vector<uint8_t>({'o', 'f', 'f', 'l', 'i', 'n', 'e'}));
+}
+
+TEST(MQTTSNCodecTest, WillUpdateResponsesCarryReturnCode)
+{
+    Parsed parsed;
+    const std::vector<uint8_t> accepted = encode(MsgType::WILLTOPICRESP,
+                                                 {static_cast<uint8_t>(ReturnCode::ACCEPTED)});
+    ASSERT_TRUE(parse(accepted.data(), accepted.size(), &parsed));
+    EXPECT_EQ(parsed.type, MsgType::WILLTOPICRESP);
+    EXPECT_EQ(parsed.returnCode, ReturnCode::ACCEPTED);
+
+    const std::vector<uint8_t> rejected = encode(MsgType::WILLMSGRESP,
+                                                 {static_cast<uint8_t>(ReturnCode::INVALID_TOPIC_ID)});
+    ASSERT_TRUE(parse(rejected.data(), rejected.size(), &parsed));
+    EXPECT_EQ(parsed.type, MsgType::WILLMSGRESP);
+    EXPECT_EQ(parsed.returnCode, ReturnCode::INVALID_TOPIC_ID);
+}
+
+TEST(MQTTSNCodecTest, PubackReturnCodeIsParsed)
+{
+    // topic id 0x0007, msg id 0x0042, return code 1 (rejected congestion)
+    const std::vector<uint8_t> wire = datagramOf(
+        {0x07, static_cast<uint8_t>(MsgType::PUBACK), 0x00, 0x07,
+         0x00, 0x42, 0x01});
+    Parsed parsed;
+    ASSERT_TRUE(parse(wire.data(), wire.size(), &parsed));
+    EXPECT_EQ(parsed.topicId, 7);
+    EXPECT_EQ(parsed.msgId, 0x42);
+    EXPECT_EQ(parsed.returnCode, ReturnCode::REJECTED_CONGESTION);
+}

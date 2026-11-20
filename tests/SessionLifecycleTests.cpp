@@ -896,7 +896,9 @@ TEST_F(SessionLifecycleTest, ResumeKeepsUnackedRetransmissionAlongsideOfflineBuf
 {
     // The duplicate fix must not drop the other half of resume(): a message
     // that WAS sent but never acknowledged still needs a DUP retransmission,
-    // while one buffered offline is a first delivery (DUP=0).
+    // while one buffered offline is a first delivery (DUP=0). §4.6 also wants
+    // the retransmission to go out before the offline-queued message, because
+    // the original send order was "live" first, then "offline".
     auto session = std::make_shared<Session>(&broker, "mixed");
     session->connect(session, /*persistent=*/true);
     auto first = test::attach(*session);
@@ -914,22 +916,18 @@ TEST_F(SessionLifecycleTest, ResumeKeepsUnackedRetransmissionAlongsideOfflineBuf
     session->flush();
 
     ASSERT_EQ(second->size(), 2u);
-    bool liveSeen = false;
-    bool offlineSeen = false;
-    for (size_t i = 0; i < second->size(); ++i) {
-        const auto &delivered = second->delivered[i];
-        const std::string payload(delivered.payload.begin(), delivered.payload.end());
-        if (payload == "live") {
-            liveSeen = true;
-            EXPECT_EQ(second->packetIds[i], liveId);
-            EXPECT_TRUE(delivered.dup) << "an unacknowledged sent message is a retransmission";
-        } else {
-            offlineSeen = true;
-            EXPECT_FALSE(delivered.dup) << "a message buffered offline is a first transmission";
-        }
-    }
-    EXPECT_TRUE(liveSeen);
-    EXPECT_TRUE(offlineSeen);
+    // The unacknowledged retransmission leads; the offline buffer follows.
+    const auto &firstDelivered = second->delivered[0];
+    const std::string firstPayload(firstDelivered.payload.begin(),
+                                   firstDelivered.payload.end());
+    EXPECT_EQ(firstPayload, "live");
+    EXPECT_TRUE(firstDelivered.dup) << "an unacknowledged sent message is a retransmission";
+    EXPECT_EQ(second->packetIds[0], liveId);
+    const auto &secondDelivered = second->delivered[1];
+    const std::string secondPayload(secondDelivered.payload.begin(),
+                                    secondDelivered.payload.end());
+    EXPECT_EQ(secondPayload, "offline");
+    EXPECT_FALSE(secondDelivered.dup) << "a message buffered offline is a first transmission";
 }
 
 TEST_F(SessionLifecycleTest, ReceiveMaximumCountsQos2AwaitingPubcomp)

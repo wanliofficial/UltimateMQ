@@ -1071,9 +1071,13 @@ std::vector<uint8_t> Frame::serializeConnect(const ConnectPacket &packet) {
     buffer.push_back(packet.keepAlive >> 8);
     buffer.push_back(packet.keepAlive & 0xFF);
 
-    // Properties (MQTT 5 only)
+    // Properties (MQTT 5 only). §2.2.2: every MQTT 5 CONNECT carries the
+    // Property Length field, even when there are no properties, so it is
+    // written for both the CONNECT and the Will block.
     if (packet.protocolVersion == Version::MQTT5) {
         auto propertiesBuffer = serializeProperties(packet.properties);
+        auto propertyLengthBytes = encodeRemainingLength(propertiesBuffer.size());
+        buffer.insert(buffer.end(), propertyLengthBytes.begin(), propertyLengthBytes.end());
         buffer.insert(buffer.end(), propertiesBuffer.begin(), propertiesBuffer.end());
     }
 

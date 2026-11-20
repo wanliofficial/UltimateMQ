@@ -90,6 +90,46 @@ Opt-in behaviour must not change when no new environment variable or config is
 set. A new feature is gated behind an explicit, documented knob and the default
 path stays identical to before.
 
+## Specification conformance
+
+This broker implements normative specifications, so **specification conformance
+is the acceptance criterion for any wire-level change**: don't implement from
+memory or from what a peer client happens to tolerate — implement against the
+spec text, cite it, and verify it.
+
+Authoritative documents (all linked from https://mqtt.org/mqtt-specification/):
+
+| Spec | Edition | Link |
+|------|---------|------|
+| MQTT 5.0 | OASIS Standard | <https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html> |
+| MQTT 3.1.1 | OASIS Standard | <http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html> |
+| MQTT-SN 1.2 | OASIS Standard | <https://www.oasis-open.org/committees/document.php?document_id=66091&wg_abbrev=mqtt> |
+
+(MQTT 3.1 is kept for historical reference only and is not a target.)
+
+Rules of thumb, learned the hard way:
+
+- **Quote the requirement number in code.** Every normative rule enforced by
+  the codec or the protocol handlers carries its tag in a comment (e.g.
+  `MQTT-3.3.1-8`, `§2.2.2.2`). Keep the tag accurate when editing; a wrong tag
+  is worse than none because it sends the next reader to the wrong clause.
+- **Respect the modal verbs.** A `MUST` is a bug when violated; a `SHOULD` is
+  a decision to document; a `MAY` is a policy choice. Do not silently promote
+  any of them.
+- **Watch the encode/decode edge cases.** Minimal Variable Byte Integer
+  encoding, property-length fields, trailing-byte rejection, per-version return
+  code tables (3.1.1's `0x00`–`0x05` vs. MQTT 5 reason codes), and
+  version-gated fields (no properties section in 3.1.1) are where
+  spec-deviations hide. When in doubt about a byte layout, write a probe that
+  serializes and re-parses the packet, and keep it as a test.
+- **A clean parse is not conformance.** Accepting a packet the spec says to
+  reject (or rejecting one it says to accept) is only visible in the response
+  the broker sends: check the CONNACK / SUBACK / DISCONNECT reason codes and
+  the close-vs-answer behaviour for each version.
+- When a spec clause is deliberately not implemented (e.g. enhanced
+  authentication), refuse it explicitly with the right reason code and say so
+  in a comment, rather than half-implementing it or failing silently.
+
 ## Testing
 
 Run the unit suite and, for wire-level changes, the Python suites under the

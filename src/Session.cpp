@@ -320,6 +320,24 @@ void Session::pubcomp(uint16_t packetId) {
     }
 }
 
+void Session::retransmitInflight(uint16_t packetId) {
+    std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
+    auto it = inflightMessages.find(packetId);
+    if (it == inflightMessages.end()) {
+        return;
+    }
+    // Keep the message and its identifier outstanding; only queue it again
+    // (as a DUP retransmission) so the client can complete the flow.
+    Message outgoing = *it->second;
+    outgoing.dup = true;
+    SubscriptionIdentifiers identifiers;
+    auto idIt = inflightIdentifiers.find(packetId);
+    if (idIt != inflightIdentifiers.end()) {
+        identifiers = idIt->second;
+    }
+    pendingDeliveries.emplace_back(std::move(outgoing), packetId, it->second->qos, identifiers);
+}
+
 void Session::subscribe(const std::string &topicFilter, const SubscriptionOptions &options) {
     {
         std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
@@ -405,9 +423,13 @@ void Session::resume(const std::shared_ptr<Client>& client, Version protocolVers
                 queuedIds.insert(delivery.packetId);
             }
         }
-        // Retransmit every QoS>0 message that was delivered but never
-        // acknowledged, keeping the original packet id and setting DUP=1
-        // (MQTT-3.3.1-8 / MQTT-4.4.0-1)
+        // §4.6: every QoS>0 PUBLISH leaves the client in the order the original
+        // packets were sent. Messages that were delivered but never acknowledged
+        // were sent before anything queued while the session was offline, so the
+        // retransmissions go in front of the offline buffer instead of being
+        // appended behind it (they also keep their original packet identifiers).
+        std::vector<Delivery> retransmissions;
+        retransmissions.reserve(inflightMessages.size());
         for (const auto& [id, stored] : inflightMessages) {
             if (queuedIds.count(id) > 0) {
                 continue;
@@ -421,8 +443,11 @@ void Session::resume(const std::shared_ptr<Client>& client, Version protocolVers
             if (idIt != inflightIdentifiers.end()) {
                 identifiers = idIt->second;
             }
-            pendingDeliveries.emplace_back(std::move(outgoing), id, stored->qos, identifiers);
+            retransmissions.emplace_back(std::move(outgoing), id, stored->qos, identifiers);
         }
+        pendingDeliveries.insert(pendingDeliveries.begin(),
+                                 std::make_move_iterator(retransmissions.begin()),
+                                 std::make_move_iterator(retransmissions.end()));
         // Now that the unacked inflight messages have been re-queued (still
         // occupying their window slots), promote any blocked messages that fit.
         releaseBlocked();

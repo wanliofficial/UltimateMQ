@@ -98,6 +98,11 @@ public:
                                      ReasonCode clientReason = ReasonCode::SUCCESS);
     ReasonCode pubrel(uint16_t packetId);
     void pubcomp(uint16_t packetId);
+    //! Re-queue an inflight QoS 1/2 message for immediate retransmission with
+    //! DUP set, without acknowledging it. Used when the receiver rejected the
+    //! publish but the flow is still open (MQTT-SN §5.3.6 congestion rejection);
+    //! the identifier stays outstanding until an acknowledgement arrives.
+    void retransmitInflight(uint16_t packetId);
 
     //! Arm a disconnect-time expiry: after a graceful disconnect the session is
     //! dropped this many seconds later unless a client reconnects first. Called
