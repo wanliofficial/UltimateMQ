@@ -379,6 +379,26 @@ bool Store::write(const PersistedState &state) {
         ::unlink(tmp.c_str());
         return false;
     }
+    // The fsync above ordered the file's own contents, but the rename also has
+    // to be persisted: without fsyncing the containing directory a crash right
+    // after rename() can leave the new name uncommitted, so the durability
+    // claim holds only for torn writes, not for a lost commit.
+    {
+        std::string dir = path;
+        const auto slash = dir.find_last_of('/');
+        if (slash == std::string::npos) {
+            dir = ".";
+        } else if (slash == 0) {
+            dir = "/";
+        } else {
+            dir.erase(slash);
+        }
+        int dirFd = ::open(dir.c_str(), O_RDONLY);
+        if (dirFd >= 0) {
+            ::fsync(dirFd);
+            ::close(dirFd);
+        }
+    }
     return true;
 }
 
