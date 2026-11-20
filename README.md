@@ -768,7 +768,7 @@ This project is licensed under the Apache License, Version 2.0 - see the LICENSE
 
 ## Code agents
 
-development by the fllowing agent:
+developed by the fllowing agent:
 
 + qoder Qwen4 Max
 + codebuddy Hy4 flash
