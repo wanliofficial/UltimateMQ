@@ -73,6 +73,28 @@ TEST_F(FrameStreamTest, RejectsRemainingLengthLongerThanFourBytes)
     EXPECT_THROW(frame.feed(buffer.data(), buffer.size()), std::runtime_error);
 }
 
+TEST_F(FrameStreamTest, RejectsNonMinimalRemainingLengthEncoding)
+{
+    // §1.5.5: the Remaining Length must use the minimum number of bytes. A value
+    // of 0 encoded as 0x80 0x00 (two bytes, the second carrying nothing) decodes
+    // to 0 but is non-minimal, so it is a Malformed Packet rather than a PINGREQ
+    // of length 0.
+    std::vector<uint8_t> nonMinimal = {0xC0, 0x80, 0x00};
+    EXPECT_THROW(frame.feed(nonMinimal.data(), nonMinimal.size()), std::runtime_error);
+}
+
+TEST_F(FrameStreamTest, AcceptsMinimalMultiByteRemainingLength)
+{
+    // The guard must not over-reject: a genuinely multi-byte Remaining Length in
+    // minimal form (0x80 0x01 = 128) is still accepted. A small limit forces the
+    // length to be validated once the field is complete; only a body byte would
+    // finish the packet, so here we assert the header itself is not rejected.
+    frame.setMaxPacketSize(128);
+    std::vector<uint8_t> minimal = {0xC0, 0x80, 0x01};
+    EXPECT_NO_THROW(frame.feed(minimal.data(), minimal.size()));
+    EXPECT_FALSE(frame.isComplete());
+}
+
 TEST_F(FrameStreamTest, ResetDropsPartialPacket)
 {
     auto pkt = connectPacket("partial");

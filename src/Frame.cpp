@@ -172,6 +172,15 @@ size_t Frame::feed(const uint8_t *buffer, size_t length) {
         }
         if ((encoded & 0x80) == 0) {
             headerComplete = true;
+            // §1.5.5: the Remaining Length MUST be encoded in the minimum number
+            // of bytes. A non-minimal encoding (extra leading 0x80 continuation
+            // bytes that add nothing to the value) is a Malformed Packet, even
+            // though it decodes to the same number. Mirror the check the
+            // property-length decoder already applies (decodeVariableByteInteger).
+            if (remainingLengthBytes > 1 &&
+                remainingLength < (static_cast<size_t>(1) << (7 * (remainingLengthBytes - 1)))) {
+                throw std::runtime_error("Malformed Remaining Length: non-minimal encoding");
+            }
             // The whole Remaining Length is now known. Refuse oversized packets
             // here, before buffering a single body byte, so the per-connection
             // partial buffer can never grow past the limit plus the header.
