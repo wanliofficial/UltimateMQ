@@ -31,6 +31,7 @@ def free_port():
 
 PROBES = [
     ("recvmax_window_test", "MQTT-4.9 Receive Maximum window (QoS 2 / QoS 1)"),
+    ("websocket_framing_test", "WebSocket framing: cap-before-buffer + no fragmented control frames"),
 ]
 
 
