@@ -231,6 +231,10 @@ struct FixedHeader {
             }
             return true;
         case PacketType::PUBREL:
+            // §4.4: DUP MUST be 1 on a re-delivered PUBREL. The fixed-header
+            // bits are 0010 (MQTT-3.6.1-1) but §4.4 overrides bit 3 for
+            // retransmissions, so both DUP=0 and DUP=1 are legal here.
+            return (qos == QoS::QOS_1) && !retain;
         case PacketType::SUBSCRIBE:
         case PacketType::UNSUBSCRIBE:
             // These packets must have QoS = 1, and dup and retain must be false
@@ -388,7 +392,8 @@ struct PubrecPacket : Packet {
 struct PubrelPacket : Packet {
     uint16_t packetId;
     ReasonCode reasonCode;
-    PubrelPacket() 
+    bool dup = false;
+    PubrelPacket()
         : Packet(PacketType::PUBREL), packetId(0), reasonCode(ReasonCode::SUCCESS) {}
     PubrelPacket(uint16_t id)
         : Packet(PacketType::PUBREL), packetId(id), reasonCode(ReasonCode::SUCCESS) {}

@@ -56,6 +56,11 @@ Session::Snapshot Session::snapshot() const {
     for (const auto &blocked : blockedDeliveries) {
         snapshot.blocked.push_back(blocked.message);
     }
+    if (hasExpiry) {
+        const auto left = std::chrono::duration_cast<std::chrono::seconds>(
+                              expiryDeadline - std::chrono::steady_clock::now()).count();
+        snapshot.expiryRemainingSeconds = left < 0 ? 0 : left;
+    }
     return snapshot;
 }
 
@@ -80,8 +85,17 @@ void Session::restore(const Snapshot &snapshot) {
         blockedDeliveries.clear();
         for (const auto &m : snapshot.blocked) {
             Message copy = m;
-            copy.hasExpiry = false;  // restored backlog never expires in memory
             blockedDeliveries.emplace_back(std::move(copy), /*packetId=*/0, copy.qos);
+        }
+        // Re-arm the disconnect-time expiry from the remaining interval that
+        // was written at snapshot time; a restart must not extend the session's
+        // lifetime (MQTT-3.1.2-11).
+        if (snapshot.expiryRemainingSeconds >= 0) {
+            expiryDeadline = std::chrono::steady_clock::now() +
+                             std::chrono::seconds(snapshot.expiryRemainingSeconds);
+            hasExpiry = true;
+        } else {
+            hasExpiry = false;
         }
     }
     connected = false;
@@ -559,8 +573,10 @@ void Session::deliverRetained(const std::string &topicFilter, const Subscription
             continue;
         }
         Message outgoing = message;
-        // MQTT-3.3.1-8: messages sent because of a subscription keep the retain flag
-        outgoing.retain = true;
+        // MQTT-3.3.1-8: RETAIN=1 when sent because of a new subscription.
+        // MQTT-3.3.1-9: RETAIN=0 when sent because of an established subscription
+        // (re-subscribe with retainHandling=0), regardless of the stored flag.
+        outgoing.retain = isNewSubscription;
         QoS qos = message.qos < options.maximumQos ? message.qos : options.maximumQos;
         // A retained delivery caused by this subscription also carries its
         // identifier (MQTT-3.3.4-3 covers every publish the subscription causes).

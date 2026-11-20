@@ -33,3 +33,5 @@
 
 # Buiding
 build/
+
+.DS_Store

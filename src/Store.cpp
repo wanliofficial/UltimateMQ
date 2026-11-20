@@ -207,6 +207,31 @@ bool decodeMessageProperties(const std::string &encoded, Properties &out) {
     return true;
 }
 
+//! Remaining Message Expiry as a trail field: whole seconds still left, or "-"
+//! when the message carries no expiry. A steady-clock deadline cannot survive a
+//! restart, so the remaining interval is stored instead (MQTT-3.3.2-9).
+std::string encodeMessageExpiry(const Message &m) {
+    if (!m.hasExpiry) {
+        return "-";
+    }
+    const auto left = std::chrono::duration_cast<std::chrono::seconds>(
+                          m.expiryDeadline - std::chrono::steady_clock::now()).count();
+    return std::to_string(left < 0 ? 0 : left);
+}
+
+bool decodeMessageExpiry(const std::string &token, Message &m) {
+    if (token == "-" || token.empty()) {
+        return true;
+    }
+    unsigned long long seconds = 0;
+    if (!parseUnsigned(token, seconds)) {
+        return false;
+    }
+    m.hasExpiry = true;
+    m.expiryDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    return true;
+}
+
 } // namespace
 
 Store::Store(std::string path, std::chrono::milliseconds interval)
@@ -279,7 +304,7 @@ bool Store::write(const PersistedState &state) {
         const Message &m = entry.second;
         out += "retained " + toHex(m.topic) + " " + std::to_string(static_cast<int>(m.qos)) + " " +
                (m.retain ? "1" : "0") + " " + toHex(m.payload) + " " +
-               encodeMessageProperties(m.properties) + "\n";
+               encodeMessageProperties(m.properties) + " " + encodeMessageExpiry(m) + "\n";
     }
     for (const auto &session : state.sessions) {
         // An empty username must still occupy its column, otherwise the fixed
@@ -287,7 +312,10 @@ bool Store::write(const PersistedState &state) {
         // "no username"; a real username is hex-encoded.
         const std::string user = session.username.empty() ? "-" : toHex(session.username);
         out += "session " + toHex(session.clientId) + " " + user + " " +
-               std::to_string(session.nextPacketId) + "\n";
+               std::to_string(session.nextPacketId) + " " +
+               (session.expiryRemainingSeconds < 0
+                    ? "-"
+                    : std::to_string(session.expiryRemainingSeconds)) + "\n";
         for (const auto &sub : session.subscriptions) {
             const SubscriptionOptions &opt = sub.second;
             out += "sub " + toHex(sub.first) + " " + std::to_string(static_cast<int>(opt.maximumQos)) +
@@ -299,13 +327,15 @@ bool Store::write(const PersistedState &state) {
             const Message &m = inflight.second;
             out += "inflight " + std::to_string(inflight.first) + " " + toHex(m.topic) + " " +
                    std::to_string(static_cast<int>(m.qos)) + " " + (m.retain ? "1" : "0") + " " +
-                   toHex(m.payload) + " " + encodeMessageProperties(m.properties) + "\n";
+                   toHex(m.payload) + " " + encodeMessageProperties(m.properties) + " " +
+                   encodeMessageExpiry(m) + "\n";
         }
         for (const auto &blocked : session.blocked) {
             const Message &m = blocked;
             out += "blocked 0 " + toHex(m.topic) + " " +
                    std::to_string(static_cast<int>(m.qos)) + " " + (m.retain ? "1" : "0") + " " +
-                   toHex(m.payload) + " " + encodeMessageProperties(m.properties) + "\n";
+                   toHex(m.payload) + " " + encodeMessageProperties(m.properties) + " " +
+                   encodeMessageExpiry(m) + "\n";
         }
         for (uint16_t id : session.awaitingPubrel) {
             out += "pubrel " + std::to_string(id) + "\n";
@@ -395,6 +425,12 @@ bool Store::load(PersistedState &out, std::string *error) const {
                 if (error) *error = "bad properties in retained record at line " + std::to_string(lineNo);
                 return false;
             }
+            // The expiry trail field is optional too: older state carries none.
+            std::string expiryToken;
+            if (ss >> expiryToken && !decodeMessageExpiry(expiryToken, m)) {
+                if (error) *error = "bad expiry in retained record at line " + std::to_string(lineNo);
+                return false;
+            }
             out.retained[m.topic] = m;
         } else if (kind == "session") {
             std::string clientHex, userHex;
@@ -419,6 +455,16 @@ bool Store::load(PersistedState &out, std::string *error) const {
                 return false;
             }
             session.nextPacketId = static_cast<uint16_t>(nextId);
+            // Optional remaining Session Expiry interval; absent in older state.
+            std::string expiryToken;
+            if (ss >> expiryToken && expiryToken != "-") {
+                unsigned long long seconds = 0;
+                if (!parseUnsigned(expiryToken, seconds)) {
+                    if (error) *error = "bad expiry in session record at line " + std::to_string(lineNo);
+                    return false;
+                }
+                session.expiryRemainingSeconds = static_cast<int64_t>(seconds);
+            }
             out.sessions.push_back(std::move(session));
             current = &out.sessions.back();
         } else if (kind == "sub" || kind == "inflight" || kind == "blocked" || kind == "pubrel" ||
@@ -466,6 +512,11 @@ bool Store::load(PersistedState &out, std::string *error) const {
                     if (error) *error = "bad properties in inflight record at line " + std::to_string(lineNo);
                     return false;
                 }
+                std::string expiryToken;
+                if (ss >> expiryToken && !decodeMessageExpiry(expiryToken, m)) {
+                    if (error) *error = "bad expiry in inflight record at line " + std::to_string(lineNo);
+                    return false;
+                }
                 current->inflight.emplace_back(static_cast<uint16_t>(id), std::move(m));
             } else if (kind == "blocked") {
                 unsigned id = 0;
@@ -479,6 +530,11 @@ bool Store::load(PersistedState &out, std::string *error) const {
                 std::string encodedProperties;
                 if (ss >> encodedProperties && !decodeMessageProperties(encodedProperties, m.properties)) {
                     if (error) *error = "bad properties in blocked record at line " + std::to_string(lineNo);
+                    return false;
+                }
+                std::string expiryToken;
+                if (ss >> expiryToken && !decodeMessageExpiry(expiryToken, m)) {
+                    if (error) *error = "bad expiry in blocked record at line " + std::to_string(lineNo);
                     return false;
                 }
                 current->blocked.push_back(std::move(m));

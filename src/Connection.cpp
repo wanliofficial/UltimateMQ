@@ -1,6 +1,7 @@
 #include "Frame.h"
 #include "Connection.h"
 #include "Topic.h"
+#include "Utf8.h"
 #include "Session.h"
 #include "Broker.h"
 #include "SysTopics.h"
@@ -250,7 +251,6 @@ void Connection::runReadLoop() {
         if (bytesRead <= 0) {
             return;
         }
-        lastActivity = std::chrono::steady_clock::now();
 
         size_t consumed = 0;
         while (consumed < static_cast<size_t>(bytesRead) && state != State::DISCONNECTED) {
@@ -263,6 +263,9 @@ void Connection::runReadLoop() {
                 auto packet = frame.parse();
                 frame.reset();
                 handleIncoming(packet);
+                // MQTT-3.1.2-24: the Keep Alive timer resets only on a complete
+                // Control Packet, not on partial bytes dribbled by the peer.
+                lastActivity = std::chrono::steady_clock::now();
             }
         }
     }
@@ -619,68 +622,58 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
         state = State::DISCONNECTED;
         return;
     }
-    if (connect->willFlag && connect->willTopic && connect->willMsg) {
-        willPending = true;
-        willMessage = Message(*connect->willTopic, *connect->willMsg, connect->willQos, connect->willRetain);
-        willDelay = 0;
-        // MQTT 5 Will properties (MQTT-3.1.2-12 / 5.4.3.1): the application
-        // properties a Will carries are forwarded when it is published, exactly
-        // as for an ordinary PUBLISH. Will Delay Interval is handled separately
-        // below (it controls timing, not the published payload).
-        if (connect->willProperties) {
-            for (PropertyID forwardable : {PropertyID::PAYLOAD_FORMAT_INDICATOR,
-                                           PropertyID::MESSAGE_EXPIRY_INTERVAL,
-                                           PropertyID::CONTENT_TYPE,
-                                           PropertyID::RESPONSE_TOPIC,
-                                           PropertyID::CORRELATION_DATA,
-                                           PropertyID::USER_PROPERTY}) {
-                auto it = connect->willProperties->find(forwardable);
-                if (it != connect->willProperties->end()) {
-                    willMessage.properties[forwardable] = it->second;
-                }
+    // MQTT 5 property validation: reject before any session state is touched or
+    // the Will is armed. A rejected CONNECT must never publish a Will or cancel
+    // another client's pending Will.
+    uint32_t validatedClientMaxPacket = 0;
+    uint16_t validatedReceiveMaximum = 65535;
+    if (frame.getVersion() == Version::MQTT5) {
+        auto maxPacket = connect->properties.find(PropertyID::MAXIMUM_PACKET_SIZE);
+        if (maxPacket != connect->properties.end() &&
+            std::holds_alternative<uint32_t>(maxPacket->second)) {
+            const uint32_t clientLimit = std::get<uint32_t>(maxPacket->second);
+            if (clientLimit == 0) {
+                logInfo("rejecting client %s: Maximum Packet Size must not be 0",
+                        connect->clientId.c_str());
+                ConnackPacket rejectConnack{false, ReasonCode::PROTOCOL_ERROR};
+                connackSent = true;
+                sendPacket(rejectConnack);
+                state = State::DISCONNECTED;
+                return;
             }
-            // MQTT 5 Will Delay Interval (MQTT-3.1.2-12 / 5.4.3.2): a nonzero delay
-            // means the Will must be held on the session and published by the broker
-            // sweeper only after the delay elapses, giving the client a window to
-            // reconnect and cancel it. Parsed here from the will property set.
-            auto it = connect->willProperties->find(PropertyID::WILL_DELAY_INTERVAL);
-            if (it != connect->willProperties->end() && std::holds_alternative<uint32_t>(it->second)) {
-                willDelay = std::get<uint32_t>(it->second);
+            validatedClientMaxPacket = clientLimit;
+        }
+        auto it = connect->properties.find(PropertyID::RECEIVE_MAXIMUM);
+        if (it != connect->properties.end() && std::holds_alternative<uint16_t>(it->second)) {
+            uint16_t receiveMaximum = std::get<uint16_t>(it->second);
+            if (receiveMaximum == 0) {
+                logInfo("rejecting client %s: Receive Maximum must not be 0",
+                        connect->clientId.c_str());
+                ConnackPacket rejectConnack{false, ReasonCode::PROTOCOL_ERROR};
+                connackSent = true;
+                sendPacket(rejectConnack);
+                state = State::DISCONNECTED;
+                return;
             }
-            // MQTT-3.3.2-9 / MQTT-3.3.2-6: the Will is published like any other
-            // Application Message, so its Message Expiry Interval has to become a
-            // deadline too. Without this the Will was delivered forever: an
-            // interval of 0 still reached subscribers, a copy queued for an
-            // offline session never went stale, and the retained copy never
-            // disappeared. The lifetime starts when the Will is published (after
-            // the Will Delay), not now, so the delay does not eat into it.
-            auto expiry = connect->willProperties->find(PropertyID::MESSAGE_EXPIRY_INTERVAL);
-            if (expiry != connect->willProperties->end() &&
-                std::holds_alternative<uint32_t>(expiry->second)) {
-                willExpiryInterval = std::get<uint32_t>(expiry->second);
-                willHasExpiry = true;
-            }
+            validatedReceiveMaximum = receiveMaximum;
         }
     }
-
-    // A reconnect within a pending Will's delay window cancels that Will
-    // (MQTT-3.1.4-6): the client came back before it was published. This covers
-    // both a resumed session and a fresh connect that supersedes a prior
-    // connection's pending Will for the same client id.
-    broker->cancelWill(connect->clientId);
 
     // Resolve the session for this client id. A clean start discards any session
     // left behind by an earlier connection; otherwise the existing session is
     // reused so that its subscriptions and unacknowledged messages survive.
     auto existing = broker->findSession(connect->clientId);
     // A session belongs to the user that authenticated for it: never hand the
-    // subscriptions and buffered messages of one user to another. If the
-    // username changes, drop the old session and start fresh.
+    // subscriptions and buffered messages of one user to another, and never let
+    // a different user destroy them. Reject the CONNECT instead of discarding.
     if (existing && existing->getUsername() != username) {
-        logInfo("client %s changed user (%s -> %s), discarding its session",
-                connect->clientId.c_str(), existing->getUsername().c_str(), username.c_str());
-        existing->discard();
-        existing.reset();
+        logInfo("rejecting client %s: session belongs to a different user (%s)",
+                connect->clientId.c_str(), existing->getUsername().c_str());
+        ConnackPacket connack{false, ReasonCode::NOT_AUTHORIZED};
+        connackSent = true;
+        sendPacket(connack);
+        state = State::DISCONNECTED;
+        return;
     }
     if (existing && connect->cleanStart) {
         existing->discard();
@@ -707,30 +700,53 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     } else {
         persistentSession = !connect->cleanStart;
     }
-    // Remember the interval for the teardown path: a graceful DISCONNECT may
-    // override it (MQTT-3.14.4-2), and a non-zero value arms the session's
-    // expiry deadline when the connection closes. The CONNECT value is kept
-    // separately because §3.14.2.2.2 forbids a DISCONNECT from raising it once
-    // it is zero.
     sessionExpirySeconds = connectSessionExpiry;
     this->connectSessionExpiry = connectSessionExpiry;
 
+    // All validation has passed: now it is safe to arm the Will and cancel any
+    // pending delayed Will for this client id. A rejected CONNECT never reaches
+    // here, so it cannot publish a Will or cancel another client's pending Will.
+    if (connect->willFlag && connect->willTopic && connect->willMsg) {
+        willPending = true;
+        willMessage = Message(*connect->willTopic, *connect->willMsg, connect->willQos, connect->willRetain);
+        willDelay = 0;
+        if (connect->willProperties) {
+            for (PropertyID forwardable : {PropertyID::PAYLOAD_FORMAT_INDICATOR,
+                                           PropertyID::MESSAGE_EXPIRY_INTERVAL,
+                                           PropertyID::CONTENT_TYPE,
+                                           PropertyID::RESPONSE_TOPIC,
+                                           PropertyID::CORRELATION_DATA,
+                                           PropertyID::USER_PROPERTY}) {
+                auto it = connect->willProperties->find(forwardable);
+                if (it != connect->willProperties->end()) {
+                    willMessage.properties[forwardable] = it->second;
+                }
+            }
+            auto it = connect->willProperties->find(PropertyID::WILL_DELAY_INTERVAL);
+            if (it != connect->willProperties->end() && std::holds_alternative<uint32_t>(it->second)) {
+                willDelay = std::get<uint32_t>(it->second);
+            }
+            auto expiry = connect->willProperties->find(PropertyID::MESSAGE_EXPIRY_INTERVAL);
+            if (expiry != connect->willProperties->end() &&
+                std::holds_alternative<uint32_t>(expiry->second)) {
+                willExpiryInterval = std::get<uint32_t>(expiry->second);
+                willHasExpiry = true;
+            }
+        }
+    }
+    // MQTT-3.1.4-6: a reconnect within a pending Will's delay window cancels it.
+    broker->cancelWill(connect->clientId);
+
     auto sessionToUse = resumed ? existing : std::make_shared<Session>(broker, connect->clientId,
                                                                         connect->cleanStart);
-    // The session belongs to the user it authenticated with, and a persistent
-    // connection keeps it across disconnects (unless cleanStart discarded it)
     sessionToUse->setUsername(username);
     sessionToUse->setPersistent(persistentSession);
+    // Apply the validated Receive Maximum. When the property is absent the
+    // protocol default is 65535; a resumed session must not keep the previous
+    // connection's smaller window.
+    sessionToUse->setReceiveMaximum(validatedReceiveMaximum);
+    clientMaxPacketSize = validatedClientMaxPacket;
     session = sessionToUse;
-
-    // The Will (immediate or delayed) stays on this connection and is resolved
-    // when the Network Connection closes: run() publishes it at once when there
-    // is no delay, or hands it to the broker so the sweeper publishes it after
-    // the Will Delay Interval elapses (MQTT-3.1.4-6 / 5.4.3.2). Arming at
-    // disconnect (not at connect) is what makes the delay count from the close
-    // of the connection (MQTT-3.1.3.2). A reconnect cancels a pending delayed
-    // Will via cancelWill() above, and onSuperseded() clears willPending so a
-    // taken-over connection never publishes.
 
     setDisconnectCallback([weak = weak_from_this()]() {
         if (auto connection = weak.lock()) {
@@ -745,77 +761,23 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     // actually being resumed.
     ConnackPacket connack{false, ReasonCode::SUCCESS};
     connack.sessionPresent = resumed;
-    // Advertise our Maximum Packet Size to MQTT 5 clients (MQTT-3.1.2-6): they
-    // then keep their own packets within the limit we will enforce. Older
-    // versions have no property section, so nothing is added for them.
     if (frame.getVersion() == Version::MQTT5) {
         const size_t limit = broker ? broker->getMaxPacketSize() : Frame::DEFAULT_MAX_PACKET_SIZE;
-        // MAXIMUM_PACKET_SIZE is a 4-byte field; the limit fits comfortably.
         connack.properties[PropertyID::MAXIMUM_PACKET_SIZE] = static_cast<uint32_t>(limit);
-        // Remember the largest packet this client accepts (MQTT-3.1.2-24). Every
-        // outbound packet is measured against it in sendPacket(); the property
-        // must not be 0, and an over-long packet is dropped rather than sent.
-        auto maxPacket = connect->properties.find(PropertyID::MAXIMUM_PACKET_SIZE);
-        if (maxPacket != connect->properties.end() &&
-            std::holds_alternative<uint32_t>(maxPacket->second)) {
-            const uint32_t clientLimit = std::get<uint32_t>(maxPacket->second);
-            if (clientLimit == 0) {
-                logInfo("rejecting client %s: Maximum Packet Size must not be 0",
-                        connect->clientId.c_str());
-                ConnackPacket rejectConnack{false, ReasonCode::PROTOCOL_ERROR};
-                connackSent = true;
-                sendPacket(rejectConnack);
-                state = State::DISCONNECTED;
-                return;
-            }
-            clientMaxPacketSize = clientLimit;
-        }
-        // Tell the client how many Topic Aliases it may use on this connection
-        // (MQTT-3.1.2-26). Advertising it is what makes alias-only PUBLISHes
-        // legal; the mapping itself is tracked per connection below.
         connack.properties[PropertyID::TOPIC_ALIAS_MAXIMUM] = TOPIC_ALIAS_MAXIMUM;
-        // Advertise the subscription features this broker actually implements
-        // (MQTT-3.1.2-4). They all default to "available" when absent, but
-        // stating them explicitly is friendlier to strict client libraries and
-        // removes any guesswork. The broker supports wildcards and shared
-        // subscriptions, subscription identifiers, retained messages and every
-        // QoS level (Maximum QoS 2).
         connack.properties[PropertyID::WILDCARD_SUBSCRIPTION_AVAILABLE] = true;
         connack.properties[PropertyID::SUBSCRIPTION_IDENTIFIER_AVAILABLE] = true;
         connack.properties[PropertyID::SHARED_SUBSCRIPTION_AVAILABLE] = true;
         connack.properties[PropertyID::RETAIN_AVAILABLE] = true;
         connack.properties[PropertyID::MAXIMUM_QOS] = static_cast<uint8_t>(QoS::QOS_2);
-        // MQTT-3.1.3-7: when the broker named the client, it must say what it
-        // chose, otherwise the client cannot resume that session later.
         if (assignedClientId) {
             connack.properties[PropertyID::ASSIGNED_CLIENT_IDENTIFIER] = connect->clientId;
         }
-        // A preferred keep alive caps how long a dead connection lingers: a
-        // client that asked for more (or for none, which would otherwise never
-        // be reaped) is told the broker's value and must use it (MQTT-3.1.2-21).
         const uint16_t preferred = broker ? broker->getServerKeepAlive() : 0;
         if (preferred != 0 && (keepAliveSeconds == 0 || keepAliveSeconds > preferred)) {
             keepAliveSeconds = preferred;
             armKeepAliveTimer();
             connack.properties[PropertyID::SERVER_KEEP_ALIVE] = preferred;
-        }
-        // Apply the client's Receive Maximum (MQTT-3.1.2-10 / 4.9): it caps how
-        // many QoS 1/2 messages the broker keeps outstanding to this client. A
-        // value of 0 is a protocol violation and the broker must close the
-        // connection. MQTT 3.1.1 has no such property, so nothing is set and the
-        // session keeps its default of no effective limit.
-        auto it = connect->properties.find(PropertyID::RECEIVE_MAXIMUM);
-        if (it != connect->properties.end() && std::holds_alternative<uint16_t>(it->second)) {
-            uint16_t receiveMaximum = std::get<uint16_t>(it->second);
-            if (receiveMaximum == 0) {
-                logInfo("client %s sent RECEIVE_MAXIMUM 0, closing connection",
-                        connect->clientId.c_str());
-                connack.reasonCode = ReasonCode::PROTOCOL_ERROR;
-                connackSent = true;
-                sendPacket(connack);
-                throw std::runtime_error("RECEIVE_MAXIMUM must not be 0");
-            }
-            sessionToUse->setReceiveMaximum(receiveMaximum);
         }
     }
     connackSent = true;
@@ -826,9 +788,6 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
         connected = true;
         state = State::CONNECTED;
     }
-    // The session only knows the Client interface; it keeps this connection
-    // alive through the shared_ptr it receives here. resume() also retransmits
-    // the unacknowledged QoS>0 messages of a resumed session.
     if (resumed) {
         sessionToUse->resume(shared_from_this(), frame.getVersion());
         sessionToUse->flush();
@@ -1008,6 +967,32 @@ void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
         }
         // MQTT 3.1.1 has no way to report a QoS0 rejection; silently drop it
         return;
+    }
+    // MQTT-3.3.2-5: a Payload Format Indicator of 1 promises the payload is
+    // UTF-8 encoded character data. When it is not, QoS 1/2 are answered with
+    // PAYLOAD_FORMAT_INVALID (0x99) and a QoS 0 MQTT 5 publish is reported with
+    // a DISCONNECT carrying the same code.
+    if (frame.getVersion() == Version::MQTT5) {
+        auto pfi = publish->properties.find(PropertyID::PAYLOAD_FORMAT_INDICATOR);
+        if (pfi != publish->properties.end() &&
+            std::holds_alternative<uint8_t>(pfi->second) &&
+            std::get<uint8_t>(pfi->second) == 1 &&
+            !Utf8::isValid(publish->payload.data(), publish->payload.size())) {
+            logDebug("client %s: PUBLISH claims UTF-8 payload but it is malformed",
+                     session->getClientId().c_str());
+            if (publish->qos == QoS::QOS_1) {
+                PubackPacket puback{publish->packetId, ReasonCode::PAYLOAD_FORMAT_INVALID};
+                sendPacket(puback);
+            } else if (publish->qos == QoS::QOS_2) {
+                PubrecPacket pubrec{publish->packetId, ReasonCode::PAYLOAD_FORMAT_INVALID};
+                sendPacket(pubrec);
+            } else {
+                DisconnectPacket disconnect{ReasonCode::PAYLOAD_FORMAT_INVALID};
+                sendPacket(disconnect);
+                state = State::DISCONNECTED;
+            }
+            return;
+        }
     }
     Message message{publish->topicName, publish->payload, publish->qos, publish->retain};
     // MQTT 5 Message Expiry Interval (MQTT-3.3.2-9): record the absolute time at
@@ -1238,10 +1223,17 @@ void Connection::handleUnsubscribe(std::shared_ptr<UnsubscribePacket> unsubscrib
     }
     // MQTT 5 UNSUBACK (MQTT-3.11.3): one reason code per topic filter, in the
     // order they appeared in the UNSUBSCRIBE. Success (0x00) when a subscription
-    // existed and was removed, No Subscription Existed (0x11) otherwise. MQTT
-    // 3.1.1 answers with a bare packet identifier and no payload.
+    // existed and was removed, No Subscription Existed (0x11) otherwise. An
+    // invalid Topic Filter is reported with TOPIC_FILTER_INVALID (0x8F).
+    // MQTT 3.1.1 answers with a bare packet identifier and no payload.
     UnsubackPacket unsuback{unsubscribe->packetId};
     for (const auto& topic : unsubscribe->topicFilters) {
+        if (!Topic::isValid(topic)) {
+            if (frame.getVersion() == Version::MQTT5) {
+                unsuback.reasonCodes.push_back(ReasonCode::TOPIC_FILTER_INVALID);
+            }
+            continue;
+        }
         const bool removed = session->unsubscribe(topic);
         if (frame.getVersion() == Version::MQTT5) {
             unsuback.reasonCodes.push_back(
@@ -1373,7 +1365,9 @@ void Connection::sendPubrel(uint16_t packetId) {
     }
     // A re-sent PUBREL always carries SUCCESS (the PUBREC that opened this leg
     // was accepted), so the client can finish the flow with PUBCOMP.
+    // §4.4: DUP MUST be set to 1 when re-delivering a PUBREL.
     PubrelPacket pubrel{packetId, ReasonCode::SUCCESS};
+    pubrel.dup = true;
     logDebug("resend PUBREL packetId=%u (awaiting PUBCOMP)", packetId);
     sendPacket(pubrel);
 }

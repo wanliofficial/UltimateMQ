@@ -1,5 +1,7 @@
 # UltimateMQ
 
+![MQTT Logo](docs/assets/mqtt-logo.png)
+
 UltimateMQ is an experimental MQTT broker written in C++ with cursor.
 
 ## Prerequisites
@@ -48,6 +50,7 @@ All configuration is read from environment variables at startup.
 | `FLOWMQ_TLS_VERIFY_CLIENTS` | unset | When set, a client certificate signed by `FLOWMQ_TLS_CA` is required |
 | `FLOWMQ_TLS_CERT_AS_USERNAME` | unset | With mutual TLS, authorise a client that sends no MQTT username under its certificate CN |
 | `FLOWMQ_WEBSOCKET_PORT` | unset | Additional TCP port serving MQTT over WebSocket (`ws://`, or `wss://` when TLS is configured) |
+| `FLOWMQ_WS_REQUIRE_SUBPROTOCOL` | unset | When set, a WebSocket upgrade that does not offer the `mqtt` subprotocol is refused with HTTP 400 (the binding's requirement); otherwise such clients are still accepted |
 | `FLOWMQ_MQTT_SN_PORT` | unset | UDP port serving MQTT-SN 1.2 clients through the built-in gateway |
 | `FLOWMQ_MQTT_SN_PREDEFINED_TOPICS` | unset | Predefined MQTT-SN topic ids, e.g. `1=sensors/temp,2=home/#` |
 | `FLOWMQ_QUIC_PORT` | unset | UDP port serving MQTT over QUIC; requires a build with libmsquic (see below) |
@@ -761,3 +764,13 @@ Please read CONTRIBUTING.md for details on our code of conduct and the process f
 ## License
 
 This project is licensed under the Apache License, Version 2.0 - see the LICENSE file for details.
+
+
+## Code agents
+
+development by the fllowing agent:
+
++ qoder Qwen4 Max
++ codebuddy Hy4 flash
++ zcode GLM 5.3 flash
++ claudecode Deepseek V4.1 flash

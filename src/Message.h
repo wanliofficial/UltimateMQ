@@ -19,8 +19,8 @@ struct Message {
     bool dup = false;
     //! MQTT 5 Message Expiry Interval, as an absolute deadline. When hasExpiry
     //! is set and now reaches expiryDeadline the message is stale and must not
-    //! be delivered (it is dropped instead). In-memory only: it is never written
-    //! to the durable state, so a restored message never expires.
+    //! be delivered (it is dropped instead). The durable state stores the
+    //! remaining seconds, which are turned back into a deadline on restore.
     bool hasExpiry = false;
     std::chrono::steady_clock::time_point expiryDeadline;
     //! The session that originated this message, set on the live fan-out path.

@@ -2,6 +2,7 @@
 #include "SHA1.h"
 #include "Log.h"
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 
 namespace MQTT {
@@ -202,10 +203,26 @@ bool WebSocketTransport::handshake(std::string *error) {
         reinterpret_cast<const uint8_t *>(keyAndGuid.data()), keyAndGuid.size());
     std::string accept = base64(digest.data(), digest.size());
 
-    // The MQTT binding's subprotocol name is "mqtt"; echo it when the client
-    // offered it so both sides agree on raw MQTT in binary frames.
+    // The MQTT-over-WebSocket binding's subprotocol name is "mqtt"; echo it
+    // when the client offered it so both sides agree on raw MQTT in binary
+    // frames. With FLOWMQ_WS_REQUIRE_SUBPROTOCOL set, a client that did not
+    // offer "mqtt" is refused outright, as the binding demands; without the
+    // knob such clients are still accepted, as before.
     if (headerContains(protocolHeader, WEBSOCKET_SUBPROTOCOL)) {
         subprotocol_ = WEBSOCKET_SUBPROTOCOL;
+    } else if (getenv("FLOWMQ_WS_REQUIRE_SUBPROTOCOL") != nullptr) {
+        std::string response =
+            "HTTP/1.1 400 Bad Request\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: 30\r\n"
+            "\r\n"
+            "mqtt subprotocol is required.\n";
+        inner_->writeAll(reinterpret_cast<const uint8_t *>(response.data()),
+                         response.size());
+        if (error) {
+            *error = "websocket client did not offer the mqtt subprotocol";
+        }
+        return false;
     }
 
     std::string response =

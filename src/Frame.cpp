@@ -236,8 +236,11 @@ std::shared_ptr<Packet> Frame::parse(const uint8_t *buffer, size_t length) {
         return std::make_shared<PubackPacket>(parsePuback(buffer + offset, remainingLength));
     case PacketType::PUBREC:
         return std::make_shared<PubrecPacket>(parsePubrec(buffer + offset, remainingLength));
-    case PacketType::PUBREL:
-        return std::make_shared<PubrelPacket>(parsePubrel(buffer + offset, remainingLength));
+    case PacketType::PUBREL: {
+        auto pubrel = parsePubrel(buffer + offset, remainingLength);
+        pubrel.dup = header.dup;
+        return std::make_shared<PubrelPacket>(pubrel);
+    }
     case PacketType::PUBCOMP:
         return std::make_shared<PubcompPacket>(parsePubcomp(buffer + offset, remainingLength));
     case PacketType::SUBSCRIBE:
@@ -273,6 +276,10 @@ std::pair<size_t, size_t> Frame::decodeVariableByteInteger(const uint8_t *buffer
         }
         multiplier *= 128;
     } while ((encodedByte & 128) != 0);
+    // §1.5.5: the encoded value MUST use the minimum number of bytes necessary.
+    if (offset > 1 && value < (size_t(1) << (7 * (offset - 1)))) {
+        throw std::runtime_error("Malformed Variable Byte Integer: non-minimal encoding");
+    }
     return {value, offset};
 }
 
@@ -743,6 +750,12 @@ ConnectPacket Frame::parseConnect(const uint8_t *buffer, size_t length) {
         offset += password.length() + 2;
     }
 
+    // MQTT-3.1.4-1: the CONNECT payload must be consumed exactly; trailing
+    // bytes indicate a malformed packet.
+    if (offset != length) {
+        throw std::runtime_error("Malformed CONNECT: trailing bytes after payload");
+    }
+
     return connect;
 }
 
@@ -785,6 +798,14 @@ PublishPacket Frame::parsePublish(const FixedHeader &header, const uint8_t *buff
 void Frame::parseAckReasonAndProperties(const uint8_t *buffer, size_t length, size_t offset,
                                          PropertyContext context, ReasonCode &reasonCode,
                                          Properties &properties) {
+    // MQTT 3.1.1: acks are exactly a Packet Identifier (RL=2). Any trailing
+    // byte is a Malformed Packet.
+    if (version != Version::MQTT5) {
+        if (offset < length) {
+            throw std::runtime_error("Malformed ack: non-zero Reason Code in MQTT 3.1.1");
+        }
+        return;
+    }
     // MQTT-3.4.2 / 3.5.2 / 3.6.2 / 3.7.2: the Reason Code follows the Packet
     // Identifier, and the Property Length follows the Reason Code.
     if (offset >= length) {
@@ -794,9 +815,6 @@ void Frame::parseAckReasonAndProperties(const uint8_t *buffer, size_t length, si
     offset += 1;
     if (offset >= length) {
         return; // Remaining Length 3: Reason Code only, no Property Length
-    }
-    if (version != Version::MQTT5) {
-        return; // MQTT 3.1.1 has no property section at all
     }
     properties = parseProperties(buffer + offset, length - offset, nullptr, context).first;
 }
@@ -870,6 +888,11 @@ SubscribePacket Frame::parseSubscribe(const uint8_t *buffer, size_t length) {
         if ((options & 0xC0) != 0) {
             throw std::runtime_error("Invalid SUBSCRIBE: reserved option bits are set");
         }
+        // MQTT 3.1.1: bits 2-5 are also reserved and MUST be zero. Only MQTT 5
+        // defines noLocal, retainAsPublished and retainHandling in those bits.
+        if (version != Version::MQTT5 && (options & 0x3C) != 0) {
+            throw std::runtime_error("Invalid SUBSCRIBE: reserved option bits are set (MQTT 3.1.1)");
+        }
         // The Subscription Identifier is a property of the whole SUBSCRIBE, so
         // it applies to every entry in it (MQTT-3.8.2.1.2).
         auto identifier = subscribe.properties.find(PropertyID::SUBSCRIPTION_IDENTIFIER);
@@ -922,17 +945,28 @@ PingrespPacket Frame::parsePingresp(const uint8_t *buffer, size_t length) {
 DisconnectPacket Frame::parseDisconnect(const uint8_t *buffer, size_t length) {
     auto disconnect = DisconnectPacket();
     if (length == 0) {
-        // DISCONNECT with an empty body means reason code 0 (normal) and no properties
         return disconnect;
     }
-    // Reason code is the first byte (present whenever there is a body)
+    // MQTT 3.1.1 §3.14.1: the DISCONNECT packet has no variable header or
+    // payload; Remaining Length MUST be 0. Any body is a Malformed Packet.
+    if (version != Version::MQTT5) {
+        throw std::runtime_error("Malformed DISCONNECT: non-zero Remaining Length in MQTT 3.1.1");
+    }
     disconnect.reasonCode = static_cast<ReasonCode>(buffer[0]);
+    // MQTT-3.14.2-1: a Client may only send 0x00 (Normal) or 0x04 (With Will).
+    if (disconnect.reasonCode != ReasonCode::NORMAL_DISCONNECTION &&
+        disconnect.reasonCode != ReasonCode::DISCONNECT_WITH_WILL_MESSAGE) {
+        throw ProtocolViolation("DISCONNECT reason code not allowed from a Client (MQTT-3.14.2-1)");
+    }
     size_t offset = 1;
-    // Remaining bytes are the property length followed by the properties
     if (length - offset > 0) {
         auto [properties, propLength] = parseProperties(buffer + offset, length - offset, nullptr,
                                                         PropertyContext::DISCONNECT);
         disconnect.properties = properties;
+        offset += propLength;
+    }
+    if (offset != length) {
+        throw std::runtime_error("Malformed DISCONNECT: trailing bytes after properties");
     }
     return disconnect;
 }
@@ -940,15 +974,30 @@ DisconnectPacket Frame::parseDisconnect(const uint8_t *buffer, size_t length) {
 AuthPacket Frame::parseAuth(const uint8_t *payload, size_t length) {
     auto auth = AuthPacket();
 
-    if (length >= 1) {
-        auth.reasonCode = static_cast<ReasonCode>(payload[0]); 
-    }
-    else {
+    if (length == 0) {
+        // §3.15.2.1: Remaining Length 0 means Reason Code 0x00, no properties.
         auth.reasonCode = ReasonCode::SUCCESS;
+        return auth;
     }
 
-    // Parse properties if present
+    auth.reasonCode = static_cast<ReasonCode>(payload[0]);
+    // MQTT-3.15.2-1: only 0x00, 0x18 and 0x19 are valid AUTH reason codes.
+    if (auth.reasonCode != ReasonCode::SUCCESS &&
+        auth.reasonCode != ReasonCode::CONTINUE_AUTHENTICATION &&
+        auth.reasonCode != ReasonCode::REAUTHENTICATE) {
+        throw ProtocolViolation("AUTH reason code not valid (MQTT-3.15.2-1)");
+    }
 
+    size_t offset = 1;
+    if (offset < length) {
+        auto [properties, propLength] = parseProperties(payload + offset, length - offset, nullptr,
+                                                        PropertyContext::AUTH);
+        auth.properties = properties;
+        offset += propLength;
+    }
+    if (offset != length) {
+        throw std::runtime_error("Malformed AUTH: trailing bytes after properties");
+    }
     return auth;
 }
 
@@ -1035,9 +1084,16 @@ std::vector<uint8_t> Frame::serializeConnect(const ConnectPacket &packet) {
     buffer.insert(buffer.end(), packet.clientId.begin(), packet.clientId.end());
 
     // Will Properties (if Will Flag is set)
-    if (packet.willFlag && packet.willProperties) {
-        auto willPropertiesBuffer = serializeProperties(*packet.willProperties);
-        buffer.insert(buffer.end(), willPropertiesBuffer.begin(), willPropertiesBuffer.end());
+    if (packet.willFlag) {
+        if (packet.protocolVersion == Version::MQTT5) {
+            // MQTT 5 always requires a Will Property Length field, even when
+            // there are no properties (a single 0 byte).
+            Properties willProps = packet.willProperties ? *packet.willProperties : Properties();
+            auto willPropertiesBuffer = serializeProperties(willProps);
+            auto willPropertyLengthBytes = encodeRemainingLength(willPropertiesBuffer.size());
+            buffer.insert(buffer.end(), willPropertyLengthBytes.begin(), willPropertyLengthBytes.end());
+            buffer.insert(buffer.end(), willPropertiesBuffer.begin(), willPropertiesBuffer.end());
+        }
     }
 
     // Will Topic (if Will Flag is set)
@@ -1203,10 +1259,17 @@ std::vector<uint8_t> Frame::serializePublish(const PublishPacket &packet) {
 std::vector<uint8_t> Frame::serializeSubscribe(const SubscribePacket &packet) {
     std::vector<uint8_t> buffer;
     buffer.push_back((static_cast<uint8_t>(PacketType::SUBSCRIBE) << 4) | 0x02);
+    // Serialize properties (MQTT 5 only)
+    std::vector<uint8_t> propertiesBuffer;
+    if (version == Version::MQTT5) {
+        propertiesBuffer = serializeProperties(packet.properties);
+    }
     // Serialize remaining length
     uint32_t remainingLength = 2; // Packet Identifier (2 bytes)
     if (version == Version::MQTT5) {
-        remainingLength += 1; // Property Length
+        remainingLength += static_cast<uint32_t>(
+            encodeRemainingLength(propertiesBuffer.size()).size());
+        remainingLength += static_cast<uint32_t>(propertiesBuffer.size());
     }
     for (const auto &subscription : packet.subscriptions) {
         remainingLength += 2 + subscription.first.length(); // Topic length (2 bytes) + topic string
@@ -1222,7 +1285,9 @@ std::vector<uint8_t> Frame::serializeSubscribe(const SubscribePacket &packet) {
 
     // Serialize properties (MQTT 5 only)
     if (version == Version::MQTT5) {
-        buffer.push_back(0); // Property Length
+        auto propertyLength = encodeRemainingLength(propertiesBuffer.size());
+        buffer.insert(buffer.end(), propertyLength.begin(), propertyLength.end());
+        buffer.insert(buffer.end(), propertiesBuffer.begin(), propertiesBuffer.end());
     }
 
     // Serialize subscriptions
@@ -1278,10 +1343,20 @@ std::vector<uint8_t> Frame::serializeSuback(const SubackPacket &packet) {
 std::vector<uint8_t> Frame::serializeUnsubscribe(const UnsubscribePacket &packet) {
     std::vector<uint8_t> buffer;
     buffer.push_back((static_cast<uint8_t>(PacketType::UNSUBSCRIBE) << 4) | 0x02);
-    // Serialize remaining length
+    // Serialize properties (MQTT 5 only)
+    std::vector<uint8_t> propertiesBuffer;
+    if (version == Version::MQTT5) {
+        propertiesBuffer = serializeProperties(packet.properties);
+    }
+    // Calculate remaining length
     uint32_t remainingLength = 2; // Packet Identifier (2 bytes)
+    if (version == Version::MQTT5) {
+        remainingLength += static_cast<uint32_t>(
+            encodeRemainingLength(propertiesBuffer.size()).size());
+        remainingLength += static_cast<uint32_t>(propertiesBuffer.size());
+    }
     for (const auto &topic : packet.topicFilters) {
-        remainingLength += 2 + topic.length(); // Topic length (2 bytes) + topic string
+        remainingLength += 2 + topic.length();
     }
 
     std::vector<uint8_t> remainingLengthBytes = encodeRemainingLength(remainingLength);
@@ -1291,13 +1366,17 @@ std::vector<uint8_t> Frame::serializeUnsubscribe(const UnsubscribePacket &packet
     buffer.push_back((packet.packetId >> 8) & 0xFF);
     buffer.push_back(packet.packetId & 0xFF);
 
+    // Serialize properties (MQTT 5 only)
+    if (version == Version::MQTT5) {
+        auto propertyLength = encodeRemainingLength(propertiesBuffer.size());
+        buffer.insert(buffer.end(), propertyLength.begin(), propertyLength.end());
+        buffer.insert(buffer.end(), propertiesBuffer.begin(), propertiesBuffer.end());
+    }
+
     // Serialize topic filters
     for (const auto &topic : packet.topicFilters) {
-        // Topic length
         buffer.push_back((topic.length() >> 8) & 0xFF);
         buffer.push_back(topic.length() & 0xFF);
-
-        // Topic string
         buffer.insert(buffer.end(), topic.begin(), topic.end());
     }
     return buffer;
@@ -1361,8 +1440,10 @@ std::vector<uint8_t> Frame::serializePuback(const PubackPacket &packet) {
         if (packet.reasonCode != ReasonCode::SUCCESS) {
             buffer.push_back(static_cast<uint8_t>(packet.reasonCode));
         }
-        // No properties are emitted
-        buffer.push_back(0); // Property Length
+        // On Success the trailing zero byte is read by the receiver as Reason
+        // Code 0x00 with the Property Length omitted (the RL=3 short form of
+        // MQTT-3.4.2-1), not as a Property Length field.
+        buffer.push_back(0);
     }
     return buffer;
 }
@@ -1395,15 +1476,19 @@ std::vector<uint8_t> Frame::serializePubrec(const PubrecPacket &packet) {
         if (packet.reasonCode != ReasonCode::SUCCESS) {
             buffer.push_back(static_cast<uint8_t>(packet.reasonCode));
         }
-        // No properties are emitted
-        buffer.push_back(0); // Property Length
+        // On Success the trailing zero byte is read by the receiver as Reason
+        // Code 0x00 with the Property Length omitted (the RL=3 short form of
+        // MQTT-3.4.2-1), not as a Property Length field.
+        buffer.push_back(0);
     }
     return buffer;
 }
 
 std::vector<uint8_t> Frame::serializePubrel(const PubrelPacket &packet) {
     std::vector<uint8_t> buffer;
-    buffer.push_back((static_cast<uint8_t>(PacketType::PUBREL) << 4) | 0x02);
+    uint8_t flags = (static_cast<uint8_t>(PacketType::PUBREL) << 4) | 0x02;
+    if (packet.dup) flags |= 0x08;
+    buffer.push_back(flags);
     // Calculate remaining length
     // MQTT 3.1.1 acks are exactly a packet identifier: no reason code and no
     // property section (MQTT-3.4.2-1, 3.5.2, 3.6.2, 3.7.2).
@@ -1429,8 +1514,10 @@ std::vector<uint8_t> Frame::serializePubrel(const PubrelPacket &packet) {
         if (packet.reasonCode != ReasonCode::SUCCESS) {
             buffer.push_back(static_cast<uint8_t>(packet.reasonCode));
         }
-        // No properties are emitted
-        buffer.push_back(0); // Property Length
+        // On Success the trailing zero byte is read by the receiver as Reason
+        // Code 0x00 with the Property Length omitted (the RL=3 short form of
+        // MQTT-3.4.2-1), not as a Property Length field.
+        buffer.push_back(0);
     }
     return buffer;
 }
@@ -1463,8 +1550,10 @@ std::vector<uint8_t> Frame::serializePubcomp(const PubcompPacket &packet) {
         if (packet.reasonCode != ReasonCode::SUCCESS) {
             buffer.push_back(static_cast<uint8_t>(packet.reasonCode));
         }
-        // No properties are emitted
-        buffer.push_back(0); // Property Length
+        // On Success the trailing zero byte is read by the receiver as Reason
+        // Code 0x00 with the Property Length omitted (the RL=3 short form of
+        // MQTT-3.4.2-1), not as a Property Length field.
+        buffer.push_back(0);
     }
     return buffer;
 }

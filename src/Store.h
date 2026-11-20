@@ -31,6 +31,10 @@ struct PersistedSession {
     std::string clientId;
     std::string username;
     uint16_t nextPacketId = 1;
+    //! Seconds left on the disconnect-time Session Expiry deadline, or -1 when
+    //! no expiry is armed. Persisted as a remaining interval because the
+    //! steady-clock deadline itself does not survive a restart (MQTT-3.1.2-11).
+    int64_t expiryRemainingSeconds = -1;
     std::map<std::string, SubscriptionOptions> subscriptions;
     std::vector<std::pair<uint16_t, Message>> inflight;
     //! QoS>0 messages parked behind the client's Receive Maximum: no packet id
