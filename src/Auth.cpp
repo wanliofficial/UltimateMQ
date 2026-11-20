@@ -238,12 +238,13 @@ bool Auth::authenticate(const std::string& username, const std::string& password
     }
     const User& u = it->second;
     std::string candidate = u.salt.empty() ? password : hashPassword(u.salt, password);
-    // Constant time-ish comparison; lengths differ only on malformed stored data
-    if (candidate.size() != u.hash.size()) {
-        return false;
-    }
-    unsigned diff = 0;
-    for (size_t i = 0; i < candidate.size(); ++i) {
+    // Constant-time comparison: run the XOR over the common prefix and fold the
+    // length mismatch into the accumulator instead of returning early, so the
+    // response time does not reveal which stored hash (and therefore which
+    // account) the caller hit (CWE-208).
+    const size_t common = std::min(candidate.size(), u.hash.size());
+    unsigned diff = (candidate.size() == u.hash.size()) ? 0u : 1u;
+    for (size_t i = 0; i < common; ++i) {
         diff |= static_cast<unsigned>(candidate[i]) ^ static_cast<unsigned>(u.hash[i]);
     }
     return diff == 0;
