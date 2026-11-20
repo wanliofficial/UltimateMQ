@@ -477,6 +477,12 @@ QUIC_STATUS QUIC_API listenerCallback(HQUIC /*listener*/, void *context,
             logError("too many QUIC connections, refusing client");
             return QUIC_STATUS_CONNECTION_REFUSED;
         }
+        // Count the connection from the moment it is accepted, so the decrement
+        // in SHUTDOWN_COMPLETE always has a matching increment. Doing it only on
+        // the success path below let a failed ConnectionSetConfiguration (which
+        // shuts the connection down before the fetch_add) underflow the atomic
+        // and lock out every later client once it passed the cap.
+        accept->impl->activeConnections.fetch_add(1, std::memory_order_relaxed);
         auto conn = new QUICConnectionContext();
         conn->state = std::make_shared<QUICStreamState>();
         conn->accept = accept;
@@ -486,12 +492,12 @@ QUIC_STATUS QUIC_API listenerCallback(HQUIC /*listener*/, void *context,
             event->NEW_CONNECTION.Connection, accept->impl->configuration);
         if (QUIC_FAILED(setStatus)) {
             // The shutdown completion fires on the worker thread, closes the
-            // handle and deletes the context installed above.
+            // handle and deletes the context installed above; the accept count
+            // is dropped there, matching the increment taken at accept time.
             quicApi()->ConnectionShutdown(event->NEW_CONNECTION.Connection,
                                           QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
             return QUIC_STATUS_CONNECTION_REFUSED;
         }
-        accept->impl->activeConnections.fetch_add(1, std::memory_order_relaxed);
         return QUIC_STATUS_SUCCESS;
     }
     default:
