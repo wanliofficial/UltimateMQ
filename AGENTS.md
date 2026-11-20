@@ -132,6 +132,6 @@ Rules of thumb, learned the hard way:
 
 ## Testing
 
-Run the unit suite and, for wire-level changes, the Python suites under the
-agent's scratch area before claiming a change is done. Verify, don't assume:
+Run the unit suite and, for wire-level changes, the `wire/` probes (see
+`wire/README.md`) before claiming a change is done. Verify, don't assume:
 build, run tests, and confirm the output.
