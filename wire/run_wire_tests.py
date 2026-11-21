@@ -33,6 +33,7 @@ PROBES = [
     ("recvmax_window_test", "MQTT-4.9 Receive Maximum window (QoS 2 / QoS 1)"),
     ("websocket_framing_test", "WebSocket framing: cap-before-buffer + no fragmented control frames"),
     ("accept_backoff_test", "accept(): EMFILE/ENFILE backs off instead of spinning"),
+    ("tls_handshake_timeout_test", "TLS handshake: a silent peer is dropped, not held forever"),
     ("mqttsn_large_publish_test", "MQTT-SN §5.2.1 three-octet Length field"),
 ]
 

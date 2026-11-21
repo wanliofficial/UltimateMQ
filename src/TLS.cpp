@@ -1,12 +1,14 @@
 #include "TLS.h"
 #include "Log.h"
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <vector>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <openssl/err.h>
@@ -17,6 +19,14 @@
 namespace MQTT {
 
 namespace {
+
+//! Upper bound on a single TLS handshake. A client that completes the TCP
+//! handshake but never sends its ClientHello (or stalls mid-handshake) must not
+//! pin a serving thread and its descriptor forever: that is a slowloris that
+//! costs the attacker only a bare TCP connect and can exhaust every connection
+//! thread. The plaintext path bounds an idle peer with CONNECT_TIMEOUT_SECONDS;
+//! this is the TLS-equivalent bound, applied to the handshake itself.
+constexpr int HANDSHAKE_TIMEOUT_MS = 10 * 1000;
 
 //! The SIGPIPE mask as a reusable constant.
 sigset_t &sigPipeMask() {
@@ -168,20 +178,84 @@ bool SecureTransport::handshake(std::string *error) {
     if (!ssl_) {
         return true;
     }
-    // The socket is blocking, so SSL_accept drives the handshake to completion
-    // (including any renegotiation round trips) without spinning. It writes the
-    // server hello, so a peer that vanished mid-handshake must not raise
-    // SIGPIPE here either.
+    // The socket is normally blocking, so a bare SSL_accept blocks until the
+    // peer completes the handshake - forever if the peer connects and then
+    // sends nothing. Switch the socket to non-blocking for the duration of the
+    // handshake and drive SSL_accept with a bounded poll() loop, then restore
+    // blocking mode (readSome/writeAll below poll for their own timeouts and do
+    // not expect a non-blocking descriptor).
+    //
+    // SSL_accept writes the server hello, so a peer that vanished mid-handshake
+    // must not raise SIGPIPE either: suppress it for this thread first.
     suppressSigPipe();
-    int rc = SSL_accept(ssl_);
+
+    const int originalFlags = ::fcntl(fd_, F_GETFL, 0);
+    if (originalFlags < 0 || ::fcntl(fd_, F_SETFL, originalFlags | O_NONBLOCK) < 0) {
+        if (error) {
+            *error = std::string("TLS handshake failed: cannot configure the socket: ") +
+                     std::strerror(errno);
+        }
+        return false;
+    }
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(HANDSHAKE_TIMEOUT_MS);
+    int rc = -1;
+    bool timedOut = false;
+    for (;;) {
+        ERR_clear_error();
+        rc = SSL_accept(ssl_);
+        if (rc == 1) {
+            break;
+        }
+        const int sslError = SSL_get_error(ssl_, rc);
+        if (sslError != SSL_ERROR_WANT_READ && sslError != SSL_ERROR_WANT_WRITE) {
+            break; // a real handshake failure (or a closed peer)
+        }
+        // The handshake needs more input/output: wait for it, but never past the
+        // deadline so a silent or dribbling peer cannot hold the thread.
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            timedOut = true;
+            break;
+        }
+        int sliceMs = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+        if (sliceMs < 1) {
+            sliceMs = 1;
+        }
+        struct pollfd pfd;
+        pfd.fd = fd_;
+        pfd.events = (sslError == SSL_ERROR_WANT_READ) ? POLLIN : POLLOUT;
+        pfd.revents = 0;
+        int ready = ::poll(&pfd, 1, sliceMs);
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break; // poll failed: surface it below
+        }
+        if (ready == 0) {
+            timedOut = true;
+            break;
+        }
+    }
+
+    // Restore the original (blocking) mode before anything else can use the fd.
+    ::fcntl(fd_, F_SETFL, originalFlags);
+
     if (rc == 1) {
         return true;
     }
     if (error) {
-        unsigned long code = ERR_get_error();
-        char buf[256];
-        ERR_error_string_n(code, buf, sizeof(buf));
-        *error = std::string("TLS handshake failed: ") + buf;
+        if (timedOut) {
+            *error = "TLS handshake timed out";
+        } else {
+            unsigned long code = ERR_get_error();
+            char buf[256];
+            ERR_error_string_n(code, buf, sizeof(buf));
+            *error = std::string("TLS handshake failed: ") + buf;
+        }
     }
     return false;
 }
