@@ -397,18 +397,28 @@ void Server::run() {
             }
             lastSweep = std::chrono::steady_clock::now();
         }
-        // Wait for either a new client, the periodic wake-up, or the shutdown
-        // wake-up pipe
+        // Wait for either a new client, the periodic wake-up, the shutdown
+        // wake-up pipe, or a pending accept-backoff deadline.
+        const auto now = std::chrono::steady_clock::now();
         struct pollfd fds[4];
         int count = 0;
+        // A listener whose accept() failed with EMFILE/ENFILE stays readable
+        // (its connection is still queued), so polling it for POLLIN would spin.
+        // Drop the POLLIN mask until its backoff deadline and let the timeout
+        // below wake the loop to retry once fds may have freed up.
+        const bool listenerBackingOff =
+            listenerBackoffUntil_.time_since_epoch().count() != 0 && now < listenerBackoffUntil_;
         fds[count].fd = listener->fd();
-        fds[count].events = POLLIN;
+        fds[count].events = listenerBackingOff ? 0 : POLLIN;
         ++count;
         int websocketFdIndex = -1;
         if (websocketListener) {
             websocketFdIndex = count;
+            const bool backingOff =
+                websocketBackoffUntil_.time_since_epoch().count() != 0 &&
+                now < websocketBackoffUntil_;
             fds[count].fd = websocketListener->fd();
-            fds[count].events = POLLIN;
+            fds[count].events = backingOff ? 0 : POLLIN;
             ++count;
         }
         int mqttSnFdIndex = -1;
@@ -423,10 +433,20 @@ void Server::run() {
             fds[count].events = POLLIN;
             ++count;
         }
-        // Wake at most once per sweep interval so an idle loop still sweeps
-        auto untilSweep = sweepInterval - (std::chrono::steady_clock::now() - lastSweep);
+        // Wake at most once per sweep interval so an idle loop still sweeps, but
+        // no later than the nearest accept-backoff deadline so a throttled
+        // listener is retried promptly once fds may have recovered.
+        auto wakeAt = lastSweep + sweepInterval;
+        if (listenerBackoffUntil_.time_since_epoch().count() != 0 &&
+            listenerBackoffUntil_ < wakeAt) {
+            wakeAt = listenerBackoffUntil_;
+        }
+        if (websocketBackoffUntil_.time_since_epoch().count() != 0 &&
+            websocketBackoffUntil_ < wakeAt) {
+            wakeAt = websocketBackoffUntil_;
+        }
         int pollTimeoutMs = static_cast<int>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(untilSweep).count());
+            std::chrono::duration_cast<std::chrono::milliseconds>(wakeAt - now).count());
         if (pollTimeoutMs < 0) {
             pollTimeoutMs = 0;
         }
@@ -469,9 +489,19 @@ void Server::run() {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
                 continue;
             }
+            if (errno == EMFILE || errno == ENFILE) {
+                // Out of file descriptors: the connection stays queued and the
+                // listener stays readable, so backing off (instead of looping)
+                // keeps poll() from spinning at 100% CPU until an fd frees up.
+                logError("accept failed: %s; pausing accepts briefly", std::strerror(errno));
+                listenerBackoffUntil_ = std::chrono::steady_clock::now() + acceptBackoff;
+                continue;
+            }
             logError("failed to accept connection: %s", std::strerror(errno));
             continue;
         }
+        // The descriptor space has room again; stop backing off.
+        listenerBackoffUntil_ = std::chrono::steady_clock::time_point{};
 
         if (getActiveConnections() >= maxConnections) {
             logError("too many connections, rejecting client");
@@ -497,11 +527,21 @@ void Server::acceptWebSocket() {
         if (!running) {
             return;
         }
+        if (errno == EMFILE || errno == ENFILE) {
+            // Same fd-exhaustion back off as the MQTT listener: without it the
+            // readable-but-unaccepted socket spins poll() at 100% CPU.
+            logError("websocket accept failed: %s; pausing accepts briefly",
+                     std::strerror(errno));
+            websocketBackoffUntil_ = std::chrono::steady_clock::now() + acceptBackoff;
+            return;
+        }
         if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
             logError("failed to accept websocket connection: %s", std::strerror(errno));
         }
         return;
     }
+    // The descriptor space has room again; stop backing off.
+    websocketBackoffUntil_ = std::chrono::steady_clock::time_point{};
     if (getActiveConnections() >= maxConnections) {
         logError("too many connections, rejecting websocket client");
         close(clientSocket);

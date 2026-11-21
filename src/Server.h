@@ -94,6 +94,13 @@ private:
     //! expiry has elapsed (MQTT-5 Session Expiry Interval on DISCONNECT).
     std::chrono::milliseconds sweepInterval{1000};
     std::chrono::steady_clock::time_point lastSweep{std::chrono::steady_clock::now()};
+    //! While an accept() fails with EMFILE/ENFILE the kernel keeps the connection
+    //! queued and the listener readable, so poll() would spin on it at 100% CPU.
+    //! Each listener backs off until this deadline before it is polled again; a
+    //! successful accept clears it. A null time_point means "not backing off".
+    static constexpr std::chrono::milliseconds acceptBackoff{250};
+    std::chrono::steady_clock::time_point listenerBackoffUntil_{};
+    std::chrono::steady_clock::time_point websocketBackoffUntil_{};
 };
 
 } // namespace MQTT
