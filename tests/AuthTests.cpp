@@ -92,6 +92,80 @@ TEST(AuthTest, MalformedUserFileIsRejected)
     ::remove(path.c_str());
 }
 
+TEST(AuthTest, Pbkdf2UsersAuthenticate)
+{
+    const std::string salt = "a1b2c3d4e5f60718";
+    const uint32_t iterations = 100000;
+    const std::string hash = Auth::pbkdf2Password(salt, "s3cret", iterations);
+    auto path = writeTemp("users_pbkdf2", "dave:$pbkdf2-sha256$" +
+                                            std::to_string(iterations) + "$" + salt + "$" +
+                                            hash + "\n");
+    Auth auth;
+    std::string error;
+    ASSERT_TRUE(auth.loadUsers(path, &error)) << error;
+    ::remove(path.c_str());
+
+    EXPECT_TRUE(auth.authenticate("dave", "s3cret"));
+    EXPECT_FALSE(auth.authenticate("dave", "s3cret2"));
+    EXPECT_FALSE(auth.authenticate("dave", ""));
+}
+
+TEST(AuthTest, Pbkdf2DiffersFromSingleSha256)
+{
+    // The whole point of the new scheme: the same salt/password must not produce
+    // the legacy digest, so a file migrated to PBKDF2 is not crackable with the
+    // cheaper single-hash attack.
+    const std::string salt = "0011223344556677";
+    EXPECT_NE(Auth::pbkdf2Password(salt, "pw", 1000), Auth::hashPassword(salt, "pw"));
+    // Salt and iteration count both matter.
+    EXPECT_NE(Auth::pbkdf2Password(salt, "pw", 1000), Auth::pbkdf2Password(salt, "pw", 2000));
+    EXPECT_NE(Auth::pbkdf2Password(salt, "pw", 1000),
+              Auth::pbkdf2Password("ffeeddccbbaa9988", "pw", 1000));
+}
+
+TEST(AuthTest, Pbkdf2EntryRejectsBadIterationCount)
+{
+    for (const std::string &bad : {std::string("0"), std::string("abc"), std::string("12x")}) {
+        auto path = writeTemp("users_pbkdf2_bad", "eve:$pbkdf2-sha256$" + bad +
+                                                      "$aabb$00112233\n");
+        Auth auth;
+        std::string error;
+        EXPECT_FALSE(auth.loadUsers(path, &error)) << "iterations=" << bad;
+        EXPECT_FALSE(error.empty());
+        ::remove(path.c_str());
+    }
+}
+
+TEST(AuthTest, MalformedHashHexIsAConfigError)
+{
+    // A truncated/odd-length or non-hex digest must fail the load rather than
+    // silently decoding to a prefix (which would make the stored credential
+    // shorter than it looks).
+    for (const std::string &bad : {std::string("abc"), std::string("zz"), std::string("00zz")}) {
+        auto path = writeTemp("users_badhex", "frank:$sha256$deadbeef:" + bad + "\n");
+        Auth auth;
+        std::string error;
+        EXPECT_FALSE(auth.loadUsers(path, &error)) << "hash=" << bad;
+        EXPECT_FALSE(error.empty());
+        ::remove(path.c_str());
+    }
+}
+
+TEST(AuthTest, LegacySha256EntryStillWorks)
+{
+    // Backward compatibility: an existing $sha256$ file must keep authenticating
+    // exactly as before the PBKDF2 scheme was added.
+    const std::string salt = "cafebabe";
+    auto path = writeTemp("users_legacy",
+                          "gina:$sha256$" + salt + ":" + Auth::hashPassword(salt, "old") + "\n");
+    Auth auth;
+    std::string error;
+    ASSERT_TRUE(auth.loadUsers(path, &error)) << error;
+    ::remove(path.c_str());
+    EXPECT_TRUE(auth.authenticate("gina", "old"));
+    EXPECT_FALSE(auth.authenticate("gina", "wrong"));
+}
+
 TEST(AuthTest, MissingFileIsReported)
 {
     Auth auth;

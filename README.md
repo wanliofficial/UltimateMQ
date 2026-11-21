@@ -113,9 +113,20 @@ One entry per line, `#` starts a comment:
 ```
 # plaintext
 alice:secret
-# pre-hashed: $sha256$<salt-hex>:<sha256(salt + password)>
+# legacy pre-hashed: $sha256$<salt-text>:<sha256(salt + password)>
 bob:$sha256$a1b2c3d4:9f2c...c41d
+# preferred: $pbkdf2-sha256$<iterations>$<salt-hex>$<hash-hex>
+carol:$pbkdf2-sha256$210000$0011223344556677$8f14...9ac1
 ```
+
+Prefer the `$pbkdf2-sha256$` form: it is PBKDF2-HMAC-SHA256 with the given
+iteration count, so a leaked password file is expensive to crack offline,
+whereas a single salted `$sha256$` digest is cheap to brute-force. The salt in
+the `$pbkdf2-sha256$` entry is used as written (its hex text is the salt
+string), so deriving the digest from the file with `Auth::pbkdf2Password()`
+reproduces the stored value. The legacy `$sha256$` form stays supported so
+existing files keep working unchanged. A malformed hex salt/hash is a load
+error rather than a credential that silently never matches.
 
 Once a users file is loaded every client must send a username and password;
 a missing or wrong credential is answered with CONNACK `0x86` (bad user name

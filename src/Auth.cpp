@@ -5,6 +5,9 @@
 #include <cstring>
 #include <stdexcept>
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
+#include <openssl/evp.h>
 
 namespace MQTT {
 
@@ -100,6 +103,58 @@ std::string trim(const std::string& s) {
     size_t b = s.find_last_not_of(" \t\r\n");
     return s.substr(a, b - a + 1);
 }
+
+//! Decode a hex string to bytes, rejecting malformed input instead of silently
+//! stopping at the first bad nibble. The users file is configuration, so a
+//! truncated or corrupted hash must be a load error, not a credential that
+//! quietly becomes "no password".
+bool decodeHexStrict(const std::string& hex, std::string& out) {
+    if (hex.size() % 2 != 0) {
+        return false;
+    }
+    out.clear();
+    out.reserve(hex.size() / 2);
+    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+        auto nibble = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        const int hi = nibble(hex[i]);
+        const int lo = nibble(hex[i + 1]);
+        if (hi < 0 || lo < 0) {
+            return false;
+        }
+        out.push_back(static_cast<char>((hi << 4) | lo));
+    }
+    return true;
+}
+
+//! PBKDF2-HMAC-SHA256. Key stretching is what makes a pre-hashed password file
+//! resistant to offline cracking: a single salted SHA-256 can be brute-forced
+//! at billions of guesses per second on a GPU, while the iteration count here
+//! costs an attacker the same work per guess.
+std::string pbkdf2Sha256(const std::string& password, const std::string& salt,
+                         uint32_t iterations) {
+    unsigned char out[32];
+    if (PKCS5_PBKDF2_HMAC(password.data(), static_cast<int>(password.size()),
+                          reinterpret_cast<const unsigned char*>(salt.data()),
+                          static_cast<int>(salt.size()), static_cast<int>(iterations),
+                          EVP_sha256(), static_cast<int>(sizeof(out)), out) != 1) {
+        // Cannot happen for valid inputs; refuse rather than compare a bogus
+        // digest (an empty return never equals a stored hash).
+        return std::string();
+    }
+    static const char* digits = "0123456789abcdef";
+    std::string hex;
+    hex.reserve(sizeof(out) * 2);
+    for (unsigned char c : out) {
+        hex.push_back(digits[c >> 4]);
+        hex.push_back(digits[c & 0x0f]);
+    }
+    return hex;
+}
 } // namespace
 
 std::string Auth::sha256(const std::string& data) {
@@ -123,25 +178,22 @@ std::string Auth::toHex(const uint8_t* data, size_t len) {
 }
 
 std::vector<uint8_t> Auth::fromHex(const std::string& hex) {
-    auto val = [](char c) -> int {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-        return -1;
-    };
     std::vector<uint8_t> out;
-    out.reserve(hex.size() / 2);
-    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
-        int hi = val(hex[i]);
-        int lo = val(hex[i + 1]);
-        if (hi < 0 || lo < 0) break;
-        out.push_back(static_cast<uint8_t>((hi << 4) | lo));
+    std::string raw;
+    if (!decodeHexStrict(hex, raw)) {
+        return out;
     }
+    out.assign(raw.begin(), raw.end());
     return out;
 }
 
 std::string Auth::hashPassword(const std::string& salt, const std::string& password) {
     return sha256(salt + password);
+}
+
+std::string Auth::pbkdf2Password(const std::string& salt, const std::string& password,
+                                 uint32_t iterations) {
+    return pbkdf2Sha256(password, salt, iterations);
 }
 
 bool Auth::loadUsers(const std::string& path, std::string* error) {
@@ -169,18 +221,82 @@ bool Auth::loadUsers(const std::string& path, std::string* error) {
             return false;
         }
         User u;
-        if (rest.rfind("$sha256$", 0) == 0) {
-            std::string body = rest.substr(8);
+        static const std::string pbkdf2Prefix = "$pbkdf2-sha256$";
+        if (rest.rfind(pbkdf2Prefix, 0) == 0) {
+            // $pbkdf2-sha256$<iterations>$<salt-hex>$<hash-hex>
+            std::string body = rest.substr(pbkdf2Prefix.size());
+            const auto first = body.find('$');
+            const auto second = first == std::string::npos ? std::string::npos
+                                                          : body.find('$', first + 1);
+            if (first == std::string::npos || second == std::string::npos) {
+                if (error) *error = "password file line " + std::to_string(lineNo) +
+                                    ": expected $pbkdf2-sha256$<iterations>$<salt-hex>$<hash-hex>";
+                return false;
+            }
+            const std::string iterationText = body.substr(0, first);
+            const std::string saltHex = body.substr(first + 1, second - first - 1);
+            const std::string hashHex = trim(body.substr(second + 1));
+            // Reject an unparseable or zero iteration count rather than falling
+            // back to an un-stretched hash: the count is the whole point of using
+            // this format.
+            char* end = nullptr;
+            errno = 0;
+            const unsigned long long iterations = std::strtoull(iterationText.c_str(), &end, 10);
+            if (iterationText.empty() || end == iterationText.c_str() || *end != '\0' ||
+                iterations == 0 || iterations > 100000000ull) {
+                if (error) *error = "password file line " + std::to_string(lineNo) +
+                                    ": invalid PBKDF2 iteration count";
+                return false;
+            }
+            // The salt is kept as the hex text the file carries, and
+            // authenticate() derives with those exact bytes, so tooling that
+            // computes pbkdf2Password("<salt-hex>", ...) from the file matches.
+            // Validate it is well-formed hex all the same, so a typo cannot turn
+            // into a silently different salt.
+            std::string ignoredSaltBytes;
+            if (!decodeHexStrict(saltHex, ignoredSaltBytes)) {
+                if (error) *error = "password file line " + std::to_string(lineNo) +
+                                    ": malformed hex in $pbkdf2-sha256$ salt";
+                return false;
+            }
+            u.salt = saltHex;
+            // Keep the digest as canonical lowercase hex so it compares directly
+            // against the hex candidate that authenticate() derives.
+            std::string rawHash;
+            if (!decodeHexStrict(hashHex, rawHash)) {
+                if (error) *error = "password file line " + std::to_string(lineNo) +
+                                    ": malformed hex in $pbkdf2-sha256$ hash";
+                return false;
+            }
+            u.hash = toHex(reinterpret_cast<const uint8_t *>(rawHash.data()), rawHash.size());
+            u.iterations = static_cast<uint32_t>(iterations);
+            u.kind = User::Kind::PBKDF2;
+        } else if (rest.rfind("$sha256$", 0) == 0) {
+            std::string body = rest.substr(std::string("$sha256$").size());
             auto sep = body.find(':');
             if (sep == std::string::npos) {
                 if (error) *error = "password file line " + std::to_string(lineNo) + ": bad $sha256$ entry";
                 return false;
             }
+            // The salt is used as raw text by the legacy scheme, so keep it
+            // verbatim; only the digest is hex, and a malformed digest is a load
+            // error rather than an account whose password never matches.
             u.salt = body.substr(0, sep);
-            u.hash = trim(body.substr(sep + 1));
+            const std::string hashHex = trim(body.substr(sep + 1));
+            std::string rawHash;
+            if (!decodeHexStrict(hashHex, rawHash)) {
+                if (error) *error = "password file line " + std::to_string(lineNo) +
+                                    ": malformed hex in $sha256$ entry";
+                return false;
+            }
+            // Canonical lowercase hex, so authenticate()'s hex candidate compares
+            // directly (and an upper-case file still matches).
+            u.hash = toHex(reinterpret_cast<const uint8_t *>(rawHash.data()), rawHash.size());
+            u.kind = User::Kind::SHA256;
         } else {
             u.salt.clear();
             u.hash = rest;
+            u.kind = User::Kind::PLAINTEXT;
         }
         users_[user] = std::move(u);
     }
@@ -237,7 +353,22 @@ bool Auth::authenticate(const std::string& username, const std::string& password
         return false;
     }
     const User& u = it->second;
-    std::string candidate = u.salt.empty() ? password : hashPassword(u.salt, password);
+    std::string candidate;
+    switch (u.kind) {
+    case User::Kind::PLAINTEXT:
+        candidate = password;
+        break;
+    case User::Kind::SHA256:
+        // Legacy scheme: a single salted SHA-256. Kept so existing password
+        // files keep working; new credentials should use $pbkdf2-sha256$.
+        candidate = hashPassword(u.salt, password);
+        break;
+    case User::Kind::PBKDF2:
+        // Stretch the candidate with the same salt and iteration count the file
+        // records, so an attacker with the file pays the same per-guess cost.
+        candidate = pbkdf2Sha256(password, u.salt, u.iterations);
+        break;
+    }
     // Constant-time comparison: run the XOR over the common prefix and fold the
     // length mismatch into the accumulator instead of returning early, so the
     // response time does not reveal which stored hash (and therefore which

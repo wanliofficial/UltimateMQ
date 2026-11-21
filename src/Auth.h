@@ -25,9 +25,16 @@ namespace MQTT {
  *
  *   Users file (FLOWMQ_PASSWORD_FILE):
  *       user:password
- *       user2:$sha256$<salt-hex>:<hash-hex>      -- pre-hashed password
+ *       user2:$sha256$<salt-text>:<hash-hex>          -- legacy: single SHA-256
+ *       user3:$pbkdf2-sha256$<iterations>$<salt-hex>$<hash-hex>  -- preferred
  *   A pre-hashed password is never compared in plaintext; instead the given
- *   password is hashed with the same salt and the digests compared.
+ *   password is derived with the same salt (and iteration count) and the
+ *   digests compared. For $pbkdf2-sha256$, the <salt-hex> column is passed to
+ *   pbkdf2Password() as the salt string exactly as written (its hex text), so
+ *   tooling that hashes from the file reproduces the stored digest. PBKDF2
+ *   stretches the derivation, so a leaked password file resists offline
+ *   cracking far better than the single SHA-256 scheme, which is retained only
+ *   so existing files keep working.
  *
  *   ACL file (FLOWMQ_ACL_FILE):
  *       user,read,<topic-filter>                 -- may appear multiple times
@@ -77,12 +84,25 @@ public:
 
     //! Hash a password with the given salt (hex) using SHA-256. Exposed so
     //! tests and tooling can pre-compute the values expected by loadUsers().
+    //! This is the legacy scheme: it is a single unsalted-costly digest, so
+    //! prefer pbkdf2Password() for new credentials.
     static std::string hashPassword(const std::string& salt, const std::string& password);
+
+    //! Derive a password with PBKDF2-HMAC-SHA256, returning the digest as hex.
+    //! This is the recommended scheme for a pre-hashed password file: the
+    //! iteration count makes an offline dictionary attack cost real work per
+    //! guess, which a single salted SHA-256 does not. Exposed so tests and
+    //! tooling can pre-compute the values expected by loadUsers().
+    static std::string pbkdf2Password(const std::string& salt, const std::string& password,
+                                      uint32_t iterations);
 
 private:
     struct User {
-        std::string salt;   // empty when the password is stored in plaintext
-        std::string hash;   // digest hex, or the raw password when salt is empty
+        enum class Kind { PLAINTEXT, SHA256, PBKDF2 };
+        Kind kind = Kind::PLAINTEXT;
+        std::string salt;   // raw bytes; empty for a plaintext password
+        std::string hash;   // digest bytes, or the raw password when PLAINTEXT
+        uint32_t iterations = 0;  // PBKDF2 only
     };
 
     bool authRequired_ = false;
