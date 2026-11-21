@@ -40,10 +40,22 @@ import time
 
 HOST = "127.0.0.1"
 BIN = sys.argv[1]
-# TCP port comes from the runner; the UDP MQTT-SN port is derived from it so the
-# two never collide across probes.
+# TCP port comes from the runner. The UDP MQTT-SN port is asked for separately
+# rather than derived from it: the runner's TCP port comes from the ephemeral
+# range, so "TCP port + 1000" can exceed 65535 or land on a port already in use,
+# which makes the broker refuse to start.
 TCP_PORT = [int(sys.argv[2])]
-SN_PORT = [TCP_PORT[0] + 1000]
+
+
+def free_udp_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind((HOST, 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+SN_PORT = [free_udp_port()]
 
 # MQTT-SN message types (§5.2.2).
 CONNECT = 0x04
