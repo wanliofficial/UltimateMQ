@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <cstring>
 #include <cstdlib>
+#include <string>
 #include <cerrno>
 #include <fcntl.h>
 #include <poll.h>
@@ -34,6 +35,14 @@ void handleSignal(int) {
 
 Server::Server(int port, size_t maxConnections)
     : maxConnections(maxConnections == 0 ? 1024 : maxConnections) {
+    // The primary MQTT port comes from atoi() in main(), which silently yields 0
+    // for a non-numeric value and lets a >65535 value wrap through htons(). Every
+    // other listener port is range-checked below; do the same here so a mistyped
+    // MQTT_PORT fails the startup loudly instead of binding to an unintended
+    // port (0 asks the OS for an ephemeral one).
+    if (port <= 0 || port > 65535) {
+        throw std::runtime_error("invalid MQTT port: " + std::to_string(port));
+    }
     // Cap the number of simultaneous client connections. Each holds a thread
     // and a socket, so an unbounded accept loop is a resource-exhaustion lever.
     // The constructor argument (or 1024) is the default; FLOWMQ_MAX_CONNECTIONS

@@ -18,6 +18,7 @@ set(TEST_SOURCES
     SysTopicsTests.cpp
     Utf8Tests.cpp
     MQTTSNTests.cpp
+    ServerTests.cpp
 )
 
 # Create the test executable
