@@ -370,6 +370,83 @@ def case_oversized_control_frame_rejected():
         stop(proc, workdir)
 
 
+def case_stray_continuation_frame_rejected():
+    """A CONTINUATION frame (0x0) that arrives with no fragmented message in
+    progress violates RFC 6455 §5.4 (it has nothing to continue) and must fail
+    the connection with CLOSE 1002. Without the check the broker would treat it
+    as the start of a fresh binary message and assemble whatever follows."""
+    proc, ws_port, workdir = start()
+    try:
+        c = ws_handshake(ws_port)
+        try:
+            # CONTINUATION opcode, FIN set, MASK + zero length, as the very
+            # first frame after the handshake (no BINARY fragment opened one).
+            ws_send_masked(c, 0x00, b"")
+            fin, opcode, payload = ws_recv_frame(c, 2.0)
+            assert opcode == OP_CLOSE, (
+                "expected CLOSE for a stray CONTINUATION frame, got opcode 0x%02x" % opcode)
+            status = close_status(payload)
+            assert status == CLOSE_PROTOCOL_ERROR, (
+                "expected CLOSE 1002 for a stray CONTINUATION frame, got %d" % status)
+            return "a CONTINUATION frame with no open message is rejected with CLOSE 1002 (RFC 6455 §5.4)"
+        finally:
+            c.close()
+    finally:
+        stop(proc, workdir)
+
+
+def case_interleaved_data_frame_during_fragment_rejected():
+    """A new BINARY data frame arriving while a fragmented message is still open
+    (a BINARY fragment with FIN=0 has been sent, no CONTINUATION has closed it)
+    violates RFC 6455 §5.4: only a CONTINUATION may continue the fragment. The
+    broker must reject it with CLOSE 1002 rather than silently dropping the
+    partial message and starting a competing one."""
+    proc, ws_port, workdir = start()
+    try:
+        c = ws_handshake(ws_port)
+        try:
+            # Open a fragmented message: BINARY, FIN clear, one payload byte.
+            ws_send_masked(c, OP_BINARY, b"\x01", fin=False)
+            # A second, new BINARY data frame interrupts the open fragment.
+            ws_send_masked(c, OP_BINARY, b"\x02", fin=True)
+            fin, opcode, payload = ws_recv_frame(c, 2.0)
+            assert opcode == OP_CLOSE, (
+                "expected CLOSE for an interleaved data frame, got opcode 0x%02x" % opcode)
+            status = close_status(payload)
+            assert status == CLOSE_PROTOCOL_ERROR, (
+                "expected CLOSE 1002 for an interleaved data frame, got %d" % status)
+            return "a new data frame during a fragmented message is rejected with CLOSE 1002 (RFC 6455 §5.4)"
+        finally:
+            c.close()
+    finally:
+        stop(proc, workdir)
+
+
+def case_legitimate_fragmentation_reassembles():
+    """The §5.4 guard must not break legal fragmentation: a BINARY frame with
+    FIN=0 followed by a CONTINUATION with FIN=1 reassembles into one MQTT
+    CONNECT, which gets its CONNACK. This proves the fragmenting_ state machine
+    accepts a well-formed fragment sequence end to end."""
+    proc, ws_port, workdir = start()
+    try:
+        c = ws_handshake(ws_port)
+        try:
+            mqtt = connect("ws-frag")
+            # Split the MQTT CONNECT bytes across a BINARY fragment and a
+            # CONTINUATION frame; the broker must deliver the reassembled
+            # stream to the protocol layer, which answers CONNACK.
+            ws_send_masked(c, OP_BINARY, mqtt[:3], fin=False)
+            ws_send_masked(c, 0x00, mqtt[3:], fin=True)
+            r = ws_recv_frame(c, 2.0)
+            assert r[1] == OP_BINARY and r[2][0] & 0xF0 == 0x20, (
+                "no CONNACK after a legitimate fragmented CONNECT: %r" % (r,))
+            return "a legal BINARY+CONTINUATION fragment pair reassembles and completes the CONNECT"
+        finally:
+            c.close()
+    finally:
+        stop(proc, workdir)
+
+
 results = []
 
 
@@ -402,6 +479,12 @@ case("WebSocket: a control frame (PING) with a payload over 125 bytes is rejecte
      case_oversized_control_frame_rejected)
 case("WebSocket (control): a normal MQTT CONNECT/SUBSCRIBE/PUBLISH round-trips inside binary frames",
      case_wrapped_mqtt_round_trips)
+case("WebSocket: a CONTINUATION frame with no open message is rejected with CLOSE 1002 (RFC 6455 §5.4)",
+     case_stray_continuation_frame_rejected)
+case("WebSocket: a new data frame during a fragmented message is rejected with CLOSE 1002 (RFC 6455 §5.4)",
+     case_interleaved_data_frame_during_fragment_rejected)
+case("WebSocket: a legal BINARY+CONTINUATION fragment pair reassembles and completes the CONNECT",
+     case_legitimate_fragmentation_reassembles)
 
 print("\nSUMMARY: %d/%d passed" % (sum(1 for _, ok in results if ok), len(results)))
 sys.exit(0 if all(ok for _, ok in results) else 1)

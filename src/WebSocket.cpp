@@ -427,8 +427,31 @@ bool WebSocketTransport::nextFrame() {
         // appends, and the caller gets data only once FIN ends the message.
         if (opcode == 0x02 || opcode == 0x00) {
             if (opcode == 0x02) {
+                // RFC 6455 §5.4: a new data frame must not arrive while a
+                // fragmented message is still open; only a CONTINUATION may
+                // continue it. Accepting this would silently drop the partial
+                // message already in message_ and start a competing one.
+                if (fragmenting_) {
+                    logDebug("websocket: new data frame during a fragmented message, closing (1002)");
+                    sendClose(1002);
+                    closedByPeer_ = true;
+                    return false;
+                }
                 message_.clear();
                 messagePos_ = 0;
+                fragmenting_ = !fin;
+            } else {
+                // CONTINUATION with no open fragment is a protocol error
+                // (§5.4): it has nothing to continue.
+                if (!fragmenting_) {
+                    logDebug("websocket: continuation frame with no open message, closing (1002)");
+                    sendClose(1002);
+                    closedByPeer_ = true;
+                    return false;
+                }
+                if (fin) {
+                    fragmenting_ = false;
+                }
             }
             for (uint64_t i = 0; i < length; ++i) {
                 message_.push_back(payload[i] ^ mask[i % 4]);

@@ -75,6 +75,12 @@ private:
     //! Payload of the binary message currently being assembled
     std::vector<uint8_t> message_;
     size_t messagePos_ = 0;
+    //! True while a fragmented binary message is in progress (a BINARY data
+    //! frame with FIN clear has been seen, awaiting CONTINUATION frames). RFC
+    //! 6455 §5.4: a CONTINUATION frame must follow an open fragment, and a new
+    //! data frame must not start one; without this a stray CONTINUATION (or a
+    //! BINARY that interrupts a fragment) would be silently accepted.
+    bool fragmenting_ = false;
     bool closedByPeer_ = false;
     bool closeSent_ = false;
 };
