@@ -365,17 +365,27 @@ namespace {
 void serveConnection(QUICConnectionContext *conn) {
     QUICListener::Impl *impl = conn->accept->impl;
     Broker *broker = conn->accept->broker;
+    // Thread-per-client, exactly like the TCP accept loop. The serving thread
+    // is registered while servingMutex is held and the stopped flag is checked
+    // under that same lock, mirroring Server::startClientThread: stop() sets
+    // stopped and then snapshots the serving list under servingMutex, so a
+    // thread either appears before that snapshot or sees stopped==true and is
+    // never spawned. Checking stopped before taking the lock (the earlier
+    // shape) left a window in which a serving thread was pushed just after
+    // stop() had already observed the list empty and closed the registration,
+    // orphaning the thread and its Connection past shutdown.
+    auto finished = std::make_shared<std::atomic<bool>>(false);
+    std::lock_guard<std::mutex> lock(impl->servingMutex);
     if (impl->stopped.load(std::memory_order_acquire)) {
         // The listener is going away: refuse the session instead of spawning
-        // a thread that would outlive the shutdown bookkeeping.
+        // a thread that would outlive the shutdown bookkeeping. ConnectionShutdown
+        // only enqueues an asynchronous shutdown (SHUTDOWN_COMPLETE fires later
+        // on an msquic worker thread and never re-enters servingMutex), so it is
+        // safe to call while the lock is held.
         quicApi()->ConnectionShutdown(conn->state->connection,
                                       QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
         return;
     }
-    // Thread-per-client, exactly like the TCP accept loop. The serving thread
-    // owns the Connection, which owns the transport and its receive state.
-    auto finished = std::make_shared<std::atomic<bool>>(false);
-    std::lock_guard<std::mutex> lock(impl->servingMutex);
     impl->serving.push_back({std::thread([broker, state = conn->state, finished]() {
         auto transport = std::make_unique<QUICTransport>(state);
         auto connection = std::make_shared<Connection>(-1, broker, std::move(transport));
