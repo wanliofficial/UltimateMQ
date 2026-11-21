@@ -127,9 +127,17 @@ void Session::close(const std::shared_ptr<Client> &client) {
         }
         this->client.reset();
         if (!persistent) {
-            // A non-persistent session holds nothing worth keeping
+            // A non-persistent session holds nothing worth keeping. Count what is
+            // being thrown away (it is a genuine loss) and clear it, including
+            // any inflight QoS 1/2 -- the normal TCP teardown reaches discard()
+            // instead, but the MQTT-SN gateway closes a non-persistent session
+            // here, and those losses must be observable too.
+            countHeldDeliveriesLocked();
             pendingDeliveries.clear();
             blockedDeliveries.clear();
+            inflightMessages.clear();
+            awaitingPubrel.clear();
+            pendingPubrel.clear();
             filters.swap(subscriptions);
         }
         // A persistent session keeps its subscriptions, its offline message
@@ -166,6 +174,16 @@ void Session::removeSubscriptions(const std::map<std::string, SubscriptionOption
     }
 }
 
+uint64_t Session::countHeldDeliveriesLocked() {
+    const uint64_t lost = static_cast<uint64_t>(pendingDeliveries.size()) +
+                          static_cast<uint64_t>(blockedDeliveries.size()) +
+                          static_cast<uint64_t>(inflightMessages.size());
+    if (lost > 0 && broker) {
+        broker->incrementMessagesDropped(lost);
+    }
+    return lost;
+}
+
 void Session::discard() {
     logDebug("session discarded: %s", clientId.c_str());
     std::function<void()> notify;
@@ -179,14 +197,7 @@ void Session::discard() {
         // genuine loss, so it is counted in the backpressure drop metric rather
         // than vanishing silently -- this is what makes a connection torn down
         // for a full/stalled outbound write buffer observable as lost deliveries.
-        if (broker) {
-            const uint64_t lost = static_cast<uint64_t>(pendingDeliveries.size()) +
-                                  static_cast<uint64_t>(blockedDeliveries.size()) +
-                                  static_cast<uint64_t>(inflightMessages.size());
-            if (lost > 0) {
-                broker->incrementMessagesDropped(lost);
-            }
-        }
+        countHeldDeliveriesLocked();
         // Throw away everything: subscriptions, offline buffer and inflight
         filters.swap(subscriptions);
         pendingDeliveries.clear();

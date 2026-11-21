@@ -1554,7 +1554,6 @@ void Connection::drainWriteBuffer() {
         state = State::DISCONNECTED;
         return;
     }
-    size_t freedTotal = 0;
     while (!writeBuffer.empty()) {
         auto &front = writeBuffer.front();
         const ssize_t n = transport->writeSome(front.data(), front.size());
@@ -1568,18 +1567,23 @@ void Connection::drainWriteBuffer() {
             if (n > 0) {
                 front.erase(front.begin(), front.begin() + n);
                 writeBufferBytes -= static_cast<size_t>(n);
-                freedTotal += static_cast<size_t>(n);
+                // Keep the live gauge in lock-step with the local count here, not
+                // in a batch after the loop: an early return on a write error must
+                // not leave bytes counted as buffered that were actually delivered.
+                if (broker) {
+                    broker->adjustWriteBufferBytes(-static_cast<int64_t>(n));
+                }
                 lastWriteProgress = std::chrono::steady_clock::now();
             }
             break;
         }
-        writeBufferBytes -= front.size();
-        freedTotal += front.size();
+        const size_t done = front.size();
+        writeBufferBytes -= done;
+        if (broker) {
+            broker->adjustWriteBufferBytes(-static_cast<int64_t>(done));
+        }
         writeBuffer.pop_front();
         lastWriteProgress = std::chrono::steady_clock::now();
-    }
-    if (freedTotal > 0 && broker) {
-        broker->adjustWriteBufferBytes(-static_cast<int64_t>(freedTotal));
     }
     // Fully drained: let the session push anything it had to hold back.
     if (writeBuffer.empty() && session) {

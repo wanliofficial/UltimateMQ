@@ -275,6 +275,15 @@ private:
     //! Called with deliveryMutex held; never takes any other lock
     void notifyMutation();
 
+    //! Count every delivery the session still holds (pending + flow-blocked +
+    //! unacknowledged inflight QoS 1/2) into the broker's backpressure drop
+    //! metric, then return that count. Called, with deliveryMutex held, from each
+    //! path that throws those deliveries away (discard, and the non-persistent
+    //! branch of close) so a torn-down session's lost messages are observable
+    //! rather than vanishing silently. Idempotent per teardown path: the caller
+    //! clears the queues right after, so a second call counts zero.
+    uint64_t countHeldDeliveriesLocked();
+
     void pushDelivery(const Message& message, QoS qos,
                       const SubscriptionIdentifiers& subscriptionIdentifiers = {});
     //! Drop the single oldest buffered delivery (front of pendingDeliveries or

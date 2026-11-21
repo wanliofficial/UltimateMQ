@@ -259,6 +259,40 @@ TEST_F(ConnectionStateTests, BufferedWriteBuffersOverflowAndTracksTheGauge)
         << "a write larger than the socket buffer must leave a buffered remainder";
     EXPECT_EQ(sysGetWriteBufferBytes(), buffered)
         << "the live gauge must equal this connection's buffered bytes";
+
+    // Break the peer and drain: the write now fails on the first unit, so nothing
+    // is freed -- but the per-iteration gauge accounting must not over-subtract or
+    // leave the gauge above the true buffered count.
+    ::close(pair.peer);
+    pair.peer = -1;
+    pair.connection->drainWriteBufferForTest();
+    EXPECT_LE(sysGetWriteBufferBytes(), buffered)
+        << "a failed drain must never inflate the live gauge";
+}
+
+TEST_F(ConnectionStateTests, WriteBufferGaugeReturnsToZeroOnDestruction)
+{
+    // A connection torn down with bytes still buffered (a peer that vanished
+    // mid-write) must remove every one of those bytes from the live gauge in its
+    // destructor, or $SYS/broker/writebuffer/bytes would stay permanently
+    // inflated. Driven in a nested scope so the gauge can be read after the
+    // connection is destroyed.
+    broker.setWriteBufferBytes(256 * 1024);
+    const size_t baseline = sysGetWriteBufferBytes();
+    {
+        int fds[2] = {-1, -1};
+        ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+        auto connection = std::make_shared<Connection>(fds[0], &broker);
+        std::vector<uint8_t> payload(128 * 1024, 'x');
+        auto publish = std::make_shared<PublishPacket>("buf/t", payload, QoS::QOS_0);
+        ASSERT_TRUE(connection->sendPacketForTest(*publish));
+        ASSERT_GT(connection->writeBufferBytesForTest(), 0u);
+        EXPECT_GT(sysGetWriteBufferBytes(), baseline);
+        ::close(fds[1]);
+        connection->detach();
+    } // connection destroyed here
+    EXPECT_EQ(sysGetWriteBufferBytes(), baseline)
+        << "the gauge must return to its baseline once the connection is gone";
 }
 
 TEST_F(ConnectionStateTests, NoWriteBufferKeepsThePathSynchronous)

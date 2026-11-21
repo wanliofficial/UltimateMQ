@@ -147,6 +147,42 @@ TEST_F(SessionLifecycleTest, BackpressureDropsIncrementTheSysCounter)
         << "a full delivery queue must increment the dropped counter";
 }
 
+TEST_F(SessionLifecycleTest, CloseOnNonPersistentSessionCountsHeldDeliveries)
+{
+    // The TCP teardown of a non-persistent session goes through discard(), but
+    // the MQTT-SN gateway releases a non-persistent peer through close(). That
+    // branch clears the buffer directly, so it must count those deliveries as
+    // dropped too -- otherwise an SN peer torn down with queued messages would
+    // lose them invisibly, defeating the observability this counter provides.
+    broker.setSysTopics(true);
+    auto droppedCounter = [&] {
+        broker.refreshSysTopics();
+        auto values = broker.sysTopicValues();
+        auto it = values.find("$SYS/broker/messages/dropped");
+        return it == values.end() ? 0u : std::stoul(it->second);
+    };
+
+    auto session = std::make_shared<Session>(&broker, "sn-np");
+    session->connect(session, /*persistent=*/false);
+    session->subscribe("sn-np/#", optionsFor(QoS::QOS_1));
+    auto client = test::attach(*session);
+    // Squeeze the flow-control window to one, then fill it: the first QoS 1
+    // message occupies the single inflight slot (never acked here), so the eight
+    // that follow are parked in blockedDeliveries and are what close() must count.
+    session->setReceiveMaximum(1);
+    for (size_t i = 0; i < 9; ++i) {
+        broker.publish(Message{"sn-np/t", std::string("x"), QoS::QOS_1});
+    }
+    ASSERT_EQ(session->droppedOnDiscardForTest(), 9u)
+        << "expected one inflight + eight flow-blocked deliveries held";
+
+    const auto before = droppedCounter();
+    session->close(client); // non-persistent: clears the buffer directly
+    const auto after = droppedCounter();
+    EXPECT_EQ(after - before, 9u)
+        << "closing a non-persistent session must count its held deliveries";
+}
+
 TEST_F(SessionLifecycleTest, DiscardCountsHeldDeliveriesAsDropped)
 {
     // A discard throws away everything a session is holding for its client --
