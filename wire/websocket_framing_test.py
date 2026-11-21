@@ -347,6 +347,29 @@ def case_reserved_opcode_is_rejected():
         stop(proc, workdir)
 
 
+def case_oversized_control_frame_rejected():
+    """A control frame (PING) with a payload larger than 125 bytes violates
+    RFC 6455 §5.5 and must fail the connection with CLOSE 1002, not be answered
+    with a PONG."""
+    proc, ws_port, workdir = start()
+    try:
+        c = ws_handshake(ws_port)
+        try:
+            # FIN + PING, MASK, payload length 126 (one over the limit).
+            c.sendall(bytes([0x8A, 0x80 | 126]) + struct.pack("!H", 126) + os.urandom(4) + b"x" * 126)
+            fin, opcode, payload = ws_recv_frame(c, 2.0)
+            assert opcode == OP_CLOSE, (
+                "expected CLOSE for an oversized control frame, got opcode 0x%02x" % opcode)
+            status = close_status(payload)
+            assert status == CLOSE_PROTOCOL_ERROR, (
+                "expected CLOSE 1002 for an oversized control frame, got %d" % status)
+            return "a PING with a 126-byte payload is rejected with CLOSE 1002 (RFC 6455 §5.5)"
+        finally:
+            c.close()
+    finally:
+        stop(proc, workdir)
+
+
 results = []
 
 
@@ -375,6 +398,8 @@ case("WebSocket: a frame with a reserved RSV bit set is rejected with CLOSE 1002
      case_rsv_bit_set_is_rejected)
 case("WebSocket: a frame with a reserved opcode (0x03) is rejected with CLOSE 1002 (RFC 6455 §5.2)",
      case_reserved_opcode_is_rejected)
+case("WebSocket: a control frame (PING) with a payload over 125 bytes is rejected with CLOSE 1002 (RFC 6455 §5.5)",
+     case_oversized_control_frame_rejected)
 case("WebSocket (control): a normal MQTT CONNECT/SUBSCRIBE/PUBLISH round-trips inside binary frames",
      case_wrapped_mqtt_round_trips)
 

@@ -369,6 +369,16 @@ bool WebSocketTransport::nextFrame() {
             closedByPeer_ = true;
             return false;
         }
+        // RFC 6455 §5.5: every control frame MUST have a Payload length of 125
+        // bytes or less. A longer control frame (CLOSE/PING/PONG) is a protocol
+        // error and must fail the connection, not be buffered and answered.
+        if (isControl && length > 125) {
+            logDebug("websocket: control frame with %llu-byte payload over 125, closing (1002)",
+                     static_cast<unsigned long long>(length));
+            sendClose(1002);
+            closedByPeer_ = true;
+            return false;
+        }
         // Enforce the per-message byte cap before buffering the payload, so a
         // peer cannot make the broker wait for (and buffer) an advertised length
         // larger than the cap by dribbling the bytes in. Checking it only after
