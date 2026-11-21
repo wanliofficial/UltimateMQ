@@ -229,6 +229,51 @@ TEST(StoreTest, RejectsAnOutOfRangeSubscriptionOption)
     ::remove(path.c_str());
 }
 
+TEST(StoreTest, RejectsAnOutOfRangeSubscriptionIdentifier)
+{
+    // A Subscription Identifier is a Variable Byte Integer: at most four bytes,
+    // so its value cannot exceed 268,435,455 (§1.5.5, §2.2.2.2). A corrupt file
+    // carrying a larger value must be rejected on load; otherwise it would be
+    // narrowed into the uint32_t field and re-emitted on resume as a five-byte
+    // VBI, which this broker's own parser refuses — breaking every SUBACK for
+    // the restored session. (0 stays legal: it is the "no identifier" sentinel.)
+    const std::string path = tempPath("badsubid.dat");
+    // sub <filter-hex> <qos> <noLocal> <rap> <handling> <subid>; 268435456 is one
+    // past the largest four-byte VBI.
+    writeRaw(path, "FLOWMQ-STATE-1\n"
+                   "session 636c 2d 1\n"
+                   "sub 6123 0 0 0 0 268435456\n");
+    Store store(path, std::chrono::milliseconds(10));
+
+    PersistedState state;
+    std::string error;
+    EXPECT_FALSE(store.load(state, &error));
+    EXPECT_NE(error.find("subscription identifier"), std::string::npos) << error;
+
+    ::remove(path.c_str());
+}
+
+TEST(StoreTest, AcceptsTheLargestLegalSubscriptionIdentifier)
+{
+    // The boundary itself must load: 268,435,455 (0x0FFFFFFF) is the largest
+    // four-byte VBI and a legal identifier. The optional field is also still
+    // optional when absent (older state files).
+    const std::string path = tempPath("maxsubid.dat");
+    writeRaw(path, "FLOWMQ-STATE-1\n"
+                   "session 636c 2d 1\n"
+                   "sub 6123 0 0 0 0 268435455\n");
+    Store store(path, std::chrono::milliseconds(10));
+
+    PersistedState state;
+    std::string error;
+    ASSERT_TRUE(store.load(state, &error)) << error;
+    ASSERT_EQ(state.sessions.size(), 1U);
+    ASSERT_EQ(state.sessions[0].subscriptions.count("a#"), 1U);
+    EXPECT_EQ(state.sessions[0].subscriptions.at("a#").subscriptionIdentifier, 268435455U);
+
+    ::remove(path.c_str());
+}
+
 TEST(StoreTest, StateFileIsPrivateToTheOwner)
 {
     // Payloads and session usernames live in the file, so it must not be

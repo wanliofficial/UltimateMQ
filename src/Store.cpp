@@ -548,10 +548,29 @@ bool Store::load(PersistedState &out, std::string *error) const {
                     return false;
                 }
                 // The Subscription Identifier trail field is optional so that a
-                // state file written by an older build still loads.
+                // state file written by an older build still loads. When present
+                // it MUST be a legal Variable Byte Integer: a VBI holds at most
+                // four bytes, so the value cannot exceed 268,435,455 (§1.5.5,
+                // §2.2.2.2). Unlike the fixed fields above it is the last
+                // column and genuinely optional, so an absent field means "no
+                // identifier" (0) rather than an error; a present field, though,
+                // is range-checked so a corrupt file cannot smuggle an
+                // out-of-range value into the restored subscription. Such a
+                // value would otherwise be narrowed into the uint32_t field and
+                // re-serialised on resume as a five-byte VBI, which this broker's
+                // own parser rejects (MAX_REMAINING_LENGTH_BYTES) — breaking
+                // every SUBACK for the session.
+                std::string idToken;
                 unsigned long long subscriptionIdentifier = 0;
-                if (!(ss >> subscriptionIdentifier)) {
-                    subscriptionIdentifier = 0;
+                if (ss >> idToken) {
+                    if (!parseUnsigned(idToken, subscriptionIdentifier) ||
+                        subscriptionIdentifier > 268435455ull) {
+                        if (error) {
+                            *error = "bad subscription identifier in sub record at line " +
+                                     std::to_string(lineNo);
+                        }
+                        return false;
+                    }
                 }
                 std::string filter;
                 if (!fromHex(filterHex, filter)) {
