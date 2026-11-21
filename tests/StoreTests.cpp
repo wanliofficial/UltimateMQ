@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <fstream>
 #include <string>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace MQTT {
@@ -192,6 +193,73 @@ TEST(StoreTest, RejectsAnUnknownRecord)
     EXPECT_NE(error.find("bogus"), std::string::npos) << error;
 
     ::remove(path.c_str());
+}
+
+TEST(StoreTest, RejectsAnOutOfRangeQos)
+{
+    // A corrupt file must not smuggle QoS 7 into a restored message: no handler
+    // would ever produce it, and later packet code assumes 0..2.
+    const std::string path = tempPath("badenum.dat");
+    writeRaw(path, "FLOWMQ-STATE-1\n"
+                   "retained 612f62 7 0 76\n");
+    Store store(path, std::chrono::milliseconds(10));
+
+    PersistedState state;
+    std::string error;
+    EXPECT_FALSE(store.load(state, &error));
+    EXPECT_FALSE(error.empty());
+
+    ::remove(path.c_str());
+}
+
+TEST(StoreTest, RejectsAnOutOfRangeSubscriptionOption)
+{
+    const std::string path = tempPath("badsub.dat");
+    // sub <filter-hex> <qos> <noLocal> <rap> <handling>; handling 3 is invalid.
+    writeRaw(path, "FLOWMQ-STATE-1\n"
+                   "session 636c 2d 1\n"
+                   "sub 612f23 0 0 0 3\n");
+    Store store(path, std::chrono::milliseconds(10));
+
+    PersistedState state;
+    std::string error;
+    EXPECT_FALSE(store.load(state, &error));
+    EXPECT_FALSE(error.empty());
+
+    ::remove(path.c_str());
+}
+
+TEST(StoreTest, StateFileIsPrivateToTheOwner)
+{
+    // Payloads and session usernames live in the file, so it must not be
+    // world-readable.
+    const std::string path = tempPath("mode.dat");
+    Store store(path, std::chrono::milliseconds(10));
+    ASSERT_TRUE(store.flushNow([] { return sampleState(); }));
+
+    struct stat st {};
+    ASSERT_EQ(::stat(path.c_str(), &st), 0);
+    EXPECT_EQ(st.st_mode & 0777, 0600u);
+
+    ::remove(path.c_str());
+}
+
+TEST(StoreTest, StaleTempFileDoesNotWedgeLaterWrites)
+{
+    // A crash between open() and rename() leaves "<path>.tmp" behind. With
+    // O_EXCL the next write must clear the stale file and succeed, not fail
+    // forever with EEXIST.
+    const std::string path = tempPath("stale.dat");
+    writeRaw(path + ".tmp", "leftover garbage from a crashed write\n");
+    Store store(path, std::chrono::milliseconds(10));
+    EXPECT_TRUE(store.flushNow([] { return sampleState(); }));
+
+    PersistedState state;
+    EXPECT_TRUE(store.load(state));
+    EXPECT_EQ(state.sessions.size(), 1u);
+
+    ::remove(path.c_str());
+    ::remove((path + ".tmp").c_str());
 }
 
 TEST(StoreTest, DisabledStoreIsInert)

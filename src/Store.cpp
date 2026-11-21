@@ -119,8 +119,6 @@ std::string encodeMessageProperties(const Properties &properties) {
     return out;
 }
 
-//! Parse one non-negative decimal itself, so a corrupt state file reports an
-//! error instead of throwing out of load().
 bool parseUnsigned(const std::string &text, unsigned long long &out) {
     if (text.empty()) {
         return false;
@@ -140,6 +138,23 @@ bool parseUnsigned(const std::string &text, unsigned long long &out) {
         out = out * 10 + digit;
     }
     return true;
+}
+
+//! Read one whitespace-delimited decimal and reject it when it falls outside
+//! [0, limit]. The state file is data, not code: enumerations stored in it
+//! (QoS, Retain Handling) are cast to their types after this check, so a corrupt
+//! file cannot smuggle an out-of-range value into a restored message or
+//! subscription (e.g. QoS 7, which no packet handler would produce).
+bool readBounded(std::istringstream &in, unsigned long long limit,
+                 unsigned long long &out) {
+    std::string token;
+    if (!(in >> token)) {
+        return false;
+    }
+    if (!parseUnsigned(token, out)) {
+        return false;
+    }
+    return out <= limit;
 }
 
 bool decodeMessageProperties(const std::string &encoded, Properties &out) {
@@ -353,7 +368,17 @@ bool Store::write(const PersistedState &state) {
     out += "end\n";
 
     std::string tmp = path + ".tmp";
-    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    // 0600: the state file can hold message payloads and session usernames, so it
+    // is private to the broker's user. O_EXCL makes a pre-planted symlink at the
+    // predictable ".tmp" name fail with EEXIST instead of being followed and
+    // truncating whatever it points at.
+    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0 && errno == EEXIST) {
+        // A stale temp file from a previous crash is the normal case; remove it
+        // and retry once so a crash mid-write does not wedge every later write.
+        ::unlink(tmp.c_str());
+        fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+    }
     if (fd < 0) {
         logError("cannot open state file %s: %s", tmp.c_str(), std::strerror(errno));
         return false;
@@ -372,7 +397,15 @@ bool Store::write(const PersistedState &state) {
         }
         offset += static_cast<size_t>(written);
     }
-    ::fsync(fd);
+    // The durability claim rests on this fsync: if it fails, the rename below
+    // would commit contents that may only be in the page cache, so report the
+    // write as failed rather than claim state that a crash could lose.
+    if (::fsync(fd) != 0) {
+        logError("cannot fsync state file %s: %s", tmp.c_str(), std::strerror(errno));
+        ::close(fd);
+        ::unlink(tmp.c_str());
+        return false;
+    }
     ::close(fd);
     if (::rename(tmp.c_str(), path.c_str()) != 0) {
         logError("cannot replace state file %s: %s", path.c_str(), std::strerror(errno));
@@ -395,6 +428,9 @@ bool Store::write(const PersistedState &state) {
         }
         int dirFd = ::open(dir.c_str(), O_RDONLY);
         if (dirFd >= 0) {
+            // Best effort: some filesystems refuse to fsync a directory. The
+            // file's own fsync above still holds; this only sharpens the
+            // rename-vs-crash window when the platform supports it.
             ::fsync(dirFd);
             ::close(dirFd);
         }
@@ -435,13 +471,15 @@ bool Store::load(PersistedState &out, std::string *error) const {
         ss >> kind;
         if (kind == "retained") {
             std::string topicHex, payloadHex;
-            int qos = 0;
-            int retain = 0;
-            if (!(ss >> topicHex >> qos >> retain >> payloadHex)) {
+            unsigned long long qos = 0;
+            unsigned long long retain = 0;
+            unsigned long long maxQos = static_cast<unsigned long long>(QoS::QOS_2);
+            if (!(ss >> topicHex) || !readBounded(ss, maxQos, qos) ||
+                !readBounded(ss, 1, retain) || !(ss >> payloadHex)) {
                 if (error) *error = "bad retained record at line " + std::to_string(lineNo);
                 return false;
             }
-            Message m = decodeMessage(topicHex, qos, retain != 0, payloadHex);
+            Message m = decodeMessage(topicHex, static_cast<int>(qos), retain != 0, payloadHex);
             // The property trail field is optional: state written by an older
             // build has no such column and simply carries no properties.
             std::string encodedProperties;
@@ -499,8 +537,13 @@ bool Store::load(PersistedState &out, std::string *error) const {
             }
             if (kind == "sub") {
                 std::string filterHex;
-                int qos = 0, noLocal = 0, rap = 0, handling = 0;
-                if (!(ss >> filterHex >> qos >> noLocal >> rap >> handling)) {
+                unsigned long long qos = 0, noLocal = 0, rap = 0, handling = 0;
+                const unsigned long long maxQos = static_cast<unsigned long long>(QoS::QOS_2);
+                // Retain Handling's stored range is 0..2 (§3.8.3.1).
+                const unsigned long long maxHandling = 2;
+                if (!(ss >> filterHex) || !readBounded(ss, maxQos, qos) ||
+                    !readBounded(ss, 1, noLocal) || !readBounded(ss, 1, rap) ||
+                    !readBounded(ss, maxHandling, handling)) {
                     if (error) *error = "bad sub record at line " + std::to_string(lineNo);
                     return false;
                 }
@@ -516,21 +559,24 @@ bool Store::load(PersistedState &out, std::string *error) const {
                     return false;
                 }
                 SubscriptionOptions opt;
-                opt.maximumQos = static_cast<QoS>(qos);
+                opt.maximumQos = static_cast<QoS>(static_cast<uint8_t>(qos));
                 opt.noLocal = noLocal != 0;
                 opt.retainAsPublished = rap != 0;
-                opt.retainHandling = static_cast<RetainHandling>(handling);
+                opt.retainHandling = static_cast<RetainHandling>(static_cast<uint8_t>(handling));
                 opt.subscriptionIdentifier = subscriptionIdentifier;
                 current->subscriptions[filter] = opt;
             } else if (kind == "inflight") {
-                unsigned id = 0;
+                unsigned long long id = 0;
                 std::string topicHex, payloadHex;
-                int qos = 0, retain = 0;
-                if (!(ss >> id >> topicHex >> qos >> retain >> payloadHex)) {
+                unsigned long long qos = 0, retain = 0;
+                const unsigned long long maxQos = static_cast<unsigned long long>(QoS::QOS_2);
+                if (!readBounded(ss, 65535, id) || !(ss >> topicHex) ||
+                    !readBounded(ss, maxQos, qos) || !readBounded(ss, 1, retain) ||
+                    !(ss >> payloadHex)) {
                     if (error) *error = "bad inflight record at line " + std::to_string(lineNo);
                     return false;
                 }
-                Message m = decodeMessage(topicHex, qos, retain != 0, payloadHex);
+                Message m = decodeMessage(topicHex, static_cast<int>(qos), retain != 0, payloadHex);
                 std::string encodedProperties;
                 if (ss >> encodedProperties && !decodeMessageProperties(encodedProperties, m.properties)) {
                     if (error) *error = "bad properties in inflight record at line " + std::to_string(lineNo);
@@ -543,14 +589,17 @@ bool Store::load(PersistedState &out, std::string *error) const {
                 }
                 current->inflight.emplace_back(static_cast<uint16_t>(id), std::move(m));
             } else if (kind == "blocked") {
-                unsigned id = 0;
+                unsigned long long id = 0;
                 std::string topicHex, payloadHex;
-                int qos = 0, retain = 0;
-                if (!(ss >> id >> topicHex >> qos >> retain >> payloadHex)) {
+                unsigned long long qos = 0, retain = 0;
+                const unsigned long long maxQos = static_cast<unsigned long long>(QoS::QOS_2);
+                if (!readBounded(ss, 0, id) || !(ss >> topicHex) ||
+                    !readBounded(ss, maxQos, qos) || !readBounded(ss, 1, retain) ||
+                    !(ss >> payloadHex)) {
                     if (error) *error = "bad blocked record at line " + std::to_string(lineNo);
                     return false;
                 }
-                Message m = decodeMessage(topicHex, qos, retain != 0, payloadHex);
+                Message m = decodeMessage(topicHex, static_cast<int>(qos), retain != 0, payloadHex);
                 std::string encodedProperties;
                 if (ss >> encodedProperties && !decodeMessageProperties(encodedProperties, m.properties)) {
                     if (error) *error = "bad properties in blocked record at line " + std::to_string(lineNo);
@@ -565,15 +614,15 @@ bool Store::load(PersistedState &out, std::string *error) const {
             } else if (kind == "outpubrel") {
                 // Outgoing QoS 2 flow awaiting PUBCOMP; re-sent to the client on
                 // resume (MQTT-4.4.0-1).
-                unsigned id = 0;
-                if (!(ss >> id)) {
+                unsigned long long id = 0;
+                if (!readBounded(ss, 65535, id)) {
                     if (error) *error = "bad outpubrel record at line " + std::to_string(lineNo);
                     return false;
                 }
                 current->pendingPubrel.insert(static_cast<uint16_t>(id));
             } else {
-                unsigned id = 0;
-                if (!(ss >> id)) {
+                unsigned long long id = 0;
+                if (!readBounded(ss, 65535, id)) {
                     if (error) *error = "bad pubrel record at line " + std::to_string(lineNo);
                     return false;
                 }
