@@ -18,6 +18,15 @@ namespace MQTT {
 std::atomic<uint64_t> totalMessagesSent{0};
 std::atomic<uint64_t> totalMessagesReceived{0};
 std::atomic<uint64_t> totalMessagesDropped{0};
+// Live outbound write-buffer occupancy across all connections (bytes), and the
+// number of currently connected clients. These are gauges, not cumulative
+// counters: they rise and fall as connections buffer and drain, or connect and
+// disconnect. They back the real-time $SYS/broker/writebuffer/bytes and
+// $SYS/broker/clients/connected topics, so an operator can see backpressure
+// building BEFORE messages are dropped (messages/dropped stays 0 until a loss
+// has already happened).
+std::atomic<uint64_t> liveWriteBufferBytes{0};
+std::atomic<uint64_t> liveConnectedClients{0};
 std::chrono::steady_clock::time_point sysStartedAt{std::chrono::steady_clock::now()};
 
 // Free helpers backing the $SYS/broker/messages/* and uptime/load topics. They
@@ -27,6 +36,8 @@ size_t sysGetTotalSent();
 size_t sysGetTotalReceived();
 double sysUptimeSeconds();
 size_t sysGetRetainedCount();
+size_t sysGetWriteBufferBytes();
+size_t sysGetConnectedClients();
 
 Broker::Broker(Auth* auth, Store* store) : trie(std::make_unique<Trie>()), auth(auth), store(store) {}
 
@@ -548,6 +559,22 @@ size_t sysGetTotalReceived() {
 
 size_t sysGetTotalDropped() {
     return totalMessagesDropped.load(std::memory_order_relaxed);
+}
+
+size_t sysGetWriteBufferBytes() {
+    return liveWriteBufferBytes.load(std::memory_order_relaxed);
+}
+
+size_t sysGetConnectedClients() {
+    return liveConnectedClients.load(std::memory_order_relaxed);
+}
+
+void Broker::adjustWriteBufferBytes(int64_t delta) {
+    liveWriteBufferBytes.fetch_add(delta, std::memory_order_relaxed);
+}
+
+void Broker::adjustConnectedClients(int64_t delta) {
+    liveConnectedClients.fetch_add(delta, std::memory_order_relaxed);
 }
 
 double sysUptimeSeconds() {

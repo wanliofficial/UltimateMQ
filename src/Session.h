@@ -194,6 +194,13 @@ public:
     //! slot). Lets a test assert that dropping a queued QoS>0 delivery released
     //! its slot rather than over-subscribing the window.
     size_t blockedCountForTest() { return blockedDeliveries.size(); }
+    //! Test hook: number of deliveries the session is currently holding that a
+    //! discard would throw away -- pending + flow-blocked + inflight (QoS>0 sent
+    //! but unacknowledged). Lets a test assert that tearing a session down counts
+    /// those messages as dropped rather than silently losing them.
+    size_t droppedOnDiscardForTest() {
+        return pendingDeliveries.size() + blockedDeliveries.size() + inflightMessages.size();
+    }
 
 private:
     struct Delivery {

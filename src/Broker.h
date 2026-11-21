@@ -182,6 +182,14 @@ public:
     void setWriteBufferBytes(size_t bytes) { writeBufferBytes = bytes; }
     size_t getWriteBufferBytes() const { return writeBufferBytes; }
 
+    //! Adjust the live outbound write-buffer occupancy gauge (bytes across all
+    //! connections) by \p delta. Called by Connection as its buffer grows and
+    //! drains, so $SYS/broker/writebuffer/bytes reflects current backpressure.
+    void adjustWriteBufferBytes(int64_t delta);
+    //! Adjust the live connected-clients gauge by \p delta (+1 on connect,
+    //! -1 on disconnect). Backs the connection-count view of the monitoring tree.
+    void adjustConnectedClients(int64_t delta);
+
     //! Configure the maximum number of subscriptions per session. Must be set
     //! before any client connects.
     void setMaxSubscriptions(size_t limit) { maxSubscriptions = limit; }

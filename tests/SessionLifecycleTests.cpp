@@ -147,6 +147,45 @@ TEST_F(SessionLifecycleTest, BackpressureDropsIncrementTheSysCounter)
         << "a full delivery queue must increment the dropped counter";
 }
 
+TEST_F(SessionLifecycleTest, DiscardCountsHeldDeliveriesAsDropped)
+{
+    // A discard throws away everything a session is holding for its client --
+    // the offline/ready buffer (pendingDeliveries), Receive-Max-blocked messages
+    // (blockedDeliveries) and unacknowledged inflight QoS 1/2. All of those are
+    // genuine losses, so tearing a session down must move them into the $SYS
+    // dropped counter rather than losing them silently. This is the path a
+    // backpressure connection close takes (a slow reader whose write buffer
+    // fills), so it must be observable like the queue drop. Persistent sessions
+    // that merely go dormant are NOT discarded, so their buffer is not counted.
+    broker.setSysTopics(true);
+    auto droppedCounter = [&] {
+        broker.refreshSysTopics();
+        auto values = broker.sysTopicValues();
+        auto it = values.find("$SYS/broker/messages/dropped");
+        return it == values.end() ? 0u : std::stoul(it->second);
+    };
+
+    // An OFFLINE persistent session (no client bound): published messages stay
+    // in its buffer rather than being flushed out, so they are "held" at discard.
+    // It is persistent, so close() would keep it resumable (not discarded, not
+    // counted); we call discard() directly to model the teardown that a
+    // backpressure connection close performs on a non-resumable session.
+    auto session = std::make_shared<Session>(&broker, "bp-discard");
+    session->connect(session, /*persistent=*/true);
+    session->subscribe("bp-discard/#", optionsFor());
+    for (size_t i = 0; i < 10; ++i) {
+        broker.publish(Message{"bp-discard/t", std::string("x"), QoS::QOS_0});
+    }
+    // No client attached: the ten messages sit in the offline buffer, held.
+    ASSERT_EQ(session->droppedOnDiscardForTest(), 10u);
+
+    const auto beforeDiscard = droppedCounter();
+    session->discard();
+    const auto afterDiscard = droppedCounter();
+    EXPECT_EQ(afterDiscard - beforeDiscard, 10u)
+        << "discarding a session must count every held delivery as dropped";
+}
+
 TEST_F(SessionLifecycleTest, DropOldestKeepsTheNewestWhenTheQueueIsFull)
 {
     // FLOWMQ_QUEUE_DROP=oldest: when the delivery queue is full the broker evicts

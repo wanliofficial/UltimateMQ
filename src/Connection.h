@@ -96,6 +96,17 @@ public:
     //! Serialize and write a packet. Returns false when nothing was written
     //! (socket gone, or the packet exceeds the client's Maximum Packet Size).
     bool sendPacket(Packet &packet);
+    //! Test-only accessors for the buffered write path (see the private members
+    //! writeBuffer / writeBufferBytes). They let a unit test drive buffering
+    //! without the event loop: configure FLOWMQ_WRITE_BUFFER, deliver a packet
+    //! larger than the socketpair's send buffer, and observe both the per-
+    //! connection buffered byte count and the live $SYS/broker/writebuffer/bytes
+    //! gauge moving together; drainWriteBufferForTest() then models the POLLOUT
+    //! drain once the peer socket is emptied.
+    size_t writeBufferBytesForTest() { return writeBufferBytes; }
+    bool writeBufferActiveForTest() { return writeBufferActive; }
+    bool sendPacketForTest(Packet &packet) { return sendPacket(packet); }
+    void drainWriteBufferForTest() { drainWriteBuffer(); }
     //! Report a Topic Alias protocol violation with a DISCONNECT carrying \p
     //! reason, mark the connection closed and return false (MQTT-3.3.2-7/-8).
     bool failTopicAlias(ReasonCode reason, const std::string &detail);

@@ -13,6 +13,11 @@ size_t sysGetTotalSent();
 size_t sysGetTotalReceived();
 size_t sysGetTotalDropped();
 double sysUptimeSeconds();
+//! Live gauges: total outbound write-buffer bytes buffered across all
+//! connections (rises while a slow reader is behind), and the number of
+//! currently connected clients.
+size_t sysGetWriteBufferBytes();
+size_t sysGetConnectedClients();
 
 //! Optional broker-side monitoring topic tree (the "$SYS/..." tree). When the
 //! feature is enabled the broker publishes its own counters as retained QoS 0
@@ -31,6 +36,7 @@ double sysUptimeSeconds();
 //!   $SYS/broker/messages/sent        total PUBLISHes the broker has delivered
 //!   $SYS/broker/messages/received    total PUBLISHes the broker has accepted
 //!   $SYS/broker/messages/dropped     total PUBLISHes dropped under backpressure
+//!   $SYS/broker/writebuffer/bytes    live outbound write-buffer bytes (backpressure gauge)
 //!   $SYS/broker/retaineds/count      number of retained messages held
 //!   $SYS/broker/uptime               seconds since the broker started
 //!   $SYS/broker/load                 1-minute load average

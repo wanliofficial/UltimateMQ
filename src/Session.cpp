@@ -172,6 +172,21 @@ void Session::discard() {
     std::map<std::string, SubscriptionOptions> filters;
     {
         std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
+        // A discard throws away everything the session was holding for the
+        // client: the offline/ready buffer (pendingDeliveries), messages parked
+        // under Receive Maximum (blockedDeliveries), and QoS 1/2 messages sent
+        // but not yet acknowledged (inflightMessages). Every one of those is a
+        // genuine loss, so it is counted in the backpressure drop metric rather
+        // than vanishing silently -- this is what makes a connection torn down
+        // for a full/stalled outbound write buffer observable as lost deliveries.
+        if (broker) {
+            const uint64_t lost = static_cast<uint64_t>(pendingDeliveries.size()) +
+                                  static_cast<uint64_t>(blockedDeliveries.size()) +
+                                  static_cast<uint64_t>(inflightMessages.size());
+            if (lost > 0) {
+                broker->incrementMessagesDropped(lost);
+            }
+        }
         // Throw away everything: subscriptions, offline buffer and inflight
         filters.swap(subscriptions);
         pendingDeliveries.clear();

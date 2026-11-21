@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include "../src/Connection.h"
 #include "../src/Broker.h"
+#include "../src/SysTopics.h"
 #include <sys/socket.h>
 #include <unistd.h>
 #include <memory>
@@ -232,6 +233,46 @@ TEST_F(ConnectionStateTests, PublishWithWildcardResponseTopicIsAProtocolError)
     EXPECT_EQ(static_cast<uint8_t>(buffer[2]), 0x82)
         << "expected Protocol Error (0x82), got 0x"
         << std::hex << static_cast<int>(static_cast<uint8_t>(buffer[2]));
+}
+
+TEST_F(ConnectionStateTests, BufferedWriteBuffersOverflowAndTracksTheGauge)
+{
+    // With FLOWMQ_WRITE_BUFFER set, a write the socket cannot take immediately is
+    // buffered and the live occupancy gauge ($SYS/broker/writebuffer/bytes) rises
+    // with it. A connection without the buffer configured never engages it.
+    broker.setWriteBufferBytes(256 * 1024); // 256KB buffer
+    SocketPairConnection pair(&broker);
+    ASSERT_TRUE(pair.connection->writeBufferActiveForTest())
+        << "the write buffer did not activate for a configured broker";
+
+    // A 128KB PUBLISH: the kernel socketpair buffer (typically 8-64KB auto-tuned)
+    // absorbs part of it, and the remainder buffers in the write buffer (128KB
+    // < 256KB limit, so the connection survives). This exercises the buffered path
+    // and verifies the live gauge tracks the buffered bytes.
+    std::vector<uint8_t> payload(128 * 1024, 'x');
+    auto publish = std::make_shared<PublishPacket>("buf/t", payload, QoS::QOS_0);
+    ASSERT_TRUE(pair.connection->sendPacketForTest(*publish))
+        << "a packet within the buffer limit must be accepted";
+
+    const size_t buffered = pair.connection->writeBufferBytesForTest();
+    EXPECT_GT(buffered, 0u)
+        << "a write larger than the socket buffer must leave a buffered remainder";
+    EXPECT_EQ(sysGetWriteBufferBytes(), buffered)
+        << "the live gauge must equal this connection's buffered bytes";
+}
+
+TEST_F(ConnectionStateTests, NoWriteBufferKeepsThePathSynchronous)
+{
+    // Default (no FLOWMQ_WRITE_BUFFER): the buffer never engages, so a write goes
+    // straight through and nothing is buffered -- the historical behaviour.
+    SocketPairConnection pair(&broker);
+    EXPECT_FALSE(pair.connection->writeBufferActiveForTest());
+
+    std::vector<uint8_t> payload(2048, 'x');
+    auto publish = std::make_shared<PublishPacket>("sync/t", payload, QoS::QOS_0);
+    EXPECT_TRUE(pair.connection->sendPacketForTest(*publish));
+    EXPECT_EQ(pair.connection->writeBufferBytesForTest(), 0u);
+    EXPECT_EQ(sysGetWriteBufferBytes(), 0u);
 }
 
 } // namespace MQTT

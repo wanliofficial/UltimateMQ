@@ -76,6 +76,34 @@ TEST(SysTopicsTest, DroppedTopicIsInTheMonitoringTree)
     EXPECT_TRUE(found) << "dropped topic missing from allTopics()";
 }
 
+TEST(SysTopicsTest, WriteBufferBytesIsTheLiveGauge)
+{
+    // $SYS/broker/writebuffer/bytes backs the live outbound backpressure gauge.
+    // Unlike sent/received/dropped it is not one of the process-wide cumulative
+    // counters passed into payload(); it reads the live write-buffer occupancy
+    // directly, so a subscriber sees current buffering as a plain decimal that
+    // rises while a slow reader is behind and falls again as it drains.
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/writebuffer/bytes", 7, 7, 7),
+              std::to_string(sysGetWriteBufferBytes()));
+    // The connected-clients gauge is the other live value exposed this way.
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/clients/connected", 0, 0, 0),
+              std::to_string(sysGetConnectedClients()));
+}
+
+TEST(SysTopicsTest, WriteBufferBytesIsInTheMonitoringTree)
+{
+    EXPECT_EQ(SysTopics::matchedCount("$SYS/broker/writebuffer/bytes"), 1u);
+    EXPECT_EQ(SysTopics::matchedCount("$SYS/#"), SysTopics::allTopics().size());
+    bool found = false;
+    for (const std::string &topic : SysTopics::allTopics()) {
+        if (topic == "$SYS/broker/writebuffer/bytes") {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found) << "writebuffer/bytes topic missing from allTopics()";
+}
+
 TEST(SysTopicsTest, UnknownTopicYieldsNoPayload)
 {
     EXPECT_TRUE(SysTopics::payload("$SYS/does/not/exist", 0, 0, 0).empty());

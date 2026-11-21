@@ -101,9 +101,23 @@ Connection::Connection(int sockfd, Broker* broker,
     publishRateLimit = broker ? broker->getMaxPublishRate() : 0;
     publishTokens = static_cast<double>(publishRateLimit);
     publishBucketStamp = std::chrono::steady_clock::now();
+    // This connection now counts toward the live connected-clients gauge.
+    if (broker) {
+        broker->adjustConnectedClients(+1);
+    }
 }
 
 Connection::~Connection() {
+    // Release this connection's contribution to the live gauges before the
+    // socket goes away: any bytes still buffered (a slow reader we never caught
+    // up with) leave the global write-buffer occupancy, and the client leaves
+    // the connected count. Symmetric with the constructor's +1.
+    if (broker) {
+        if (writeBufferBytes > 0) {
+            broker->adjustWriteBufferBytes(-static_cast<int64_t>(writeBufferBytes));
+        }
+        broker->adjustConnectedClients(-1);
+    }
     closeSocket();
 }
 
@@ -1508,7 +1522,11 @@ bool Connection::sendPacket(Packet &packet) {
             return false;
         }
         writeBuffer.emplace_back(data.begin() + n, data.end());
-        writeBufferBytes += data.size() - static_cast<size_t>(n);
+        const size_t added = data.size() - static_cast<size_t>(n);
+        writeBufferBytes += added;
+        if (broker) {
+            broker->adjustWriteBufferBytes(static_cast<int64_t>(added));
+        }
         lastWriteProgress = std::chrono::steady_clock::now();
         return true;
     }
@@ -1536,6 +1554,7 @@ void Connection::drainWriteBuffer() {
         state = State::DISCONNECTED;
         return;
     }
+    size_t freedTotal = 0;
     while (!writeBuffer.empty()) {
         auto &front = writeBuffer.front();
         const ssize_t n = transport->writeSome(front.data(), front.size());
@@ -1549,16 +1568,21 @@ void Connection::drainWriteBuffer() {
             if (n > 0) {
                 front.erase(front.begin(), front.begin() + n);
                 writeBufferBytes -= static_cast<size_t>(n);
+                freedTotal += static_cast<size_t>(n);
                 lastWriteProgress = std::chrono::steady_clock::now();
             }
-            return;
+            break;
         }
         writeBufferBytes -= front.size();
+        freedTotal += front.size();
         writeBuffer.pop_front();
         lastWriteProgress = std::chrono::steady_clock::now();
     }
+    if (freedTotal > 0 && broker) {
+        broker->adjustWriteBufferBytes(-static_cast<int64_t>(freedTotal));
+    }
     // Fully drained: let the session push anything it had to hold back.
-    if (session) {
+    if (writeBuffer.empty() && session) {
         session->flush();
     }
 }
