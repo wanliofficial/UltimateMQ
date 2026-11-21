@@ -26,8 +26,12 @@ public:
     ~Server();
 
     void start();
-    //! Handle one accepted socket until it closes; the server keeps it alive
-    void handleClient(int clientSocket);
+    //! Serve one accepted connection until it closes. The server keeps it alive
+    //! for the lifetime of the session callbacks, so the same object is handed
+    //! to the serving thread and used to identify it in the registry.
+    void handleClient(const std::shared_ptr<Connection> &connection);
+    //! Ask a connection to leave its read loop by shutting its descriptor down.
+    //! The owning Connection then closes the descriptor itself.
     void closeClient(int clientSocket);
     //! Stop accepting new clients and drop all open connections
     void stop();
@@ -48,7 +52,8 @@ private:
     //! Register a connection and start the thread that serves it. Returns false
     //! (and starts nothing) once shutdown has begun.
     bool startClientThread(int clientSocket, const std::shared_ptr<Connection>& connection);
-    void unregisterConnection(int clientSocket);
+    void unregisterConnection(int clientSocket,
+                              const std::shared_ptr<Connection> &connection);
     //! Join the threads of connections that have already finished, so a
     //! long-running server does not accumulate them.
     void reapFinishedClientThreads();

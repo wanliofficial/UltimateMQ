@@ -475,8 +475,8 @@ void Server::run() {
         auto connection = std::make_shared<Connection>(clientSocket, broker, TLS);
         if (!startClientThread(clientSocket, connection)) {
             // Shutdown started between accept() and here: no thread was
-            // started, so close the descriptor we own.
-            close(clientSocket);
+            // started. The Connection we constructed still owns the descriptor
+            // and closes it in its destructor, so we must not close it again.
             break;
         }
     }
@@ -508,21 +508,15 @@ void Server::acceptWebSocket() {
     auto connection = std::make_shared<Connection>(clientSocket, broker,
                                                    std::move(websocket));
     if (!startClientThread(clientSocket, connection)) {
-        close(clientSocket);
+        // Shutdown started: no thread was started. The Connection we built still
+        // owns the descriptor and closes it in its destructor.
     }
 }
 
-void Server::handleClient(int clientSocket) {
-    std::shared_ptr<Connection> connection;
-    {
-        std::lock_guard<std::mutex> lock(connectionsMutex);
-        auto it = connections.find(clientSocket);
-        if (it == connections.end()) {
-            return;
-        }
-        connection = it->second;
-    }
-    // Connection::run() owns the socket and closes it when it is done
+void Server::handleClient(const std::shared_ptr<Connection> &connection) {
+    // The connection was kept alive by the shared_ptr captured here; the
+    // descriptor is owned by the Connection and closed exactly once by
+    // Connection::run() when it returns.
     connection->run();
 }
 
@@ -538,17 +532,24 @@ bool Server::startClientThread(int clientSocket,
     }
     connections[clientSocket] = connection;
     std::thread thread([this, clientSocket, connection, finished]() {
-        handleClient(clientSocket);
-        unregisterConnection(clientSocket);
+        handleClient(connection);
+        unregisterConnection(clientSocket, connection);
         finished->store(true, std::memory_order_release);
     });
     clientThreads.push_back(ClientThread{std::move(thread), std::move(finished)});
     return true;
 }
 
-void Server::unregisterConnection(int clientSocket) {
+void Server::unregisterConnection(int clientSocket,
+                                  const std::shared_ptr<Connection> &connection) {
     std::lock_guard<std::mutex> lock(connectionsMutex);
-    connections.erase(clientSocket);
+    // Only drop the entry if it still names this connection. The descriptor may
+    // have been closed by run() and reused by a newer accept() before we get
+    // here; erasing unconditionally would evict that newer, still-live entry.
+    auto it = connections.find(clientSocket);
+    if (it != connections.end() && it->second == connection) {
+        connections.erase(it);
+    }
 }
 
 void Server::reapFinishedClientThreads() {
