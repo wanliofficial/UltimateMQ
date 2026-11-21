@@ -35,7 +35,17 @@ PersistedState Broker::snapshotState() const {
     // one. The lock order is Broker -> Session, matching every other path.
     {
         std::lock_guard<std::recursive_mutex> lock(mutex);
-        state.retained = retainedMessages;
+        // The $SYS/broker/... monitoring tree is regenerated live by
+        // refreshSysTopics() on every sweep and is never meaningful to persist:
+        // its values (uptime, live counts) describe the current process only.
+        // Persisting it would (a) write a stale snapshot of the tree into every
+        // state file, and (b) re-serve it on the next start even when the
+        // monitoring feature is disabled. Exclude it from the durable state.
+        for (const auto &[topic, message] : retainedMessages) {
+            if (!SysTopics::isSysTopic(topic)) {
+                state.retained[topic] = message;
+            }
+        }
         for (const auto &[clientId, session] : sessions) {
             if (session && session->isPersistent()) {
                 state.sessions.push_back(session->snapshot());
@@ -46,9 +56,20 @@ PersistedState Broker::snapshotState() const {
 }
 
 void Broker::restoreState(const PersistedState &state) {
+    size_t keptRetained = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(mutex);
-        retainedMessages = state.retained;
+        // The $SYS/broker/... monitoring tree is a live, process-local view and
+        // is never restored from disk: it is repopulated by refreshSysTopics()
+        // only while the feature is enabled. Drop any $SYS entries a state file
+        // written by an older build may still carry, so a $SYS-disabled broker
+        // never serves a stale monitoring tree it no longer generates.
+        for (const auto &[topic, message] : state.retained) {
+            if (!SysTopics::isSysTopic(topic)) {
+                retainedMessages[topic] = message;
+                ++keptRetained;
+            }
+        }
         for (const auto &persisted : state.sessions) {
             auto session = std::make_shared<Session>(this, persisted.clientId, /*cleanStart=*/false);
             session->restore(persisted);
@@ -90,7 +111,7 @@ void Broker::restoreState(const PersistedState &state) {
         }
     }
     logInfo("restored %zu retained message(s) and %zu persistent session(s) from disk",
-            state.retained.size(), state.sessions.size());
+            keptRetained, state.sessions.size());
 }
 
 void Broker::insertSession(const std::string &clientId, const std::shared_ptr<Session>& session) {
@@ -538,7 +559,15 @@ std::map<std::string, std::string> Broker::sysTopicValues() const {
             }
         }
         sessionCount = sessions.size();
-        retainedCount = retainedMessages.size();
+        // $SYS/broker/retaineds/count reports the retained messages clients have
+        // published, not the broker's own monitoring tree: counting the $SYS
+        // topics here would fold the tree into its own metric (and grow it every
+        // time a topic were added), so the monitoring topics are excluded.
+        for (const auto &[topic, message] : retainedMessages) {
+            if (!SysTopics::isSysTopic(topic)) {
+                ++retainedCount;
+            }
+        }
     }
     for (const std::string &topic : SysTopics::allTopics()) {
         const std::string value = SysTopics::payload(topic, connected, sessionCount, retainedCount);
@@ -571,7 +600,10 @@ void Broker::refreshSysTopics() {
             continue;
         }
         retainedMessages[topic] = Message(topic, value, QoS::QOS_0, /*retain=*/true);
-        notifyStateChanged();
+        // A $SYS refresh never marks the store dirty: the monitoring tree is
+        // excluded from the durable state (see snapshotState), so persisting it
+        // would rewrite the state file every sweep (uptime alone changes every
+        // second) with data that is discarded on the next start anyway.
     }
 }
 
