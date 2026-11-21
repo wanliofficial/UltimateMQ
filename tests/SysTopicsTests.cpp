@@ -48,6 +48,34 @@ TEST(SysTopicsTest, CountsAreReportedAsDecimalNumbers)
     EXPECT_EQ(SysTopics::payload("$SYS/broker/retaineds/count", 0, 0, 0), "0");
 }
 
+TEST(SysTopicsTest, DroppedCountReflectsTheProcessCounter)
+{
+    // $SYS/broker/messages/dropped backs the backpressure metric. Unlike the
+    // connected/sessions/retained topics its value comes from a process-wide
+    // counter (the same one sent/received use), not from the arguments, so a
+    // subscriber sees the live cumulative drop count as a plain decimal.
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/messages/dropped", 0, 0, 0),
+              std::to_string(sysGetTotalDropped()));
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/messages/dropped", 99, 0, 0),
+              std::to_string(sysGetTotalDropped()));
+}
+
+TEST(SysTopicsTest, DroppedTopicIsInTheMonitoringTree)
+{
+    // The dropped topic must be part of the advertised tree so a "$SYS/#" subscriber
+    // receives it and it is refreshed on the sweep like every other counter.
+    EXPECT_EQ(SysTopics::matchedCount("$SYS/broker/messages/dropped"), 1u);
+    EXPECT_EQ(SysTopics::matchedCount("$SYS/#"), SysTopics::allTopics().size());
+    bool found = false;
+    for (const std::string &topic : SysTopics::allTopics()) {
+        if (topic == "$SYS/broker/messages/dropped") {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found) << "dropped topic missing from allTopics()";
+}
+
 TEST(SysTopicsTest, UnknownTopicYieldsNoPayload)
 {
     EXPECT_TRUE(SysTopics::payload("$SYS/does/not/exist", 0, 0, 0).empty());

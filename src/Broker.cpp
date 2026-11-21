@@ -17,6 +17,7 @@ namespace MQTT {
 // atomics: they are informational snapshots only, never used for correctness.
 std::atomic<uint64_t> totalMessagesSent{0};
 std::atomic<uint64_t> totalMessagesReceived{0};
+std::atomic<uint64_t> totalMessagesDropped{0};
 std::chrono::steady_clock::time_point sysStartedAt{std::chrono::steady_clock::now()};
 
 // Free helpers backing the $SYS/broker/messages/* and uptime/load topics. They
@@ -530,12 +531,20 @@ void Broker::incrementMessagesSent(uint64_t count) {
     totalMessagesSent += count;
 }
 
+void Broker::incrementMessagesDropped(uint64_t count) {
+    totalMessagesDropped += count;
+}
+
 size_t sysGetTotalSent() {
     return totalMessagesSent.load(std::memory_order_relaxed);
 }
 
 size_t sysGetTotalReceived() {
     return totalMessagesReceived.load(std::memory_order_relaxed);
+}
+
+size_t sysGetTotalDropped() {
+    return totalMessagesDropped.load(std::memory_order_relaxed);
 }
 
 double sysUptimeSeconds() {

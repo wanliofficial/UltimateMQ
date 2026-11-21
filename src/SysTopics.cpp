@@ -20,6 +20,7 @@ const std::vector<std::string> kTopics = {
     "$SYS/broker/clients/total",
     "$SYS/broker/messages/sent",
     "$SYS/broker/messages/received",
+    "$SYS/broker/messages/dropped",
     "$SYS/broker/retaineds/count",
     "$SYS/broker/uptime",
     "$SYS/broker/load",
@@ -77,6 +78,9 @@ std::string payload(const std::string &topic, size_t connected, size_t sessions,
     }
     if (topic == "$SYS/broker/messages/received") {
         return numberPayload(sysGetTotalReceived());
+    }
+    if (topic == "$SYS/broker/messages/dropped") {
+        return numberPayload(sysGetTotalDropped());
     }
     if (topic == "$SYS/broker/retaineds/count") {
         return numberPayload(retained);

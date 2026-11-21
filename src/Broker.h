@@ -232,6 +232,10 @@ public:
     void incrementMessagesReceived();
     //! Count messages the broker delivered to subscribers ($SYS counter)
     void incrementMessagesSent(uint64_t count = 1);
+    //! Count messages the broker dropped because a session's delivery queue was
+    //! full (backpressure). Backs $SYS/broker/messages/dropped so an operator can
+    //! see backpressure happening; the per-session drop is also logged at debug.
+    void incrementMessagesDropped(uint64_t count = 1);
     //! All retained messages, keyed by topic name (returns a snapshot; thread safe)
     std::map<std::string, Message> snapshotRetained() const;
     size_t getRetainedCount() const;

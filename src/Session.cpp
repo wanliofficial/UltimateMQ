@@ -622,6 +622,13 @@ void Session::pushDelivery(const Message &message, QoS qos,
     if (pendingDeliveries.size() + blockedDeliveries.size() >= MAX_QUEUED_MESSAGES) {
         logDebug("session %s: queue full (%zu), dropping message on %s", clientId.c_str(),
                  pendingDeliveries.size() + blockedDeliveries.size(), message.topic.c_str());
+        // Backpressure: make the drop observable. The queue-full event is logged
+        // at debug (it can be chatty under sustained load), but the dropped count
+        // is always accumulated and exposed on $SYS/broker/messages/dropped when
+        // the monitoring tree is on, so an operator can see backpressure happening.
+        if (broker) {
+            broker->incrementMessagesDropped();
+        }
         return;
     }
     Message outgoing = message;

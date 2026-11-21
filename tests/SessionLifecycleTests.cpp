@@ -110,6 +110,43 @@ TEST_F(SessionLifecycleTest, ResumeCancelsPendingExpiry)
     EXPECT_FALSE(session->isExpired(future));
 }
 
+TEST_F(SessionLifecycleTest, BackpressureDropsIncrementTheSysCounter)
+{
+    // An offline persistent session whose delivery queue fills (MAX_QUEUED_MESSAGES)
+    // drops further messages. The drop must be observable through the
+    // $SYS/broker/messages/dropped counter, not just a debug log line. The counter
+    // is process-wide, so assert the delta around the burst.
+    broker.setSysTopics(true);
+    auto session = std::make_shared<Session>(&broker, "bp");
+    session->connect(session, /*persistent=*/true);
+    session->subscribe("bp/#", optionsFor());
+    // No client attached: the session is offline, so flush() keeps the queue.
+
+    auto droppedBefore = [&] {
+        broker.refreshSysTopics();
+        auto values = broker.sysTopicValues();
+        auto it = values.find("$SYS/broker/messages/dropped");
+        return it == values.end() ? 0u : std::stoul(it->second);
+    }();
+
+    // One more than the per-session queue cap (Session::MAX_QUEUED_MESSAGES,
+    // private): that many queue, the final one is dropped under backpressure.
+    const size_t queueCap = 1000;
+    for (size_t i = 0; i <= queueCap; ++i) {
+        broker.publish(Message{"bp/t", std::string("x"), QoS::QOS_0, /*retain=*/false});
+    }
+
+    auto droppedAfter = [&] {
+        broker.refreshSysTopics();
+        auto values = broker.sysTopicValues();
+        auto it = values.find("$SYS/broker/messages/dropped");
+        return it == values.end() ? 0u : std::stoul(it->second);
+    }();
+
+    EXPECT_GT(droppedAfter, droppedBefore)
+        << "a full delivery queue must increment the dropped counter";
+}
+
 TEST_F(SessionLifecycleTest, SweepDropsAnExpiredSession)
 {
     auto session = std::make_shared<Session>(&broker, "sweep");

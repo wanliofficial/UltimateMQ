@@ -11,6 +11,7 @@ namespace MQTT {
 // to the Broker. Each is a relaxed snapshot of a monotonic counter or gauge.
 size_t sysGetTotalSent();
 size_t sysGetTotalReceived();
+size_t sysGetTotalDropped();
 double sysUptimeSeconds();
 
 //! Optional broker-side monitoring topic tree (the "$SYS/..." tree). When the
@@ -29,6 +30,7 @@ double sysUptimeSeconds();
 //!   $SYS/broker/clients/total        number of sessions the broker holds
 //!   $SYS/broker/messages/sent        total PUBLISHes the broker has delivered
 //!   $SYS/broker/messages/received    total PUBLISHes the broker has accepted
+//!   $SYS/broker/messages/dropped     total PUBLISHes dropped under backpressure
 //!   $SYS/broker/retaineds/count      number of retained messages held
 //!   $SYS/broker/uptime               seconds since the broker started
 //!   $SYS/broker/load                 1-minute load average
