@@ -290,6 +290,29 @@ Server::Server(int port, size_t maxConnections)
         logInfo("max publish rate per client: %zu msg/s", broker->getMaxPublishRate());
     }
 
+    // Session delivery-queue backpressure policy (opt-in). When a session's
+    // delivery queue is full the default drops the incoming message
+    // (FLOWMQ_QUEUE_DROP=newest, the historical behaviour). Setting
+    // FLOWMQ_QUEUE_DROP=oldest instead evicts the oldest buffered message so the
+    // client always sees the most recent traffic, for real-time feeds that must
+    // not be buried in stale messages behind a stalled reader.
+    const char* queueDrop = getenv("FLOWMQ_QUEUE_DROP");
+    if (queueDrop && *queueDrop) {
+        std::string value(queueDrop);
+        if (value == "oldest") {
+            broker->setQueueDropPolicy(QueueDropPolicy::DropOldest);
+            logInfo("session queue drop policy: oldest (keep newest under backpressure)");
+        } else if (value == "newest" || value == "0" || value == "false") {
+            broker->setQueueDropPolicy(QueueDropPolicy::DropNewest);
+            logInfo("session queue drop policy: newest (default)");
+        } else {
+            delete broker;
+            broker = nullptr;
+            throw std::runtime_error("invalid FLOWMQ_QUEUE_DROP: " + value +
+                                     " (expected 'newest' or 'oldest')");
+        }
+    }
+
     // Preferred keep alive (opt-in). Without it a client may ask for 0 (no
     // keep alive) and its dead connection would never be reaped. When set,
     // MQTT 5 clients that ask for more (or for none) are told the broker's

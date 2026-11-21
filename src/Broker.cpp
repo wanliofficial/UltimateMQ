@@ -79,6 +79,7 @@ void Broker::restoreState(const PersistedState &state) {
             session->setMaxSubscriptions(maxSubscriptions);
             session->setMaxSharedSubscriptions(
                 sharedQuotaExplicit ? maxSharedSubscriptions : maxSubscriptions);
+            session->setQueueDropPolicy(queueDropPolicy);
             sessions[persisted.clientId] = session;
             // Re-create the routing entries so live publishes reach the session
             // while it is offline (they are buffered until it reconnects)
@@ -125,6 +126,8 @@ void Broker::insertSession(const std::string &clientId, const std::shared_ptr<Se
         session->setMaxSubscriptions(maxSubscriptions);
         session->setMaxSharedSubscriptions(
             sharedQuotaExplicit ? maxSharedSubscriptions : maxSubscriptions);
+        // Apply the broker's subscription limits to the newly created session
+        session->setQueueDropPolicy(queueDropPolicy);
     }
 }
 

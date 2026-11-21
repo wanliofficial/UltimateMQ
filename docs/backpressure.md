@@ -85,6 +85,25 @@ AGENTS.md"opt-in 行为不改变默认路径"。
 A 落地后再评估是否需要 B**,或仅实现一个克制的变体:满时丢最旧**且未入
 inflight** 的消息。待你决定。
 
+**已落地(2026-11,完整 B2)**:按"完整 B2"实现,默认不变。实现要点:
+
+- `QueueDropPolicy`(`DropNewest` 默认 / `DropOldest`)定义在 `Broker.h` 命名空间
+  作用域(非 `Session` 嵌套),便于只前向声明 `Session` 的翻译单元引用。Broker
+  持有该策略,并在 `insertSession`/`restoreState` 两个会话创建路径下发给每个
+  session;`Server.cpp` 读 `FLOWMQ_QUEUE_DROP=newest|oldest` 设置(非法值启动即报错)。
+- 每个 `Delivery` 带一个单调递增的 `deliverySequence`,使"最旧"跨
+  `pendingDeliveries`/`blockedDeliveries` 两个容器可比较。`dropOldestQueued()`
+  比较两个队列的 front,弹出全局最旧者;`pendingDeliveries` 保持发送顺序(§4.6
+  的重传优先语义不破)。
+- **关键正确性**:从 `pendingDeliveries` 丢一个 QoS>0 消息时,它已认领 inflight
+  slot,必须 `releaseInflightIfPresent()` 释放,否则 Receive Maximum 窗口泄漏。
+  从 `blockedDeliveries` 丢无需释放(尚未认领 slot)。丢之前先循环腾位再追加新
+  消息,保证"最新必留"。
+- 回归测试(`SessionLifecycleTests`):DropOldest 保留最新 1000、DropNewest 保留最旧
+  1000(默认回归)、QoS1 满队列驱逐不泄漏流控窗口(以 `receiveMaximum=队列上限`
+  构造,若 slot 泄漏则新消息被迫进 blocked 队列,断言 blocked 为 0)。三个测试均
+  已验证:禁用对应逻辑后即失败。
+
 ---
 
 ### 缺口 C — TCP 出站写背压(改动最大)

@@ -335,7 +335,8 @@ void Session::retransmitInflight(uint16_t packetId) {
     if (idIt != inflightIdentifiers.end()) {
         identifiers = idIt->second;
     }
-    pendingDeliveries.emplace_back(std::move(outgoing), packetId, it->second->qos, identifiers);
+    pendingDeliveries.emplace_back(std::move(outgoing), packetId, it->second->qos, identifiers,
+                                   ++deliverySequence);
 }
 
 void Session::subscribe(const std::string &topicFilter, const SubscriptionOptions &options) {
@@ -448,6 +449,12 @@ void Session::resume(const std::shared_ptr<Client>& client, Version protocolVers
         pendingDeliveries.insert(pendingDeliveries.begin(),
                                  std::make_move_iterator(retransmissions.begin()),
                                  std::make_move_iterator(retransmissions.end()));
+        // §4.6 requires the unacked retransmissions to go out before the offline
+        // buffer (their originals were sent first). The container therefore
+        // stays in send order, not sequence order: pendingDeliveries.front() is
+        // the next-to-send (and, for the offline-buffer part, the oldest) entry,
+        // which is exactly what dropOldestQueued() compares against
+        // blockedDeliveries.front() to find the globally oldest message.
         // Now that the unacked inflight messages have been re-queued (still
         // occupying their window slots), promote any blocked messages that fit.
         releaseBlocked();
@@ -616,21 +623,29 @@ void Session::deliverRetained(const std::string &topicFilter, const Subscription
 void Session::pushDelivery(const Message &message, QoS qos,
                            const SubscriptionIdentifiers &subscriptionIdentifiers) {
     // Bound the per-session queue: a persistent session that stays offline
-    // would otherwise grow without limit. Once the cap is reached new messages
-    // are dropped rather than buffered forever. Blocked messages count toward
-    // the cap too, so flow control cannot bypass it.
+    // would otherwise grow without limit. Blocked messages count toward the cap
+    // too, so flow control cannot bypass it. What happens at the cap depends on
+    // the backpressure policy: drop the incoming message (DropNewest, the
+    // default and historical behaviour) or evict the oldest buffered message to
+    // keep the newest (DropOldest, opt-in FLOWMQ_QUEUE_DROP=oldest).
     if (pendingDeliveries.size() + blockedDeliveries.size() >= MAX_QUEUED_MESSAGES) {
-        logDebug("session %s: queue full (%zu), dropping message on %s", clientId.c_str(),
-                 pendingDeliveries.size() + blockedDeliveries.size(), message.topic.c_str());
-        // Backpressure: make the drop observable. The queue-full event is logged
-        // at debug (it can be chatty under sustained load), but the dropped count
-        // is always accumulated and exposed on $SYS/broker/messages/dropped when
-        // the monitoring tree is on, so an operator can see backpressure happening.
         if (broker) {
             broker->incrementMessagesDropped();
         }
-        return;
+        if (queueDropPolicy == QueueDropPolicy::DropNewest) {
+            logDebug("session %s: queue full (%zu), dropping message on %s", clientId.c_str(),
+                     pendingDeliveries.size() + blockedDeliveries.size(), message.topic.c_str());
+            return;
+        }
+        // DropOldest: evict the globally oldest buffered delivery until there is
+        // room, so the incoming (newest) message is always kept. A dropped QoS>0
+        // delivery that had claimed an inflight slot releases it, so the Receive
+        // Maximum window does not leak.
+        while (pendingDeliveries.size() + blockedDeliveries.size() >= MAX_QUEUED_MESSAGES) {
+            dropOldestQueued();
+        }
     }
+    const unsigned long long sequence = ++deliverySequence;
     Message outgoing = message;
     outgoing.qos = qos;
     // MQTT 5 flow control: a QoS 1/2 message may only enter the inflight set
@@ -647,7 +662,7 @@ void Session::pushDelivery(const Message &message, QoS qos,
         logDebug("session %s: receive maximum reached (%u), blocking message on %s",
                  clientId.c_str(), receiveMaximum, message.topic.c_str());
         blockedDeliveries.emplace_back(std::move(outgoing), /*packetId=*/0, qos,
-                                        subscriptionIdentifiers);
+                                       subscriptionIdentifiers, sequence);
         return;
     }
     uint16_t id = 0;
@@ -663,7 +678,54 @@ void Session::pushDelivery(const Message &message, QoS qos,
     }
     // Only queue while the broker lock is held (Broker::publish) or while this
     // session lock is held: flush() is then called outside of both.
-    pendingDeliveries.emplace_back(std::move(outgoing), id, qos, subscriptionIdentifiers);
+    pendingDeliveries.emplace_back(std::move(outgoing), id, qos, subscriptionIdentifiers, sequence);
+}
+
+void Session::releaseInflightIfPresent(uint16_t packetId) {
+    // Forget an inflight QoS>0 message and release its window slot without
+    // retransmitting it. Used when a queued copy is dropped before it was ever
+    // sent (the drop-oldest policy), so the Receive Maximum window does not leak.
+    // Called with deliveryMutex held.
+    bool freed = false;
+    if (inflightMessages.erase(packetId) > 0) {
+        freed = true;
+    }
+    if (inflightIdentifiers.erase(packetId) > 0) {
+        freed = true;
+    }
+    if (freed) {
+        notifyMutation();
+    }
+}
+
+void Session::dropOldestQueued() {
+    // Evict the globally oldest buffered delivery: the front of pendingDeliveries
+    // or the front of blockedDeliveries, whichever was inserted earlier (smaller
+    // sequence). Both are FIFO in publish order; the two fronts are the only
+    // candidates because any older entry would itself be a front. Called with
+    // deliveryMutex held and only when the queue is non-empty.
+    const bool takePending = !pendingDeliveries.empty() &&
+                             (blockedDeliveries.empty() ||
+                              pendingDeliveries.front().sequence <=
+                                  blockedDeliveries.front().sequence);
+    if (takePending) {
+        const Delivery dropped = std::move(pendingDeliveries.front());
+        pendingDeliveries.erase(pendingDeliveries.begin());
+        // A QoS>0 message sitting in pendingDeliveries has already claimed an
+        // inflight slot (it was assigned a packet id when queued). Release it or
+        // the Receive Maximum window leaks. A blocked message (packetId 0) never
+        // claimed a slot, so only a real id needs releasing.
+        if (dropped.qos != QoS::QOS_0 && dropped.packetId != 0) {
+            releaseInflightIfPresent(dropped.packetId);
+        }
+        logDebug("session %s: queue full, dropping oldest queued message on %s "
+                 "(drop-oldest backpressure)", clientId.c_str(), dropped.message.topic.c_str());
+        return;
+    }
+    const Delivery dropped = std::move(blockedDeliveries.front());
+    blockedDeliveries.erase(blockedDeliveries.begin());
+    logDebug("session %s: queue full, dropping oldest blocked message on %s "
+             "(drop-oldest backpressure)", clientId.c_str(), dropped.message.topic.c_str());
 }
 
 void Session::releaseBlocked() {

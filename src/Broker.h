@@ -21,6 +21,22 @@
 
 namespace MQTT {
 class Session;
+
+//! Backpressure policy for a session's delivery queue
+//! (pendingDeliveries + blockedDeliveries) when it reaches MAX_QUEUED_MESSAGES.
+//! Declared at namespace scope so any translation unit that includes Broker.h
+//! (even one that only forward-declares Session) can name and store it.
+enum class QueueDropPolicy {
+    //! Drop the incoming message, keep the buffered ones (the historical
+    //! default). Favourable when old data is the valuable data.
+    DropNewest,
+    //! Drop the oldest buffered message to make room for the incoming one, so
+    //! the client always sees the most recent traffic. Favourable for
+    //! real-time feeds where a stalled reader must not be buried in stale
+    //! messages. Opt-in via FLOWMQ_QUEUE_DROP=oldest; the default is unchanged.
+    DropOldest,
+};
+
 /*!
  * The broker owns all shared state (sessions, subscriptions, retained
  * messages). Every access goes through the internal lock, so callers must
@@ -110,6 +126,10 @@ class Broker {
     //! cannot saturate the broker's fan-out path with an unbounded burst.
     size_t maxPublishRate = 0;
 
+    //! Session backpressure policy when the delivery queue is full (see
+    //! QueueDropPolicy). DropNewest by default; set from FLOWMQ_QUEUE_DROP.
+    QueueDropPolicy queueDropPolicy = QueueDropPolicy::DropNewest;
+
     //! Keep alive the broker prefers, in seconds. 0 disables the override and
     //! the broker honours whatever the client asks for. When set, a client that
     //! asks for more (or for none) is told to use this value via the MQTT 5
@@ -176,6 +196,11 @@ public:
     //! unlimited, the default). Must be set before any client connects.
     void setMaxPublishRate(size_t rate) { maxPublishRate = rate; }
     size_t getMaxPublishRate() const { return maxPublishRate; }
+
+    //! Configure the session backpressure policy applied when a delivery queue is
+    //! full. Must be set before any client connects. Defaults to DropNewest.
+    void setQueueDropPolicy(QueueDropPolicy policy) { queueDropPolicy = policy; }
+    QueueDropPolicy getQueueDropPolicy() const { return queueDropPolicy; }
 
     //! Configure the keep alive the broker prefers (seconds; 0 keeps the
     //! client's own value). Must be set before any client connects.

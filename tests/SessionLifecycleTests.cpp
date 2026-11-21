@@ -147,6 +147,104 @@ TEST_F(SessionLifecycleTest, BackpressureDropsIncrementTheSysCounter)
         << "a full delivery queue must increment the dropped counter";
 }
 
+TEST_F(SessionLifecycleTest, DropOldestKeepsTheNewestWhenTheQueueIsFull)
+{
+    // FLOWMQ_QUEUE_DROP=oldest: when the delivery queue is full the broker evicts
+    // the oldest buffered message to admit the newest, so a reconnecting client
+    // sees the most recent traffic rather than a stale backlog. With the cap at
+    // Session::MAX_QUEUED_MESSAGES (1000), publishing 1001 distinct messages must
+    // drop index 0 and keep 1..1000.
+    broker.setQueueDropPolicy(QueueDropPolicy::DropOldest);
+    auto session = std::make_shared<Session>(&broker, "oldest");
+    session->connect(session, /*persistent=*/true);
+    session->subscribe("oldest/#", optionsFor());
+
+    for (size_t i = 0; i <= 1000; ++i) {
+        broker.publish(Message{"oldest/t", std::to_string(i), QoS::QOS_0,
+                               /*retain=*/false});
+    }
+
+    // Reconnect a fresh client (resume, not bindClient, so the offline buffer is
+    // kept) and observe which payloads survived the eviction.
+    auto client = std::make_shared<RecordingClient>();
+    session->resume(client, Version::MQTT5);
+    session->flush();
+
+    ASSERT_EQ(client->size(), 1000u);
+    auto payload = [](const Message &m) {
+        return std::string(m.payload.begin(), m.payload.end());
+    };
+    // The newest 1000 survive; the oldest (index 0) was evicted.
+    EXPECT_EQ(payload(client->delivered.front()), "1");
+    EXPECT_EQ(payload(client->delivered.back()), "1000");
+}
+
+TEST_F(SessionLifecycleTest, DropNewestKeepsTheOldestWhenTheQueueIsFull)
+{
+    // The default policy (and FLOWMQ_QUEUE_DROP=newest) drops the incoming
+    // message, so the buffered history is kept: index 0 survives, the last
+    // (index 1000) is dropped. This is the mirror of the drop-oldest test and
+    // guards the default against regressing.
+    broker.setQueueDropPolicy(QueueDropPolicy::DropNewest);
+    auto session = std::make_shared<Session>(&broker, "newest");
+    session->connect(session, /*persistent=*/true);
+    session->subscribe("newest/#", optionsFor());
+
+    for (size_t i = 0; i <= 1000; ++i) {
+        broker.publish(Message{"newest/t", std::to_string(i), QoS::QOS_0,
+                               /*retain=*/false});
+    }
+
+    auto client = std::make_shared<RecordingClient>();
+    session->resume(client, Version::MQTT5);
+    session->flush();
+
+    ASSERT_EQ(client->size(), 1000u);
+    auto payload = [](const Message &m) {
+        return std::string(m.payload.begin(), m.payload.end());
+    };
+    EXPECT_EQ(payload(client->delivered.front()), "0");
+    EXPECT_EQ(payload(client->delivered.back()), "999");
+}
+
+TEST_F(SessionLifecycleTest, DropOldestWithQoS1DoesNotLeakTheFlowControlWindow)
+{
+    // The subtle case: a QoS 1 message sitting in the delivery queue has already
+    // claimed an inflight packet-id slot. Evicting it (drop-oldest) must release
+    // that slot, or the Receive Maximum window leaks. The invariant to guard:
+    // after a burst that evicts, every queued QoS1 message holds exactly one
+    // inflight slot and every evicted one released its own, so the live inflight
+    // count equals the number of messages the queue actually kept.
+    broker.setQueueDropPolicy(QueueDropPolicy::DropOldest);
+    auto session = std::make_shared<Session>(&broker, "oldestqos1");
+    session->connect(session, /*persistent=*/true);
+    session->subscribe("oldestqos1/#", optionsFor(QoS::QOS_1));
+    // Make the flow-control window exactly the queue cap so a leaked slot (an
+    // evicted message whose id was never released) would over-subscribe it and
+    // force the incoming message into the blocked queue.
+    session->setReceiveMaximum(1000);
+
+    // One more than the cap: the oldest is evicted on the final publish.
+    for (size_t i = 0; i <= 1000; ++i) {
+        broker.publish(Message{"oldestqos1/t", std::to_string(i), QoS::QOS_1,
+                               /*retain=*/false});
+    }
+
+    auto client = std::make_shared<RecordingClient>();
+    session->resume(client, Version::MQTT5);
+    session->flush();
+
+    // The queue kept a full cap of messages...
+    ASSERT_EQ(client->size(), 1000u);
+    // ...and the flow-control window was not over-subscribed. With Receive
+    // Maximum equal to the queue cap, a leaked slot (an evicted QoS1 message
+    // whose id release was skipped) would leave the window full, forcing the
+    // incoming message into the blocked queue instead of admitting it. The
+    // correct build releases the evicted slot, so nothing is left blocked.
+    EXPECT_EQ(session->blockedCountForTest(), 0u)
+        << "evicting a queued QoS1 message must release its flow-control slot";
+}
+
 TEST_F(SessionLifecycleTest, SweepDropsAnExpiredSession)
 {
     auto session = std::make_shared<Session>(&broker, "sweep");

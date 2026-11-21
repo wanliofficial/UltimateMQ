@@ -181,9 +181,19 @@ public:
     //! may keep outstanding (sent, unacknowledged) to this client. Defaults to
     //! the protocol default of 65535, i.e. no effective limit.
     void setReceiveMaximum(uint16_t limit) { receiveMaximum = limit; }
+    //! Choose what happens when the delivery queue is full. DropNewest (the
+    //! default) drops the incoming message; DropOldest evicts the oldest buffered
+    //! message to keep the newest. Opt-in via FLOWMQ_QUEUE_DROP=oldest; the
+    //! default path is unchanged.
+    void setQueueDropPolicy(QueueDropPolicy policy) { queueDropPolicy = policy; }
     //! Test hook: position the outgoing Packet Identifier counter, so a test can
     //! reach the wrap-around of the 16-bit space without sending 65k messages.
     void setNextPacketIdForTest(uint16_t id) { packetId = id; }
+    //! Test hook: number of messages flow-blocked under the client's Receive
+    //! Maximum (QoS>0 admitted to the window but parked pending an inflight
+    //! slot). Lets a test assert that dropping a queued QoS>0 delivery released
+    //! its slot rather than over-subscribing the window.
+    size_t blockedCountForTest() { return blockedDeliveries.size(); }
 
 private:
     struct Delivery {
@@ -193,11 +203,18 @@ private:
         //! MQTT 5 Subscription Identifiers of the subscriptions that caused this
         //! delivery (empty for none); echoed on the PUBLISH (MQTT-3.3.4-3/-4).
         SubscriptionIdentifiers subscriptionIdentifiers;
+        //! Monotonic insertion order across pendingDeliveries and
+        //! blockedDeliveries, so "oldest" is well defined even when messages of
+        //! one queue are split across the two containers (the drop-oldest policy
+        //! compares the two fronts). Assigned once when the delivery is created.
+        unsigned long long sequence = 0;
 
         Delivery(Message message, uint16_t packetId, QoS qos,
-                 SubscriptionIdentifiers subscriptionIdentifiers = {})
+                 SubscriptionIdentifiers subscriptionIdentifiers = {},
+                 unsigned long long sequence = 0)
             : message(std::move(message)), packetId(packetId), qos(qos),
-              subscriptionIdentifiers(std::move(subscriptionIdentifiers)) {}
+              subscriptionIdentifiers(std::move(subscriptionIdentifiers)),
+              sequence(sequence) {}
     };
 
     std::string clientId;
@@ -214,6 +231,11 @@ private:
     //! Cap on outstanding (sent, unacknowledged) QoS 1/2 messages to the client
     uint16_t receiveMaximum = 65535;
     uint16_t packetId = 1;
+    //! Backpressure policy when the delivery queue is full (see QueueDropPolicy).
+    QueueDropPolicy queueDropPolicy = QueueDropPolicy::DropNewest;
+    //! Monotonic counter assigning each Delivery its insertion order; never reset
+    //! for the life of the session so the drop-oldest comparison is total.
+    unsigned long long deliverySequence = 0;
     std::set<uint16_t> awaitingPubrel;
     //! Outgoing QoS 2 packet ids for which this session has sent a PUBREL and is
     //! waiting for the matching PUBCOMP. If the connection drops in that state
@@ -248,6 +270,16 @@ private:
 
     void pushDelivery(const Message& message, QoS qos,
                       const SubscriptionIdentifiers& subscriptionIdentifiers = {});
+    //! Drop the single oldest buffered delivery (front of pendingDeliveries or
+    //! blockedDeliveries, by insertion sequence) to make room for a newer one.
+    //! Used by the drop-oldest backpressure policy. A dropped QoS>0 delivery
+    //! that had claimed an inflight slot releases it, so the Receive Maximum
+    //! window never leaks. Called with deliveryMutex held.
+    void dropOldestQueued();
+    //! Forget an inflight QoS>0 message and release its window slot without
+    //! retransmitting it (used when a queued copy is dropped before it was ever
+    //! sent). Called with deliveryMutex held.
+    void releaseInflightIfPresent(uint16_t packetId);
     void removeSubscriptions(const std::map<std::string, SubscriptionOptions>& filters);
     uint16_t nextPacketId();
     //! Move blocked QoS>0 messages into the inflight set / send queue while the
