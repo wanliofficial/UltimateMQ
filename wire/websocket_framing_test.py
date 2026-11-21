@@ -300,6 +300,53 @@ def case_wrapped_mqtt_round_trips():
         stop(proc, workdir)
 
 
+def case_rsv_bit_set_is_rejected():
+    """A frame with a reserved RSV bit set violates RFC 6455 §5.2 (the MQTT
+    binding negotiates no extensions) and must fail the connection with CLOSE
+    1002, not be processed as an ordinary data frame."""
+    proc, ws_port, workdir = start()
+    try:
+        c = ws_handshake(ws_port)
+        try:
+            # FIN + BINARY with RSV1 set (0x40), MASK + zero length. The payload
+            # is empty so nothing else needs to be sent.
+            c.sendall(bytes([0x82 | 0x40, 0x80 | 0]))
+            fin, opcode, payload = ws_recv_frame(c, 2.0)
+            assert opcode == OP_CLOSE, (
+                "expected CLOSE for a reserved-RSV frame, got opcode 0x%02x" % opcode)
+            status = close_status(payload)
+            assert status == CLOSE_PROTOCOL_ERROR, (
+                "expected CLOSE 1002 for a reserved RSV bit, got %d" % status)
+            return "a frame with RSV1 set is rejected with CLOSE 1002 (RFC 6455 §5.2)"
+        finally:
+            c.close()
+    finally:
+        stop(proc, workdir)
+
+
+def case_reserved_opcode_is_rejected():
+    """A reserved opcode (0x03, a non-control frame reserved for future use)
+    violates RFC 6455 §5.2 and must fail the connection with CLOSE 1002 rather
+    than being silently consumed."""
+    proc, ws_port, workdir = start()
+    try:
+        c = ws_handshake(ws_port)
+        try:
+            # FIN + reserved opcode 0x03, MASK + zero length.
+            c.sendall(bytes([0x83, 0x80 | 0]))
+            fin, opcode, payload = ws_recv_frame(c, 2.0)
+            assert opcode == OP_CLOSE, (
+                "expected CLOSE for a reserved opcode, got opcode 0x%02x" % opcode)
+            status = close_status(payload)
+            assert status == CLOSE_PROTOCOL_ERROR, (
+                "expected CLOSE 1002 for a reserved opcode, got %d" % status)
+            return "a reserved opcode (0x03) is rejected with CLOSE 1002 (RFC 6455 §5.2)"
+        finally:
+            c.close()
+    finally:
+        stop(proc, workdir)
+
+
 results = []
 
 
@@ -324,6 +371,10 @@ case("WebSocket: an oversized frame is rejected with CLOSE 1009 before its paylo
      case_oversized_frame_closed_before_buffering)
 case("WebSocket: a fragmented control frame (CLOSE, FIN=0) is rejected with CLOSE 1002 (RFC 6455 §5.5.1)",
      case_fragmented_control_frame_rejected)
+case("WebSocket: a frame with a reserved RSV bit set is rejected with CLOSE 1002 (RFC 6455 §5.2)",
+     case_rsv_bit_set_is_rejected)
+case("WebSocket: a frame with a reserved opcode (0x03) is rejected with CLOSE 1002 (RFC 6455 §5.2)",
+     case_reserved_opcode_is_rejected)
 case("WebSocket (control): a normal MQTT CONNECT/SUBSCRIBE/PUBLISH round-trips inside binary frames",
      case_wrapped_mqtt_round_trips)
 

@@ -305,6 +305,30 @@ bool WebSocketTransport::nextFrame() {
         }
         const uint8_t fin = raw_[0] & 0x80;
         const uint8_t opcode = raw_[0] & 0x0F;
+        // RFC 6455 §5.2: RSV1/RSV2/RSV3 MUST be 0 unless an extension is
+        // negotiated that defines them. The MQTT-over-WebSocket binding
+        // negotiates no extensions, so any set RSV bit is a protocol error and
+        // the connection must be failed. Checked before the length/mask are
+        // buffered so a malformed frame cannot make us read further bytes first.
+        if (raw_[0] & 0x70) {
+            logDebug("websocket: reserved RSV bit set, closing (1002)");
+            sendClose(1002);
+            closedByPeer_ = true;
+            return false;
+        }
+        // RFC 6455 §5.2: an unknown or reserved opcode (0x3-0x7 non-control,
+        // 0xB-0xF control) MUST fail the connection. The defined opcodes are
+        // 0x0-0x2 and 0x8-0xA; 0x1 (text) is rejected further down as it is not
+        // part of the MQTT binary framing, but the reserved range is a framing
+        // error and is refused here rather than silently dropped.
+        if (opcode == 0x03 || opcode == 0x04 || opcode == 0x05 || opcode == 0x06 ||
+            opcode == 0x07 || opcode == 0x0B || opcode == 0x0C || opcode == 0x0D ||
+            opcode == 0x0E || opcode == 0x0F) {
+            logDebug("websocket: reserved opcode 0x%02x, closing (1002)", opcode);
+            sendClose(1002);
+            closedByPeer_ = true;
+            return false;
+        }
         const bool masked = (raw_[1] & 0x80) != 0;
         uint64_t length = raw_[1] & 0x7F;
         size_t offset = 2;
