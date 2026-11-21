@@ -628,6 +628,20 @@ void Gateway::handleConnect(const sockaddr_in &addr, const Parsed &p) {
         sendConnack(addr, ReturnCode::NOT_SUPPORTED);
         return;
     }
+    // Bound the peer table before growing it. Every incomplete CONNECT leaves a
+    // Peer behind, and the keep-alive sweep in tick() cannot reap one whose
+    // keepAlive is still 0 - so without this cap a stream of CONNECTs from
+    // spoofed UDP source ports would grow the map without limit. Refusing an
+    // established peer is not possible here (every one of them is live and
+    // renewed by traffic), so a full table is answered like any busy gateway.
+    constexpr size_t maxPeers = 4096;
+    if (peers.size() >= maxPeers && peers.find(keyFor(addr)) == peers.end()) {
+        logInfo("mqtt-sn: peer table full (%zu), refusing CONNECT from %s", peers.size(),
+                keyFor(addr).c_str());
+        sendConnack(addr, ReturnCode::REJECTED_CONGESTION);
+        return;
+    }
+
     auto peer = peerFor(addr);
     const bool clean = p.flags.cleanSession;
     if (clean) {
