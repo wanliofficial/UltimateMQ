@@ -501,6 +501,19 @@ bool WebSocketTransport::writeAll(const uint8_t *buf, size_t len) {
     return sendFrame(0x02, buf, len); // one BINARY frame per write
 }
 
+ssize_t WebSocketTransport::writeSome(const uint8_t *buf, size_t len) {
+    // A WebSocket write unit is one complete masked BINARY frame (sendFrame
+    // builds the whole frame, including the payload, before touching the inner
+    // socket). So the buffered path can treat writeAll's bytes as one atomic
+    // unit: send it whole or report would-block, never a partial frame. The
+    // inner transport (a SecureTransport) already writes the frame bytes
+    // without blocking under the buffer, so delegating is safe.
+    if (closedByPeer_ && closeSent_) {
+        return -1;
+    }
+    return sendFrame(0x02, buf, len) ? static_cast<ssize_t>(len) : -1;
+}
+
 void WebSocketTransport::teardown() {
     sendClose(1000);
     inner_->teardown();

@@ -49,6 +49,10 @@ public:
     int readable(int timeoutMs) override;
     ssize_t readSome(uint8_t *buf, size_t max) override;
     bool writeAll(const uint8_t *buf, size_t len) override;
+
+    //! Non-blocking write of one whole unit (a complete masked BINARY frame);
+    //! see ClientTransport::writeSome.
+    ssize_t writeSome(const uint8_t *buf, size_t len) override;
     void teardown() override;
 
     //! The subprotocol negotiated in the handshake (empty when the client

@@ -292,6 +292,17 @@ public:
         return true;
     }
 
+    ssize_t writeSome(const uint8_t *buf, size_t len) override {
+        // msquic's StreamSend takes ownership of the buffer and completes the
+        // send asynchronously (copied in the callback), so a QUIC write unit is
+        // inherently whole and non-blocking from the caller's side: there is no
+        // partial-send or would-block to report. writeSome therefore mirrors
+        // writeAll (len on success, -1 when gone), and the buffered path simply
+        // never engages a POLLOUT retry for QUIC. Untestable on macOS (no
+        // buildable msquic); reviewed by reading only.
+        return writeAll(buf, len) ? static_cast<ssize_t>(len) : -1;
+    }
+
     void teardown() override {
         requestShutdown();
     }

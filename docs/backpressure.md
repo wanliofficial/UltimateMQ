@@ -142,6 +142,36 @@ inflight** 的消息。待你决定。
 **我的倾向**:C 的价值(慢消费者不被误踢)真实,但复杂度和回归风险显著高于 A。
 建议**最后做**,且先以最小实现(仅 TCP 明文 + TLS 两条,WebSocket 暂不)落地。
 
+**已落地(2026-11,完整 C2,全部三种传输)**:按"完整 C2 + 真上游背压"实现,默认
+不变(向后兼容)。实现要点:
+
+- **传输原语**:`ClientTransport::writeSome()` 新增——非阻塞写**一个完整传输写单元**
+  (明文 `::send`+`MSG_DONTWAIT`;TLS 单次 `SSL_write`=一个完整 record,
+  `WANT_WRITE`→视为 would-block 由调用方整单元重试,绝不撕开 record;WebSocket
+  委托 `sendFrame`=一个完整掩码帧;QUIC `StreamSend` 本就整单元异步)。默认实现
+  回退到 `writeAll`,未覆盖的传输保持原行为。
+- **Connection 写缓冲**:`sendPacket` 先 `writeSome` 直写;would-block 时把
+  **整单元**追加到有界 `std::deque<std::vector<uint8_t>>`(上限
+  `FLOWMQ_WRITE_BUFFER`),`runReadLoop` 在缓冲非空时以 `POLLIN|POLLOUT` 联打,
+  `POLLOUT` 就绪即 `drainWriteBuffer()` 续写。缓冲满=消费者确实跟不上→断连
+  (有界内存,不无限缓冲)。socket 被置 `O_NONBLOCK`,且**同时把内核 `SO_SNDBUF`
+  压到缓冲上限的一半**——否则自动调优会把内核缓冲撑到数 MB 吞掉慢读者输出,
+  使 socket 永不报告 would-block、写缓冲永不介入。
+- **背压语义(真上游背压)**:`deliver()` 对缓冲成功的消息返回 `true`("已提交"),
+  故 Receive Maximum 的 inflight slot 继续保留、直到 PUBACK/PUBCOMP 才释放
+  (现状如此,C 不改变这一点——已核实所有 slot 释放点都在 PUBACK/PUBCOMP/PUBREL
+  与丢最旧驱逐路径,写/缓冲路径绝不释放 slot)。瞬时慢→缓冲吸收、不踢;持续慢→
+  缓冲满或写停滞超 `writeTimeoutMs`→断连。读循环每轮都检查写停滞死线,故
+  **"持续 PINGREQ 但从不读"的 peer 仍会被踢**(否则入站流量会让 POLLIN 常热、
+  POLLOUT 从不触发,停滞死线永不执行而连接泄漏)。
+- **opt-in**:`FLOWMQ_WRITE_BUFFER=<bytes>`,默认 `0`(=关闭,即 C1 现状:阻塞
+  `writeAll`+写超时断连,socket 保持 blocking)。`Server.cpp` 读 env,非法值启动即
+  报错;`Broker::getWriteBufferBytes()` 在连接构造时快照。
+- **覆盖**:明文 + TLS 端到端可测;WebSocket 复用同一缓冲(整单元=整掩码帧);
+  QUIC 在 macOS 不可构建,仅阅读审查并标注,行为受同一默认关闭开关影响故构建无
+  回归。wire 探针 `write_buffer_test.py`(3 例):缓冲开启时慢读者被缓冲后完整送达、
+  关闭时同样洪水被踢、**持续 ping 但从不读仍因写停滞被踢**。304 单元测试 + wire 6/6。
+
 ## 三、建议的实施顺序
 
 1. **A(背压可观测性)** — 先做。零风险、立即有运维价值、是所有后续工作的

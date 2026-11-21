@@ -100,6 +100,14 @@ public:
     //! Write all of \p len bytes. Returns false if the peer is gone.
     bool writeAll(const uint8_t *buf, size_t len) override;
 
+    //! Non-blocking write of one whole unit (see ClientTransport::writeSome).
+    //! Plaintext: a single non-blocking ::send. TLS: one SSL_write, which emits a
+    //! whole record; SSL_ERROR_WANT_WRITE is reported as 0 (would-block) so the
+    //! caller buffers the unit and retries on POLLOUT without ever splitting the
+    //! record. Requires the socket to be non-blocking, which the write buffer
+    //! path arranges; the historical blocking writeAll path is unaffected.
+    ssize_t writeSome(const uint8_t *buf, size_t len) override;
+
     //! Send a TLS close_notify and release the SSL object (a no-op if plaintext)
     void teardown() override;
 

@@ -35,6 +35,7 @@ PROBES = [
     ("accept_backoff_test", "accept(): EMFILE/ENFILE backs off instead of spinning"),
     ("tls_handshake_timeout_test", "TLS handshake: a silent peer is dropped, not held forever"),
     ("mqttsn_large_publish_test", "MQTT-SN §5.2.1 three-octet Length field"),
+    ("write_buffer_test", "FLOWMQ_WRITE_BUFFER: a slow reader is buffered, not dropped"),
 ]
 
 

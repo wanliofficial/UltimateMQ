@@ -5,11 +5,13 @@
 #include <sys/socket.h>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <atomic>
 #include <functional>
+#include <vector>
 #include "MQTT.h"
 #include "Message.h"
 #include "Frame.h"
@@ -186,7 +188,29 @@ private:
     std::unique_ptr<ClientTransport> transport;
     static const int BUFFER_SIZE = 4096;
     uint8_t buffer[BUFFER_SIZE];
+
+    //! Per-connection outbound write buffer (bytes). 0 disables it (the default):
+    //! writes go straight to the transport with the historical blocking
+    //! writeAll + stall-timeout behaviour. When > 0, a write that the socket
+    //! cannot take immediately is buffered here (as whole transport write-units,
+    //! so a TLS record or WebSocket frame is never split) and drained on POLLOUT,
+    //! so a transiently slow reader does not stall the connection thread or get
+    //! the connection dropped; a peer that fills the buffer without ever draining
+    //! it is still dropped once a write makes no progress for writeTimeoutMs.
+    size_t writeBufferLimit = 0;
+    std::deque<std::vector<uint8_t>> writeBuffer;
+    size_t writeBufferBytes = 0;
+    bool writeBufferActive = false;
+    //! Steady-clock time of the last progress draining the write buffer; used to
+    //! drop a peer whose buffer never drains (writeTimeoutMs with no progress).
+    std::chrono::steady_clock::time_point lastWriteProgress;
+    //! Drain whole buffered write-units to the socket while it is writable. Drops
+    //! the connection on a write error or a sustained stall. Called from the read
+    //! loop on POLLOUT (and the loop also checks the stall deadline every
+    //! iteration, so a peer that keeps sending but never reads is still dropped).
+    void drainWriteBuffer();
 };
+
 } // namespace MQTT
 
 #endif

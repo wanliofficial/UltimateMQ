@@ -136,6 +136,13 @@ class Broker {
     //! Server Keep Alive property, so dead connections are always reaped.
     uint16_t serverKeepAlive = 0;
 
+    //! Per-connection outbound write buffer in bytes (opt-in via
+    //! FLOWMQ_WRITE_BUFFER). 0 (the default) disables it: writes use the
+    //! historical blocking writeAll + stall-timeout path unchanged. When > 0, a
+    //! write the socket cannot take immediately is buffered and drained on
+    //! POLLOUT, so a transiently slow reader is neither stalled nor dropped.
+    size_t writeBufferBytes = 0;
+
     //! Resolve the target sessions; called with the broker lock held.
     //! Each entry pairs the session with the subscription the delivery comes
     //! through, so the session can apply that subscription's options.
@@ -169,6 +176,11 @@ public:
     //! dropped. Must be set before any client connects.
     void setWriteTimeoutMs(int ms) { writeTimeoutMs = ms; }
     int getWriteTimeoutMs() const { return writeTimeoutMs; }
+
+    //! Configure the per-connection outbound write buffer (bytes; 0 disables it,
+    //! the default). Must be set before any client connects.
+    void setWriteBufferBytes(size_t bytes) { writeBufferBytes = bytes; }
+    size_t getWriteBufferBytes() const { return writeBufferBytes; }
 
     //! Configure the maximum number of subscriptions per session. Must be set
     //! before any client connects.

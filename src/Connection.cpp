@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <poll.h>
+#include <fcntl.h>
 #include <cerrno>
 #include <algorithm>
 #include <cstring>
@@ -18,6 +19,7 @@
 #include <iomanip>
 #include <memory>
 #include <atomic>
+#include <vector>
 #include <chrono>
 #include <random>
 #include "Log.h"
@@ -64,6 +66,32 @@ Connection::Connection(int sockfd, Broker* broker,
       auth(broker ? broker->getAuth() : nullptr),
       transport(std::move(ownedTransport)),
       lastActivity(std::chrono::steady_clock::now()) {
+    // The optional outbound write buffer: when enabled the socket is made
+    // non-blocking so writes that the kernel cannot take immediately return
+    // EAGAIN (routed into the buffer) instead of stalling the connection thread.
+    // With it disabled (the default) the socket stays blocking and the historical
+    // SO_SNDTIMEO + writeAll path is used unchanged.
+    if (broker && broker->getWriteBufferBytes() > 0) {
+        writeBufferLimit = broker->getWriteBufferBytes();
+        writeBufferActive = true;
+        const int flags = ::fcntl(sockfd, F_GETFL, 0);
+        if (flags >= 0) {
+            ::fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+        }
+        // Cap the kernel send buffer. Left alone it auto-tunes to several MB and
+        // silently swallows a slow reader's output, so the socket never reports
+        // "would block" and the write buffer below never engages -- the broker
+        // would happily queue megabytes of undeliverable data per connection.
+        // A bounded send buffer makes backpressure engage at a predictable point
+        // (the kernel buffer fills, the next write is would-block, overflow goes
+        // into the write buffer), bounding per-connection kernel memory. The
+        // value is doubled by the kernel for bookkeeping, so request half the
+        // intended ceiling.
+        const int sndbuf = static_cast<int>(writeBufferLimit / 2);
+        if (sndbuf > 0) {
+            ::setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+        }
+    }
     // Cap the packet size before any byte (including the first CONNECT) is read.
     // The version is fixed later, but the limit does not depend on it.
     frame.setMaxPacketSize(broker ? broker->getMaxPacketSize() : Frame::DEFAULT_MAX_PACKET_SIZE);
@@ -224,6 +252,22 @@ void Connection::runReadLoop() {
     //! the reason travels back to run() instead of closing here.
     bool keepAliveExpired = false;
     while (state != State::DISCONNECTED) {
+        // Enforce the outbound write-stall deadline even when the peer keeps
+        // sending (so POLLIN, never POLLOUT, refreshes lastActivity/keepalive)
+        // but never reads: the write buffer would otherwise never be drained and
+        // its stall check (in drainWriteBuffer) would never run. A peer that
+        // sends keepalives but will not read is too slow, not alive.
+        if (writeBufferActive && !writeBuffer.empty()) {
+            const auto stalledFor = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now() - lastWriteProgress)
+                                       .count();
+            if (stalledFor > writeTimeoutMs) {
+                logInfo("connection closed: outbound write stalled %lld ms (slow or dead reader)",
+                        (long long)stalledFor);
+                state = State::DISCONNECTED;
+                return;
+            }
+        }
         if (readTimeout.count() > 0) {
             auto deadline = lastActivity + readTimeout;
             auto now = std::chrono::steady_clock::now();
@@ -238,12 +282,45 @@ void Connection::runReadLoop() {
             int timeout = static_cast<int>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
             timeout = std::min(timeout, POLL_SLICE_MS);
-            int ready = transport->readable(timeout);
-            if (ready < 0) {
-                continue;
-            }
-            if (ready == 0) {
-                continue;
+            // With an active write buffer, poll both directions so a writable
+            // socket drains the buffer even when the peer sends nothing. Without
+            // it, fall back to the transport's own readable() (POLLIN only).
+            int ready;
+            if (writeBufferActive && !writeBuffer.empty()) {
+                struct pollfd pfd;
+                pfd.fd = transport->fd();
+                pfd.events = POLLIN | POLLOUT;
+                pfd.revents = 0;
+                ready = ::poll(&pfd, 1, timeout);
+                if (ready < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    ready = 1; // let the drain/read surface a real error
+                } else if (ready > 0) {
+                    if (pfd.revents & POLLOUT) {
+                        drainWriteBuffer();
+                    }
+                    if (state == State::DISCONNECTED) {
+                        return;
+                    }
+                    // Only read when the peer actually has data; a lone POLLOUT
+                    // wake-up must not turn into a (would-block) read.
+                    if (!(pfd.revents & POLLIN)) {
+                        continue;
+                    }
+                    ready = 1;
+                } else {
+                    continue; // timeout: keep watching the deadline
+                }
+            } else {
+                ready = transport->readable(timeout);
+                if (ready < 0) {
+                    continue;
+                }
+                if (ready == 0) {
+                    continue;
+                }
             }
         }
 
@@ -1408,12 +1485,82 @@ bool Connection::sendPacket(Packet &packet) {
                  data.size(), clientMaxPacketSize);
         return false;
     }
+    if (writeBufferActive) {
+        // Buffered path: try to write the whole packet without blocking. If the
+        // socket takes it, done. Otherwise buffer the whole unit (never a partial
+        // TLS record / WebSocket frame) for the read loop to drain on POLLOUT.
+        const ssize_t n = transport->writeSome(data.data(), data.size());
+        if (n < 0) {
+            state = State::DISCONNECTED; // peer gone
+            return false;
+        }
+        if (static_cast<size_t>(n) == data.size()) {
+            return true;
+        }
+        // Would-block: buffer the remainder. The whole unit is kept so the drain
+        // can re-send it from the front.
+        if (writeBufferBytes + (data.size() - static_cast<size_t>(n)) > writeBufferLimit) {
+            // The buffer is full: this reader is genuinely too slow to ever catch
+            // up, not just transiently behind. Drop the connection (the session
+            // and its inflight state are torn down in run()).
+            logInfo("connection closed: outbound write buffer full (slow reader)");
+            state = State::DISCONNECTED;
+            return false;
+        }
+        writeBuffer.emplace_back(data.begin() + n, data.end());
+        writeBufferBytes += data.size() - static_cast<size_t>(n);
+        lastWriteProgress = std::chrono::steady_clock::now();
+        return true;
+    }
     if (!transport->writeAll(data.data(), data.size())) {
         // The peer is gone; stop the connection on the next loop iteration
         state = State::DISCONNECTED;
         return false;
     }
     return true;
+}
+
+void Connection::drainWriteBuffer() {
+    std::lock_guard<std::recursive_mutex> lock(writeMutex);
+    if (writeBuffer.empty()) {
+        return;
+    }
+    // Drop a peer whose buffer has made no progress for longer than the write
+    // stall bound: it is gone, not merely slow.
+    const auto now = std::chrono::steady_clock::now();
+    const auto stalledFor = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                now - lastWriteProgress).count();
+    if (stalledFor > writeTimeoutMs) {
+        logInfo("connection closed: outbound write stalled %lld ms (slow or dead reader)",
+                (long long)stalledFor);
+        state = State::DISCONNECTED;
+        return;
+    }
+    while (!writeBuffer.empty()) {
+        auto &front = writeBuffer.front();
+        const ssize_t n = transport->writeSome(front.data(), front.size());
+        if (n < 0) {
+            state = State::DISCONNECTED;
+            return;
+        }
+        if (static_cast<size_t>(n) < front.size()) {
+            // Partial (would-block): keep the remainder buffered and wait for the
+            // next POLLOUT. Update the progress marker only when bytes moved.
+            if (n > 0) {
+                front.erase(front.begin(), front.begin() + n);
+                writeBufferBytes -= static_cast<size_t>(n);
+                lastWriteProgress = std::chrono::steady_clock::now();
+            }
+            return;
+        }
+        writeBufferBytes -= front.size();
+        writeBuffer.pop_front();
+        lastWriteProgress = std::chrono::steady_clock::now();
+    }
+    // Fully drained: let the session push anything it had to hold back.
+    if (session) {
+        session->flush();
+    }
 }
 
 } // namespace MQTT

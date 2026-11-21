@@ -410,6 +410,45 @@ bool SecureTransport::writeAll(const uint8_t *buf, size_t len) {
     return true;
 }
 
+ssize_t SecureTransport::writeSome(const uint8_t *buf, size_t len) {
+    if (len == 0) {
+        return 0;
+    }
+    if (!ssl_) {
+        // Plaintext: one non-blocking send. EAGAIN/EWOULDBLOCK means the kernel
+        // send buffer is full (a slow reader), so report would-block and let the
+        // caller buffer the unit. EINTR is retried. A dead peer is -1.
+        for (;;) {
+            ssize_t n = ::send(fd_, buf, len, MSG_NOSIGNAL | MSG_DONTWAIT);
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    return 0;
+                }
+                return -1;
+            }
+            return n;
+        }
+    }
+    // TLS: a single SSL_write emits exactly one record, so a partial record never
+    // reaches the peer (OpenSSL buffers the remainder internally and resumes on
+    // the next SSL_write of the same data). WANT_WRITE therefore means "the
+    // record did not fit yet": report would-block (0) and let the caller retry
+    // the whole unit on POLLOUT.
+    suppressSigPipe();
+    int n = SSL_write(ssl_, buf, static_cast<int>(len));
+    if (n > 0) {
+        return n;
+    }
+    int err = SSL_get_error(ssl_, n);
+    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+        return 0;
+    }
+    return -1;
+}
+
 void SecureTransport::teardown() {
     if (!ssl_) {
         return;

@@ -220,6 +220,26 @@ Server::Server(int port, size_t maxConnections)
         logInfo("write stall timeout: %d ms", broker->getWriteTimeoutMs());
     }
 
+    // Per-connection outbound write buffer (opt-in). When > 0, a write the socket
+    // cannot take immediately (a transiently slow reader) is buffered as whole
+    // transport write-units and drained on POLLOUT, so the connection thread is
+    // not stalled and the client is not dropped for being briefly behind. 0 (the
+    // default) keeps the historical blocking-write + stall-timeout path exactly.
+    // Must be set before any client connects.
+    const char* writeBuffer = getenv("FLOWMQ_WRITE_BUFFER");
+    if (writeBuffer && *writeBuffer) {
+        char* end = nullptr;
+        unsigned long long parsed = std::strtoull(writeBuffer, &end, 10);
+        if (end == writeBuffer || *end != '\0' || parsed == 0) {
+            delete broker;
+            broker = nullptr;
+            throw std::runtime_error(std::string("invalid FLOWMQ_WRITE_BUFFER: ") +
+                                     writeBuffer);
+        }
+        broker->setWriteBufferBytes(static_cast<size_t>(parsed));
+        logInfo("outbound write buffer: %zu bytes", broker->getWriteBufferBytes());
+    }
+
     // Per-session subscription limit: bounds how many topic filters one client
     // may register, so it cannot exhaust memory with an unbounded set.
     const char* maxSubscriptions = getenv("FLOWMQ_MAX_SUBSCRIPTIONS");

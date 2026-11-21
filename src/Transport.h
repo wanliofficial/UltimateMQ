@@ -48,6 +48,17 @@ public:
     virtual ssize_t readSome(uint8_t *buf, size_t max) = 0;
     //! Write all of \p len bytes. Returns false when the peer is gone.
     virtual bool writeAll(const uint8_t *buf, size_t len) = 0;
+    //! Write one whole transport unit without blocking. Used by the optional
+    //! per-connection write buffer (FLOWMQ_WRITE_BUFFER): a unit is exactly one
+    //! writeAll()'s bytes, so a TLS record or a masked WebSocket frame is never
+    //! split across a partial write. Returns the number of bytes accepted (== len
+    //! on success), 0 when the socket would block (the caller buffers the unit and
+    //! retries on POLLOUT), or -1 when the peer is gone. The default falls back to
+    //! a blocking writeAll() so a transport that does not override it keeps the
+    //! historical behaviour (and the buffer stays effectively disabled for it).
+    virtual ssize_t writeSome(const uint8_t *buf, size_t len) {
+        return writeAll(buf, len) ? static_cast<ssize_t>(len) : -1;
+    }
     //! Send whatever protocol-level goodbye the transport speaks and release
     //! its per-connection state.
     virtual void teardown() = 0;
