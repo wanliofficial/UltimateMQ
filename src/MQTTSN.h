@@ -87,8 +87,21 @@ struct Flags {
     uint8_t encode() const;
 };
 
-//! Encode one datagram: length octets (1 byte below 0xFF, else 0xFF plus a
-//! 16-bit length, §5.2.1) followed by the message type and its body.
+//! Largest total length a message can declare. §5.2.1: "If the first octet of
+//! the Length field is coded 0x01 then the Length field is 3-octet long ... The
+//! 3-octet format allows the encoding of message lengths up to 65535 octets."
+//! (The first octet is the marker 0x01, not 0xFF: a 0xFF there would make the
+//! one-octet length 255, which cannot describe a longer datagram.)
+inline constexpr size_t MAX_MESSAGE_LENGTH = 0xFFFF;
+
+//! Encode one datagram: the length field (§5.2.1), the MsgType, then the body.
+//! The Length field specifies "the total number of octets contained in the
+//! message (including the Length field itself)": one octet for a total below
+//! 256, otherwise the marker 0x01 followed by the total as a 16-bit big-endian
+//! value counting all three length octets plus the MsgType and body.
+//! Returns an empty vector when the message would not fit in 65535 octets,
+//! which is not representable at all (MQTT-SN has no fragmentation, §5.2.1) -
+//! better to refuse than to emit a datagram whose length field lies.
 std::vector<uint8_t> encode(MsgType type, const std::vector<uint8_t> &body);
 
 struct Parsed {

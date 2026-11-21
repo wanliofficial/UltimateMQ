@@ -50,15 +50,21 @@ uint8_t Flags::encode() const {
 
 std::vector<uint8_t> encode(MsgType type, const std::vector<uint8_t> &body) {
     std::vector<uint8_t> datagram;
-    // §5.2.1: the length field counts the whole datagram. One byte below 0xFF;
-    // 0xFF followed by a 16-bit big-endian length above that.
-    const size_t total = body.size() + 2; // length octet + MsgType
-    if (total < 0xFF) {
-        datagram.push_back(static_cast<uint8_t>(total));
+    // §5.2.1: the Length field counts the whole message, itself included. The
+    // one-octet form has to carry the value in a single octet, so anything that
+    // would need 256 or more (or whose value is the 0x01 marker) uses the
+    // three-octet form: 0x01, then the total as a 16-bit big-endian value.
+    const size_t oneOctetTotal = body.size() + 2; // length octet + MsgType
+    const size_t threeOctetTotal = body.size() + 4; // 3 length octets + MsgType
+    if (oneOctetTotal < 256) {
+        datagram.push_back(static_cast<uint8_t>(oneOctetTotal));
     } else {
-        datagram.push_back(0xFF);
-        datagram.push_back(static_cast<uint8_t>(total >> 8));
-        datagram.push_back(static_cast<uint8_t>(total & 0xFF));
+        if (threeOctetTotal > MAX_MESSAGE_LENGTH) {
+            return datagram; // not representable; sendTo() drops an empty vector
+        }
+        datagram.push_back(0x01);
+        datagram.push_back(static_cast<uint8_t>(threeOctetTotal >> 8));
+        datagram.push_back(static_cast<uint8_t>(threeOctetTotal & 0xFF));
     }
     datagram.push_back(static_cast<uint8_t>(type));
     datagram.insert(datagram.end(), body.begin(), body.end());
@@ -84,7 +90,12 @@ bool parse(const uint8_t *data, size_t length, Parsed *out) {
     }
     size_t offset = 0;
     size_t total = 0;
-    if (data[0] != 0xFF) {
+    // §5.2.1: a one-octet Length describes every message shorter than 256
+    // octets. The three-octet form is marked by a first octet of 0x01, and the
+    // two following octets are the total number of octets in the message,
+    // length field included. (0xFF is not the marker: it is the one-octet value
+    // 255, and a 255-octet message is a legal short datagram.)
+    if (data[0] != 0x01) {
         total = data[0];
         offset = 1;
     } else {
@@ -617,7 +628,6 @@ void Gateway::handleConnect(const sockaddr_in &addr, const Parsed &p) {
         sendConnack(addr, ReturnCode::NOT_SUPPORTED);
         return;
     }
-
     auto peer = peerFor(addr);
     const bool clean = p.flags.cleanSession;
     if (clean) {

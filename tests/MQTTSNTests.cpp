@@ -11,6 +11,17 @@ std::vector<uint8_t> datagramOf(std::initializer_list<uint8_t> bytes) {
     return std::vector<uint8_t>(bytes.begin(), bytes.end());
 }
 
+//! A QoS 0 PUBLISH body of exactly \p payloadOctets payload octets: flags (1),
+//! topic id (2), then the payload.
+std::vector<uint8_t> publishBodyOf(size_t payloadOctets) {
+    std::vector<uint8_t> body;
+    body.push_back(0x00);       // flags: QoS 0, normal topic id
+    body.push_back(0x00);       // topic id 0x0001
+    body.push_back(0x01);
+    body.insert(body.end(), payloadOctets, 0x5A);
+    return body;
+}
+
 } // namespace
 
 TEST(MQTTSNFlagsTest, EncodeDecodeRoundTrip)
@@ -42,14 +53,82 @@ TEST(MQTTSNCodecTest, ShortDatagramUsesOneByteLength)
 
 TEST(MQTTSNCodecTest, LongDatagramUsesThreeByteLength)
 {
-    // §5.2.1: a total of 0xFF or more switches to 0xFF + a 16-bit length
-    std::vector<uint8_t> body(300, 0xAB);
+    // §5.2.1: "the Length field is either 1- or 3-octet long and specifies the
+    // total number of octets contained in the message (including the Length
+    // field itself). If the first octet of the Length field is coded 0x01 then
+    // the Length field is 3-octet long."
+    const std::vector<uint8_t> body = publishBodyOf(297);
     const std::vector<uint8_t> datagram = encode(MsgType::PUBLISH, body);
     ASSERT_EQ(datagram.size(), body.size() + 4u);
-    EXPECT_EQ(datagram[0], 0xFF);
-    EXPECT_EQ(datagram[1], static_cast<uint8_t>((body.size() + 2) >> 8));
-    EXPECT_EQ(datagram[2], static_cast<uint8_t>((body.size() + 2) & 0xFF));
+    EXPECT_EQ(datagram[0], 0x01) << "the 3-octet marker is 0x01, not 0xFF";
+    // The declared total counts the 3 length octets, the MsgType and the body.
+    EXPECT_EQ(datagram[1], static_cast<uint8_t>((body.size() + 4) >> 8));
+    EXPECT_EQ(datagram[2], static_cast<uint8_t>((body.size() + 4) & 0xFF));
     EXPECT_EQ(datagram[3], static_cast<uint8_t>(MsgType::PUBLISH));
+    // A decoded message must re-parse: an encoder the decoder rejects would make
+    // every datagram over 255 octets undeliverable.
+    Parsed parsed;
+    ASSERT_TRUE(parse(datagram.data(), datagram.size(), &parsed));
+    EXPECT_EQ(parsed.type, MsgType::PUBLISH);
+    EXPECT_EQ(parsed.data.size(), 297u);
+}
+
+TEST(MQTTSNCodecTest, LongDatagramRoundTripsAtEveryLengthBoundary)
+{
+    // 253 body octets is the largest message that fits the one-octet form
+    // (253 + 2 = 255); 254 is the first that needs the three-octet form.
+    for (const size_t bodyOctets : {size_t(3), size_t(4), size_t(253), size_t(254),
+                                    size_t(255), size_t(300), size_t(4096)}) {
+        const std::vector<uint8_t> body = publishBodyOf(bodyOctets - 3);
+        ASSERT_EQ(body.size(), bodyOctets);
+        const std::vector<uint8_t> datagram = encode(MsgType::PUBLISH, body);
+        const size_t expectedTotal = bodyOctets + 2 <= 255 ? bodyOctets + 2 : bodyOctets + 4;
+        ASSERT_EQ(datagram.size(), expectedTotal) << "body=" << bodyOctets;
+
+        Parsed parsed;
+        ASSERT_TRUE(parse(datagram.data(), datagram.size(), &parsed)) << "body=" << bodyOctets;
+        EXPECT_EQ(parsed.type, MsgType::PUBLISH) << "body=" << bodyOctets;
+        // The payload is everything after the flags and the topic id.
+        EXPECT_EQ(parsed.data.size(), bodyOctets - 3) << "body=" << bodyOctets;
+    }
+}
+
+TEST(MQTTSNCodecTest, Length255StaysInTheOneOctetForm)
+{
+    // 0xFF in the first octet is the one-octet length 255, not a marker: a
+    // 255-octet message (253 body octets) is a legal short datagram.
+    const std::vector<uint8_t> body = publishBodyOf(250);
+    ASSERT_EQ(body.size(), 253u);
+    const std::vector<uint8_t> datagram = encode(MsgType::PUBLISH, body);
+    ASSERT_EQ(datagram.size(), 255u);
+    EXPECT_EQ(datagram[0], 0xFF);
+    EXPECT_EQ(datagram[1], static_cast<uint8_t>(MsgType::PUBLISH));
+
+    Parsed parsed;
+    ASSERT_TRUE(parse(datagram.data(), datagram.size(), &parsed));
+    EXPECT_EQ(parsed.data.size(), 250u);
+}
+
+TEST(MQTTSNCodecTest, OverlongMessageIsRefusedRatherThanMangled)
+{
+    // §5.2.1: "The 3-octet format allows the encoding of message lengths up to
+    // 65535 octets", and MQTT-SN has no fragmentation, so a bigger message
+    // cannot be sent at all. Emitting it would wrap the 16-bit length and give
+    // the peer a datagram whose length field lies; refuse instead.
+    EXPECT_TRUE(encode(MsgType::PUBLISH, publishBodyOf(65529)).empty()); // total 65536
+
+    // The largest representable message (65535 octets) still encodes, and the
+    // length field it emits is the real total.
+    const std::vector<uint8_t> body = publishBodyOf(65528); // 65531 + 4 = 65535
+    ASSERT_EQ(body.size(), 65531u);
+    const std::vector<uint8_t> datagram = encode(MsgType::PUBLISH, body);
+    ASSERT_EQ(datagram.size(), 65535u);
+    EXPECT_EQ(datagram[0], 0x01);
+    EXPECT_EQ(datagram[1], 0xFF);
+    EXPECT_EQ(datagram[2], 0xFF);
+    Parsed parsed;
+    ASSERT_TRUE(parse(datagram.data(), datagram.size(), &parsed));
+    EXPECT_EQ(parsed.data.size(), 65528u);
 }
 
 TEST(MQTTSNCodecTest, ConnectRoundTrip)
