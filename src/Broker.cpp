@@ -457,6 +457,16 @@ void Broker::publish(const Message &message) {
         std::lock_guard<std::recursive_mutex> lock(mutex);
         collectTargets(message, targets);
     }
+    const size_t delivered = dispatchTargets(targets, message);
+    // Count what actually reached a subscriber: one increment per delivery the
+    // broker handed to a session (live fan-out or retained). This backs the
+    // $SYS/broker/messages/sent topic.
+    incrementMessagesSent(static_cast<uint64_t>(delivered));
+}
+
+size_t Broker::dispatchTargets(
+    std::vector<std::pair<std::shared_ptr<Session>, std::string>> &targets,
+    const Message &message) {
     // A session reachable through several ordinary subscriptions (e.g. "a/#"
     // and "a/b") receives a single copy, while every share group is its own
     // subscription and keeps its own copy. Key the dedup on the session for
@@ -496,10 +506,7 @@ void Broker::publish(const Message &message) {
             dispatch.session->flush();
         }
     }
-    // Count what actually reached a subscriber: one increment per delivery the
-    // broker handed to a session (live fan-out or retained). This backs the
-    // $SYS/broker/messages/sent topic.
-    incrementMessagesSent(static_cast<uint64_t>(unique.size()));
+    return unique.size();
 }
 
 void Broker::collectTargets(
@@ -561,7 +568,6 @@ void Broker::collectTargets(
         }
     }
 }
-
 void Broker::setSysTopics(bool enabled) {
     sysTopicsEnabled = enabled;
     sysStartedAt = std::chrono::steady_clock::now();
@@ -751,31 +757,85 @@ std::map<std::string, std::string> Broker::sysTopicValues() const {
 }
 
 void Broker::refreshSysTopics() {
-    // Only the counts move on their own; a snapshot refresh keeps the retained
-    // $SYS messages current so a client that subscribes with "send on subscribe"
-    // sees live values. Called by the sweeper on its normal interval.
+    // The counts move on their own, so each sweep writes the current value as a
+    // retained message (so a client that subscribes later sees live values, via
+    // the "send on subscribe" retained path) AND fans the new value out to the
+    // clients already subscribed. Without the live fan-out a monitoring client
+    // would receive one snapshot at subscribe time and never see the gauge move
+    // again, which makes the whole tree useless for watching backpressure or
+    // in-flight pressure build.
     //
     // $SYS values are informational and refreshed every sweep, so a topic whose
-    // value did not change is left untouched: only a real change is written and
-    // reported to the persistence layer, keeping a steady-state broker from
-    // rewriting its state file every second. Updates are never fanned out live
-    // (a $SYS subscription receives them on the next subscribe, like any
-    // retained message).
+    // value did not change is skipped entirely: no retained rewrite, no fan-out,
+    // and no notification to the persistence layer. That keeps a steady-state
+    // broker from rewriting its state file (uptime alone changes every second)
+    // and from chattering the tree to subscribers when nothing moved.
     if (!sysTopicsEnabled) {
         return;
     }
-    for (const auto &[topic, value] : sysTopicValues()) {
+    // Each changed topic carries its own payload, so resolve its subscribers as a
+    // separate batch: dispatchTargets() fans one message out to one target list.
+    struct Update {
+        Message message;
+        std::vector<std::pair<std::shared_ptr<Session>, std::string>> targets;
+    };
+    std::vector<Update> updates;
+    {
         std::lock_guard<std::recursive_mutex> lock(mutex);
-        auto it = retainedMessages.find(topic);
-        if (it != retainedMessages.end() && it->second.payload ==
-                                              std::vector<uint8_t>(value.begin(), value.end())) {
-            continue;
+        for (const auto &[topic, value] : sysTopicValues()) {
+            auto it = retainedMessages.find(topic);
+            if (it != retainedMessages.end() &&
+                it->second.payload == std::vector<uint8_t>(value.begin(), value.end())) {
+                continue;
+            }
+            Update update;
+            update.message = Message(topic, value, QoS::QOS_0, /*retain=*/true);
+            retainedMessages[topic] = update.message;
+            // A $SYS refresh never marks the store dirty: the monitoring tree is
+            // excluded from the durable state (see snapshotState), so persisting
+            // it would rewrite the state file every sweep (uptime alone changes
+            // every second) with data that is discarded on the next start.
+            //
+            // Resolve the topic's subscribers directly rather than routing the
+            // message through collectTargets(): that would re-store it as
+            // retained (already done) and, worse, let the tree's own delivery be
+            // counted in $SYS/broker/messages/sent, a self-referential metric.
+            // The (session, filter) pairs are gathered now and dispatched outside
+            // the lock, exactly like ordinary live fan-out.
+            for (const auto &filter : trie->match(topic)) {
+                auto subs = subscriptions.find(filter);
+                if (subs != subscriptions.end()) {
+                    for (const auto &clientId : subs->second) {
+                        auto sessionIt = sessions.find(clientId);
+                        if (sessionIt != sessions.end() && sessionIt->second) {
+                            update.targets.emplace_back(sessionIt->second, filter);
+                        }
+                    }
+                }
+                // A $SYS topic is never shared, but resolve shared groups too so
+                // a "$share/g/$SYS/#" subscription keeps working like any other.
+                auto shared = sharedSubscriptions.find(filter);
+                if (shared != sharedSubscriptions.end()) {
+                    for (auto &[group, members] : shared->second) {
+                        auto session = nextSharedMember(filter, group, members);
+                        if (session) {
+                            update.targets.emplace_back(std::move(session),
+                                                        "$share/" + group + "/" + filter);
+                        }
+                    }
+                }
+            }
+            updates.push_back(std::move(update));
         }
-        retainedMessages[topic] = Message(topic, value, QoS::QOS_0, /*retain=*/true);
-        // A $SYS refresh never marks the store dirty: the monitoring tree is
-        // excluded from the durable state (see snapshotState), so persisting it
-        // would rewrite the state file every sweep (uptime alone changes every
-        // second) with data that is discarded on the next start anyway.
+    }
+    // Fan out outside the lock: ordinary delivery queues on each session and
+    // flushes it, so a $SYS subscriber sees every value change rather than one
+    // stale snapshot at subscribe time. A topic nobody subscribes to costs
+    // nothing beyond the retained write above.
+    for (auto &update : updates) {
+        if (!update.targets.empty()) {
+            dispatchTargets(update.targets, update.message);
+        }
     }
 }
 

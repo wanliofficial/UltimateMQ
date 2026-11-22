@@ -148,6 +148,13 @@ class Broker {
     //! through, so the session can apply that subscription's options.
     void collectTargets(const Message &message,
                         std::vector<std::pair<std::shared_ptr<Session>, std::string>> &targets);
+    //! Hand \p message to every target in \p targets exactly once, deduplicated
+    //! per session (ordinary subscriptions) or per share group (shared ones), and
+    //! flush each session's queue. Shared by publish() and the $SYS live fan-out.
+    //! Takes no broker lock; the caller resolves \p targets under the lock first.
+    //! Returns the number of sessions that received the message.
+    size_t dispatchTargets(std::vector<std::pair<std::shared_ptr<Session>, std::string>> &targets,
+                           const Message &message);
     //! Pick the member of one share group that receives the next message,
     //! advancing that group's round-robin cursor. Called with the lock held.
     std::shared_ptr<Session> nextSharedMember(const std::string &topicFilter,

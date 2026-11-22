@@ -35,14 +35,20 @@ size_t sysGetDisconnectsOther();
 
 //! Optional broker-side monitoring topic tree (the "$SYS/..." tree). When the
 //! feature is enabled the broker publishes its own counters as retained QoS 0
-//! messages; when a client subscribes to a $SYS filter it receives them through
-//! the ordinary retained-message path. While the feature is off the broker
-//! exposes no $SYS topic and a client publish to "$SYS/..." is ordinary traffic.
+//! messages and, as each value changes on the sweep, fans the new value out to
+//! the clients already subscribed. A client that subscribes therefore receives
+//! the current value once from the retained path and then every subsequent
+//! change as a live update (RETAIN cleared, MQTT-3.3.1-8), so a monitoring client
+//! sees the gauges move rather than one frozen snapshot. While the feature is off
+//! the broker exposes no $SYS topic and a client publish to "$SYS/..." is
+//! ordinary traffic.
 //!
-//! All $SYS topics are QoS 0 and are never fanned out live to ordinary
-//! subscribers. Publishing under "$SYS" is gated behind an explicit, documented
-//! switch (FLOWMQ_SYS_TOPICS): the default is off and the broker behaves
-//! exactly as before.
+//! All $SYS topics are QoS 0. The tree is never routed through the ordinary
+//! publish path, so its own delivery never counts toward
+//! $SYS/broker/messages/sent: the monitoring traffic does not observe itself.
+//! Publishing under "$SYS" is gated behind an explicit, documented switch
+//! (FLOWMQ_SYS_TOPICS): the default is off and the broker behaves exactly as
+//! before.
 //!
 //! Implemented topics:
 //!   $SYS/broker/clients/connected    number of currently connected clients

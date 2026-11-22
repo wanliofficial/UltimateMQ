@@ -36,6 +36,7 @@ PROBES = [
     ("tls_handshake_timeout_test", "TLS handshake: a silent peer is dropped, not held forever"),
     ("mqttsn_large_publish_test", "MQTT-SN §5.2.1 three-octet Length field"),
     ("write_buffer_test", "FLOWMQ_WRITE_BUFFER: a slow reader is buffered, not dropped"),
+    ("sys_topics_test", "FLOWMQ_SYS_TOPICS: $SYS tree live updates, §4.7.2-1, §4.1.2-2, off by default"),
 ]
 
 

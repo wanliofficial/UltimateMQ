@@ -748,13 +748,25 @@ keeps them current on the normal sweep interval:
 
 | Topic | Payload |
 | --- | --- |
-| `$SYS/broker/clients/connected` | number of currently connected clients |
+| `$SYS/broker/clients/connected` | number of currently connected clients (live gauge) |
 | `$SYS/broker/clients/total` | number of sessions the broker holds |
+| `$SYS/broker/subscriptions/count` | subscription instances routed, normal + shared |
+| `$SYS/broker/inflight/count` | QoS 1/2 messages sent but not yet acknowledged (Receive Maximum occupancy) |
 | `$SYS/broker/messages/sent` | total `PUBLISH`es delivered to subscribers |
 | `$SYS/broker/messages/received` | total `PUBLISH`es accepted from clients |
-| `$SYS/broker/retaineds/count` | number of retained messages held |
+| `$SYS/broker/messages/dropped` | total `PUBLISH`es dropped under backpressure |
+| `$SYS/broker/retaineds/count` | number of retained messages held (excluding the tree) |
+| `$SYS/broker/writebuffer/bytes` | live outbound socket write-buffer bytes (live gauge) |
+| `$SYS/broker/queued/bytes` | live in-memory bytes of undelivered messages (live gauge) |
 | `$SYS/broker/uptime` | seconds since the broker started |
 | `$SYS/broker/load` | 1-minute load average |
+| `$SYS/broker/disconnect/{keepalive,protocol,quota,auth,normal,other}` | connections ended, by cause |
+
+The three backpressure gauges tell one story in sequence: `queued/bytes` rises
+first (messages queued in-process for a slow consumer), then
+`writebuffer/bytes` (buffered for the socket), and only after a real loss does
+`messages/dropped` move. Watching them together shows pressure building *before*
+anything is discarded.
 
 A client reads them by subscribing to a `$SYS` filter, e.g. `$SYS/#`:
 
@@ -766,8 +778,14 @@ Two rules apply (MQTT-4.7.2-1 / 4.1.2-2): a leading-level wildcard (`#`,
 `+`) never matches a `$SYS` topic, so only an explicit `$SYS/...` subscription
 reaches the tree; and while the feature is on, a client **publish** into the
 tree is refused (QoS 1/2 get `NOT_AUTHORIZED`, QoS 0 a `DISCONNECT`), so only
-the broker can write it. The counters are informational snapshots and are not
-fanned out live — a subscriber receives the current value on its next subscribe.
+the broker can write it.
+
+A subscriber receives the current value once from the retained path and then
+every subsequent change as a **live update** (with `RETAIN` cleared, as
+MQTT-3.3.1-8 requires when forwarding), so the gauges move in a monitoring
+client instead of freezing at subscribe time. The tree is never routed through
+the ordinary publish path, so its own traffic does not count toward
+`$SYS/broker/messages/sent`.
 
 ## Contributing
 

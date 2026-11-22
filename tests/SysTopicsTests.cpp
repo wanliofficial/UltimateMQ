@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <chrono>
+#include <thread>
 
 #include "../src/Broker.h"
 #include "../src/Session.h"
@@ -387,6 +389,64 @@ TEST(SysTopicsTest, InflightCountTracksQoSFlowControlOccupancy)
     // Only the PUBCOMP completes the QoS 2 handshake and frees the slot.
     session->pubcomp(qos2Id);
     EXPECT_EQ(count(), 0u);
+}
+
+TEST(SysTopicsTest, RefreshFansUpdatesOutToLiveSubscribers)
+{
+    // A $SYS subscriber must keep receiving updates as the gauges move, not just
+    // the one snapshot delivered at subscribe time (the retained path). Otherwise
+    // queued/bytes, inflight/count and friends are frozen at whatever they were
+    // when the operator subscribed, which makes the tree useless for watching
+    // pressure build. refreshSysTopics() therefore fans each changed value out to
+    // the current subscribers as ordinary live delivery -- with RETAIN cleared by
+    // Session::deliver() (MQTT-3.3.1-8), unlike the retained snapshot.
+    Broker broker;
+    broker.setSysTopics(true);
+    broker.sweepExpiredSessions(); // populate the retained tree
+
+    auto watcher = std::make_shared<Session>(&broker, "sys-watch");
+    watcher->connect(watcher, /*persistent=*/true);
+    auto client = test::attach(*watcher);
+    watcher->subscribe("$SYS/broker/uptime", SubscriptionOptions{});
+    // The retained snapshot is delivered by the subscribe path, not by
+    // refreshSysTopics(); drain it so the next deliveries are pure live updates.
+    const size_t afterSnapshot = client->size();
+
+    // Uptime advances every second; move enough that the value really changes so
+    // refreshSysTopics() has a new value to fan out, then refresh a few times.
+    size_t updates = 0;
+    for (int i = 0; i < 40 && updates == 0; ++i) {
+        broker.refreshSysTopics();
+        updates = client->size() - afterSnapshot;
+        if (updates == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_GT(updates, 0u)
+        << "refreshSysTopics() never delivered a live update to a $SYS subscriber";
+    auto delivered = client->snapshot();
+    ASSERT_GT(delivered.size(), afterSnapshot);
+    EXPECT_EQ(delivered.back().topic, "$SYS/broker/uptime");
+    // Live forwarding clears RETAIN (MQTT-3.3.1-8); only the snapshot carries it.
+    EXPECT_FALSE(delivered.back().retain)
+        << "a live $SYS update kept the RETAIN flag set; MQTT-3.3.1-8 requires it cleared";
+
+    // The fan-out must not count itself: no $SYS delivery may inflate
+    // $SYS/broker/messages/sent, or the monitoring traffic would show up as
+    // client-facing message throughput. Keep refreshing until at least one more
+    // update is actually fanned out, and require the counter not to move.
+    const size_t sentBefore = sysGetTotalSent();
+    const size_t deliveredBefore = client->size();
+    for (int i = 0; i < 40 && client->size() == deliveredBefore; ++i) {
+        broker.refreshSysTopics();
+        if (client->size() == deliveredBefore) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_GT(client->size(), deliveredBefore)
+        << "no further $SYS update was fanned out, so the self-count check cannot run";
+    EXPECT_EQ(sysGetTotalSent(), sentBefore)
+        << "$SYS fan-out was counted in messages/sent";
 }
 
 TEST(SysTopicsTest, InflightCountIsInTheMonitoringTree)
