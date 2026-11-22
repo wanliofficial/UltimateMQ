@@ -39,16 +39,17 @@ TEST(SysTopicsTest, PublishesEveryMonitoringTopic)
     // The broker refreshes exactly the topics it advertises, so each name in
     // allTopics() must produce a payload.
     for (const std::string &topic : SysTopics::allTopics()) {
-        EXPECT_FALSE(SysTopics::payload(topic, 1, 1, 1).empty())
+        EXPECT_FALSE(SysTopics::payload(topic, 1, 1, 1, 1).empty())
             << "no payload for " << topic;
     }
 }
 
 TEST(SysTopicsTest, CountsAreReportedAsDecimalNumbers)
 {
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/clients/connected", 3, 3, 0), "3");
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/clients/total", 0, 7, 0), "7");
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/retaineds/count", 0, 0, 0), "0");
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/clients/connected", 3, 3, 0, 0), "3");
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/clients/total", 0, 7, 0, 0), "7");
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/subscriptions/count", 0, 0, 5, 0), "5");
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/retaineds/count", 0, 0, 0, 4), "4");
 }
 
 TEST(SysTopicsTest, DroppedCountReflectsTheProcessCounter)
@@ -57,9 +58,9 @@ TEST(SysTopicsTest, DroppedCountReflectsTheProcessCounter)
     // connected/sessions/retained topics its value comes from a process-wide
     // counter (the same one sent/received use), not from the arguments, so a
     // subscriber sees the live cumulative drop count as a plain decimal.
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/messages/dropped", 0, 0, 0),
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/messages/dropped", 0, 0, 0, 0),
               std::to_string(sysGetTotalDropped()));
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/messages/dropped", 99, 0, 0),
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/messages/dropped", 99, 0, 0, 0),
               std::to_string(sysGetTotalDropped()));
 }
 
@@ -86,10 +87,10 @@ TEST(SysTopicsTest, WriteBufferBytesIsTheLiveGauge)
     // counters passed into payload(); it reads the live write-buffer occupancy
     // directly, so a subscriber sees current buffering as a plain decimal that
     // rises while a slow reader is behind and falls again as it drains.
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/writebuffer/bytes", 7, 7, 7),
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/writebuffer/bytes", 7, 7, 7, 7),
               std::to_string(sysGetWriteBufferBytes()));
     // The connected-clients gauge is the other live value exposed this way.
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/clients/connected", 0, 0, 0),
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/clients/connected", 0, 0, 0, 0),
               std::to_string(sysGetConnectedClients()));
 }
 
@@ -131,7 +132,7 @@ TEST(SysTopicsTest, QueuedBytesIsTheLiveGauge)
     // queues messages for slow consumers and falls as they are flushed, dropped
     // or acknowledged -- the stage of backpressure that writebuffer/bytes (the
     // socket) and messages/dropped (post-loss) cannot show.
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/queued/bytes", 7, 7, 7),
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/queued/bytes", 7, 7, 7, 7),
               std::to_string(sysGetQueuedBytes()));
 }
 
@@ -237,13 +238,77 @@ TEST(SysTopicsTest, DisconnectCategoriesClassifyEveryReason)
 
 TEST(SysTopicsTest, UnknownTopicYieldsNoPayload)
 {
-    EXPECT_TRUE(SysTopics::payload("$SYS/does/not/exist", 0, 0, 0).empty());
-    EXPECT_TRUE(SysTopics::payload("not/sys", 0, 0, 0).empty());
+    EXPECT_TRUE(SysTopics::payload("$SYS/does/not/exist", 0, 0, 0, 0).empty());
+    EXPECT_TRUE(SysTopics::payload("not/sys", 0, 0, 0, 0).empty());
 }
 
-// The next three tests exercise the broker-level behaviour of the $SYS tree:
+// The next tests exercise the broker-level behaviour of the $SYS tree:
 // what it counts, and what it does to the durable state. They use a real Broker
 // because the pure SysTopics::payload() helper cannot see the retained set.
+
+TEST(SysTopicsTest, SubscriptionCountTracksNormalAndShared)
+{
+    // $SYS/broker/subscriptions/count reports the total subscription INSTANCES the
+    // broker routes: every (client, filter) normal subscription plus every shared
+    // subscription member (which lives only in the shared-subscription map). It is
+    // the fan-out workload / routing-table pressure in one number -- the capacity
+    // complement to clients/total (how many sessions) and the backpressure gauges.
+    Broker broker;
+    broker.setSysTopics(true);
+    broker.sweepExpiredSessions();
+    auto count = [&] {
+        broker.refreshSysTopics();
+        auto values = broker.sysTopicValues();
+        auto it = values.find("$SYS/broker/subscriptions/count");
+        return it == values.end() ? 0u : std::stoul(it->second);
+    };
+
+    ASSERT_EQ(count(), 0u);
+
+    // Two normal subscriptions on one client.
+    auto a = std::make_shared<Session>(&broker, "sub-a");
+    a->connect(a, /*persistent=*/true);
+    a->subscribe("a/#", SubscriptionOptions{});
+    a->subscribe("b/c", SubscriptionOptions{});
+    broker.sweepExpiredSessions();
+    EXPECT_EQ(count(), 2u);
+
+    // A normal + a shared subscription on a second client. The shared one lands
+    // only in the shared-subscription map, so it must be counted from there.
+    auto b = std::make_shared<Session>(&broker, "sub-b");
+    b->connect(b, /*persistent=*/true);
+    b->subscribe("a/#", SubscriptionOptions{});
+    b->subscribe("$share/grp/t/#", SubscriptionOptions{});
+    broker.sweepExpiredSessions();
+    EXPECT_EQ(count(), 4u); // 3 normal (a:2 + b:1) + 1 shared member
+
+    // A second member in the SAME share group on the SAME filter adds one
+    // instance (per-member counting, not per-filter).
+    auto c = std::make_shared<Session>(&broker, "sub-c");
+    c->connect(c, /*persistent=*/true);
+    c->subscribe("$share/grp/t/#", SubscriptionOptions{});
+    broker.sweepExpiredSessions();
+    EXPECT_EQ(count(), 5u);
+
+    // Unsubscribing removes exactly the instance that left.
+    a->unsubscribe("a/#");
+    broker.sweepExpiredSessions();
+    EXPECT_EQ(count(), 4u);
+}
+
+TEST(SysTopicsTest, SubscriptionCountIsInTheMonitoringTree)
+{
+    EXPECT_EQ(SysTopics::matchedCount("$SYS/broker/subscriptions/count"), 1u);
+    EXPECT_EQ(SysTopics::matchedCount("$SYS/#"), SysTopics::allTopics().size());
+    bool found = false;
+    for (const auto &topic : SysTopics::allTopics()) {
+        if (topic == "$SYS/broker/subscriptions/count") {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found) << "subscriptions/count topic missing from allTopics()";
+}
 
 TEST(SysTopicsTest, RetainedCountExcludesTheMonitoringTree)
 {

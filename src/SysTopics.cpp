@@ -18,6 +18,7 @@ namespace {
 const std::vector<std::string> kTopics = {
     "$SYS/broker/clients/connected",
     "$SYS/broker/clients/total",
+    "$SYS/broker/subscriptions/count",
     "$SYS/broker/disconnect/keepalive",
     "$SYS/broker/disconnect/protocol",
     "$SYS/broker/disconnect/quota",
@@ -74,12 +75,15 @@ size_t matchedCount(const std::string &topicFilter) {
 }
 
 std::string payload(const std::string &topic, size_t connected, size_t sessions,
-                    size_t retained) {
+                    size_t subscriptions, size_t retained) {
     if (topic == "$SYS/broker/clients/connected") {
         return numberPayload(connected);
     }
     if (topic == "$SYS/broker/clients/total") {
         return numberPayload(sessions);
+    }
+    if (topic == "$SYS/broker/subscriptions/count") {
+        return numberPayload(subscriptions);
     }
     if (topic == "$SYS/broker/disconnect/keepalive") {
         return numberPayload(sysGetDisconnectsKeepAlive());

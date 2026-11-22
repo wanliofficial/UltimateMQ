@@ -697,6 +697,7 @@ std::map<std::string, std::string> Broker::sysTopicValues() const {
     size_t connected = 0;
     size_t sessionCount = 0;
     size_t retainedCount = 0;
+    size_t subscriptionCount = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(mutex);
         for (const auto &[clientId, session] : sessions) {
@@ -705,6 +706,20 @@ std::map<std::string, std::string> Broker::sysTopicValues() const {
             }
         }
         sessionCount = sessions.size();
+        // Total subscription instances the broker routes: every (client, filter)
+        // normal subscription in `subscriptions`, plus every shared-subscription
+        // member (which lives only in `sharedSubscriptions`, not `subscriptions`).
+        // This is the fan-out workload and routing-table pressure in one number,
+        // the capacity-planning complement to clients/total (how many sessions)
+        // and the backpressure gauges (how hard each one is pushed).
+        for (const auto &[filter, clients] : subscriptions) {
+            subscriptionCount += clients.size();
+        }
+        for (const auto &[filter, groups] : sharedSubscriptions) {
+            for (const auto &[group, members] : groups) {
+                subscriptionCount += members.size();
+            }
+        }
         // $SYS/broker/retaineds/count reports the retained messages clients have
         // published, not the broker's own monitoring tree: counting the $SYS
         // topics here would fold the tree into its own metric (and grow it every
@@ -716,7 +731,8 @@ std::map<std::string, std::string> Broker::sysTopicValues() const {
         }
     }
     for (const std::string &topic : SysTopics::allTopics()) {
-        const std::string value = SysTopics::payload(topic, connected, sessionCount, retainedCount);
+        const std::string value =
+            SysTopics::payload(topic, connected, sessionCount, subscriptionCount, retainedCount);
         if (!value.empty()) {
             values[topic] = value;
         }

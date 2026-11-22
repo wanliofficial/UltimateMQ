@@ -47,6 +47,7 @@ size_t sysGetDisconnectsOther();
 //! Implemented topics:
 //!   $SYS/broker/clients/connected    number of currently connected clients
 //!   $SYS/broker/clients/total        number of sessions the broker holds
+//!   $SYS/broker/subscriptions/count  total subscription instances the broker routes (normal + shared)
 //!   $SYS/broker/disconnect/keepalive cumulative disconnects on keep-alive timeout
 //!   $SYS/broker/disconnect/protocol  cumulative disconnects on a protocol/malformed violation
 //!   $SYS/broker/disconnect/quota     cumulative disconnects on a rate/connection quota
@@ -78,12 +79,13 @@ const std::vector<std::string> &allTopics();
 //! be a concrete name or a wildcard; a leading level wildcard matches none.
 size_t matchedCount(const std::string &topicFilter);
 
-//! Build the payload of one $SYS topic from the broker's counters. All four
-//! counts are read under the broker lock by the caller; the rest use
+//! Build the payload of one $SYS topic from the broker's counters. All the
+//! counts (connected clients, sessions, subscription instances, retained
+//! messages) are read under the broker lock by the caller; the rest use
 //! process-wide state, so the payload of a single topic is internally
 //! consistent. Returns an empty string for an unknown topic.
 std::string payload(const std::string &topic, size_t connected, size_t sessions,
-                    size_t retained);
+                    size_t subscriptions, size_t retained);
 
 } // namespace SysTopics
 
