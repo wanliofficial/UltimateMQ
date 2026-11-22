@@ -212,6 +212,45 @@ TEST(StoreTest, RejectsAnOutOfRangeQos)
     ::remove(path.c_str());
 }
 
+TEST(StoreTest, RejectsAnOutOfRangeNextPacketId)
+{
+    // nextPacketId is a Packet Identifier (MQTT §1.5.1: 1..65535). The writer
+    // only ever emits a uint16_t, so a larger value in the file is corruption;
+    // casting it would wrap silently (100000 -> 34464) and could collide with an
+    // in-flight message on resume (MQTT-2.2.1-4). It must be rejected on load.
+    const std::string path = tempPath("badnpid.dat");
+    // session <clientHex> <userHex=-=> <nextPacketId=100000> <expiry=->
+    writeRaw(path, "FLOWMQ-STATE-1\n"
+                   "session 63 - 100000 -\n");
+    Store store(path, std::chrono::milliseconds(10));
+
+    PersistedState state;
+    std::string error;
+    EXPECT_FALSE(store.load(state, &error));
+    EXPECT_NE(error.find("nextPacketId"), std::string::npos) << error;
+
+    ::remove(path.c_str());
+}
+
+TEST(StoreTest, AcceptsTheLargestLegalNextPacketId)
+{
+    // 65535 is the top of the Packet Identifier space and the boundary must stay
+    // legal (an off-by-one that rejected it would break a session that happens to
+    // have wrapped its counter to the maximum).
+    const std::string path = tempPath("maxnpid.dat");
+    writeRaw(path, "FLOWMQ-STATE-1\n"
+                   "session 63 - 65535 -\n");
+    Store store(path, std::chrono::milliseconds(10));
+
+    PersistedState state;
+    std::string error;
+    ASSERT_TRUE(store.load(state, &error)) << error;
+    ASSERT_EQ(state.sessions.size(), 1U);
+    EXPECT_EQ(state.sessions[0].nextPacketId, 65535);
+
+    ::remove(path.c_str());
+}
+
 TEST(StoreTest, RejectsAnOutOfRangeSubscriptionOption)
 {
     const std::string path = tempPath("badsub.dat");

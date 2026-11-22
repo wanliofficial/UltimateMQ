@@ -620,12 +620,12 @@ bool Store::load(PersistedState &out, std::string *error) const {
             }
             out.retained[m.topic] = m;
         } else if (kind == "session") {
-            std::string clientHex, userHex;
+            std::string clientHex, userHex, nextIdToken;
             unsigned nextId = 1;
             // Skip leading blanks so an empty field cannot shift the rest
             // Fields are whitespace separated; an empty username is written as
             // the literal "-" so the column count never shifts
-            if (!(ss >> clientHex >> userHex >> nextId)) {
+            if (!(ss >> clientHex >> userHex >> nextIdToken)) {
                 if (error) *error = "bad session record at line " + std::to_string(lineNo);
                 return false;
             }
@@ -640,6 +640,20 @@ bool Store::load(PersistedState &out, std::string *error) const {
             } else if (!fromHexField(userHex, session.username)) {
                 if (error) *error = "bad hex in session record at line " + std::to_string(lineNo);
                 return false;
+            }
+            // nextPacketId is a Packet Identifier (MQTT §1.5.1: 1..65535). The
+            // writer only ever emits a uint16_t, so a value above 65535 is a
+            // corrupt file: casting it would wrap silently to a different id and
+            // could collide with an in-flight message on resume (MQTT-2.2.1-4).
+            // 0 is tolerated (restore() maps it to 1) for older files.
+            {
+                unsigned long long packed = 0;
+                if (!parseUnsigned(nextIdToken, packed) || packed > 0xFFFF) {
+                    if (error) *error = "nextPacketId out of range in session record at line " +
+                                        std::to_string(lineNo);
+                    return false;
+                }
+                nextId = static_cast<unsigned>(packed);
             }
             session.nextPacketId = static_cast<uint16_t>(nextId);
             // Optional remaining Session Expiry interval; absent in older state.
