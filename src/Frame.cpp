@@ -804,6 +804,41 @@ PublishPacket Frame::parsePublish(const FixedHeader &header, const uint8_t *buff
     return publish;
 }
 
+//! Whether \p code is a Reason Code the packet type may carry on an incoming
+//! acknowledgement. The specification pins the legal set per ack and makes a
+//! code outside it a Malformed Packet:
+//!   PUBACK / PUBREC (§3.4.2.1 / §3.5.2.1): 0x00, 0x10, 0x80, 0x83, 0x87,
+//!       0x90, 0x91, 0x97, 0x99
+//!   PUBREL  (§3.6.2.1) and PUBCOMP (§3.7.2.1): 0x00, 0x92
+//! A Server receiving anything else must treat the packet as malformed rather
+//! than silently reading an out-of-range value into the flow.
+bool isLegalAckReason(Frame::PropertyContext context, uint8_t code) {
+    switch (context) {
+    case Frame::PropertyContext::PUBACK:
+    case Frame::PropertyContext::PUBREC:
+        switch (code) {
+        case static_cast<uint8_t>(ReasonCode::SUCCESS):
+        case static_cast<uint8_t>(ReasonCode::NO_MATCHING_SUBSCRIBERS):
+        case static_cast<uint8_t>(ReasonCode::UNSPECIFIED_ERROR):
+        case static_cast<uint8_t>(ReasonCode::IMPLEMENTATION_SPECIFIC_ERROR):
+        case static_cast<uint8_t>(ReasonCode::NOT_AUTHORIZED):
+        case static_cast<uint8_t>(ReasonCode::TOPIC_NAME_INVALID):
+        case static_cast<uint8_t>(ReasonCode::PACKET_IDENTIFIER_IN_USE):
+        case static_cast<uint8_t>(ReasonCode::QUOTA_EXCEEDED):
+        case static_cast<uint8_t>(ReasonCode::PAYLOAD_FORMAT_INVALID):
+            return true;
+        default:
+            return false;
+        }
+    case Frame::PropertyContext::PUBREL:
+    case Frame::PropertyContext::PUBCOMP:
+        return code == static_cast<uint8_t>(ReasonCode::SUCCESS) ||
+               code == static_cast<uint8_t>(ReasonCode::PACKET_IDENTIFIER_NOT_FOUND);
+    default:
+        return true; // other contexts are not validated here
+    }
+}
+
 void Frame::parseAckReasonAndProperties(const uint8_t *buffer, size_t length, size_t offset,
                                          PropertyContext context, ReasonCode &reasonCode,
                                          Properties &properties) {
@@ -821,6 +856,13 @@ void Frame::parseAckReasonAndProperties(const uint8_t *buffer, size_t length, si
         return; // Remaining Length 2: neither field is present (Reason Code 0x00)
     }
     reasonCode = static_cast<ReasonCode>(buffer[offset]);
+    // §3.4.2.1 / §3.5.2.1 / §3.6.2.1 / §3.7.2.1: only a fixed set of Reason
+    // Codes is legal on each acknowledgement; any other value is a Malformed
+    // Packet. Silently reading it would let a peer drive an out-of-range code
+    // into the flow as if it meant something.
+    if (!isLegalAckReason(context, buffer[offset])) {
+        throw std::runtime_error("Malformed ack: Reason Code not legal for this packet type");
+    }
     offset += 1;
     if (offset >= length) {
         return; // Remaining Length 3: Reason Code only, no Property Length

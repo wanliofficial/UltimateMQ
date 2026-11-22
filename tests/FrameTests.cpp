@@ -893,10 +893,10 @@ TEST_F(FrameTest, ParsesAckVariableHeaderInSpecOrder)
     EXPECT_EQ(a.packetId, 7);
     EXPECT_EQ(a.reasonCode, ReasonCode::PACKET_IDENTIFIER_IN_USE);
 
-    std::vector<uint8_t> pubrec = {0x00, 0x08, 0x92, 0x00};
+    std::vector<uint8_t> pubrec = {0x00, 0x08, 0x91, 0x00};
     auto r = v5.parsePubrec(pubrec.data(), pubrec.size());
     EXPECT_EQ(r.packetId, 8);
-    EXPECT_EQ(r.reasonCode, ReasonCode::PACKET_IDENTIFIER_NOT_FOUND);
+    EXPECT_EQ(r.reasonCode, ReasonCode::PACKET_IDENTIFIER_IN_USE);
 
     std::vector<uint8_t> pubrel = {0x00, 0x09, 0x92, 0x00};
     auto rel = v5.parsePubrel(pubrel.data(), pubrel.size());
@@ -907,6 +907,33 @@ TEST_F(FrameTest, ParsesAckVariableHeaderInSpecOrder)
     auto comp = v5.parsePubcomp(pubcomp.data(), pubcomp.size());
     EXPECT_EQ(comp.packetId, 10);
     EXPECT_EQ(comp.reasonCode, ReasonCode::SUCCESS);
+}
+
+TEST_F(FrameTest, RejectsAckReasonCodeIllegalForThePacketType)
+{
+    // §3.4.2.1 / §3.5.2.1 / §3.6.2.1 / §3.7.2.1: each acknowledgement
+    // admits only a fixed set of Reason Codes; any other value is a Malformed
+    // Packet. 0x92 (Packet Identifier not found) is legal only on PUBREL /
+    // PUBCOMP, so the same byte on a PUBACK or PUBREC must be rejected even
+    // though the packet is otherwise well-formed.
+    Frame v5(Version::MQTT5);
+
+    std::vector<uint8_t> pubackBad = {0x00, 0x07, 0x92, 0x00};
+    EXPECT_THROW(v5.parsePuback(pubackBad.data(), pubackBad.size()), std::runtime_error);
+
+    std::vector<uint8_t> pubrecBad = {0x00, 0x08, 0x92, 0x00};
+    EXPECT_THROW(v5.parsePubrec(pubrecBad.data(), pubrecBad.size()), std::runtime_error);
+
+    // The same 0x92 is legal on PUBREL / PUBCOMP and must still parse.
+    std::vector<uint8_t> pubrelOk = {0x00, 0x09, 0x92, 0x00};
+    EXPECT_NO_THROW(v5.parsePubrel(pubrelOk.data(), pubrelOk.size()));
+
+    std::vector<uint8_t> pubcompOk = {0x00, 0x0A, 0x92, 0x00};
+    EXPECT_NO_THROW(v5.parsePubcomp(pubcompOk.data(), pubcompOk.size()));
+
+    // And a code that IS legal on PUBACK/PUBREC (0x10) parses fine.
+    std::vector<uint8_t> pubackOk = {0x00, 0x07, 0x10, 0x00};
+    EXPECT_NO_THROW(v5.parsePuback(pubackOk.data(), pubackOk.size()));
 }
 
 TEST_F(FrameTest, ParsesAckReasonCodeWithoutPropertyLength)
