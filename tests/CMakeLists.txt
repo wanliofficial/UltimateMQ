@@ -19,6 +19,7 @@ set(TEST_SOURCES
     Utf8Tests.cpp
     MQTTSNTests.cpp
     ServerTests.cpp
+    WebSocketTests.cpp
 )
 
 # Create the test executable
