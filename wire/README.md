@@ -30,6 +30,7 @@ python3 wire/recvmax_window_test.py build/flowmq 18840
 | `websocket_framing_test.py` | RFC 6455 §5.5.1 / §5.2: a fragmented control frame is refused with CLOSE 1002, and an oversized frame is refused with CLOSE 1009 before its payload is buffered. |
 | `websocket_sys_topics_test.py` | `$SYS/broker` monitoring tree over MQTT-over-WebSocket: the retained snapshot and live fan-out both reach a WebSocket subscriber (RETAIN cleared, MQTT-3.3.1-8), and a client PUBLISH into the tree is refused `0x87` (MQTT-4.1.2-2). |
 | `mqttsn_large_publish_test.py` | MQTT-SN §5.2.1: a message of 256+ octets uses the three-octet Length field (first octet `0x01`, total counting the length field itself) and reaches an MQTT subscriber intact; a shorter one keeps the one-octet form. |
+| `mqttsn_subscribe_topicid_test.py` | MQTT-SN gateway topic-id assignment (§5.3.1, §5.3.10): a subscribe-by-name returns a non-zero assigned id in the SUBACK, a publish carrying only that id is routed back to the topic name and reaches an MQTT subscriber, and re-subscribing by the same name reuses the id. |
 | `topic_alias_test.py` | MQTT 5 Topic Alias over a real connection (§3.3.2.7/8, §3.3.2.3.4, OASIS MQTT-474): a named PUBLISH registers an alias and an alias-only PUBLISH reuses it; an unmapped alias or a zero-length Topic Name is refused `0x82`, and alias 0 or an alias above the advertised maximum `0x94`. |
 
 MQTT-SN probes are UDP: they set `FLOWMQ_MQTT_SN_PORT` to a port derived from
