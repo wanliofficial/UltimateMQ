@@ -38,6 +38,7 @@ PROBES = [
     ("mqttsn_large_publish_test", "MQTT-SN §5.2.1 three-octet Length field"),
     ("write_buffer_test", "FLOWMQ_WRITE_BUFFER: a slow reader is buffered, not dropped"),
     ("sys_topics_test", "FLOWMQ_SYS_TOPICS: $SYS tree live updates, §4.7.2-1, §4.1.2-2, off by default"),
+    ("topic_alias_test", "MQTT 5 Topic Alias: register/reuse over a connection + §3.3.2.7/8, §3.3.2.3.4, OASIS MQTT-474 refusals (0x82/0x94)"),
 ]
 
 
