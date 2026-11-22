@@ -18,6 +18,12 @@ namespace {
 const std::vector<std::string> kTopics = {
     "$SYS/broker/clients/connected",
     "$SYS/broker/clients/total",
+    "$SYS/broker/disconnect/keepalive",
+    "$SYS/broker/disconnect/protocol",
+    "$SYS/broker/disconnect/quota",
+    "$SYS/broker/disconnect/auth",
+    "$SYS/broker/disconnect/normal",
+    "$SYS/broker/disconnect/other",
     "$SYS/broker/messages/sent",
     "$SYS/broker/messages/received",
     "$SYS/broker/messages/dropped",
@@ -74,6 +80,24 @@ std::string payload(const std::string &topic, size_t connected, size_t sessions,
     }
     if (topic == "$SYS/broker/clients/total") {
         return numberPayload(sessions);
+    }
+    if (topic == "$SYS/broker/disconnect/keepalive") {
+        return numberPayload(sysGetDisconnectsKeepAlive());
+    }
+    if (topic == "$SYS/broker/disconnect/protocol") {
+        return numberPayload(sysGetDisconnectsProtocol());
+    }
+    if (topic == "$SYS/broker/disconnect/quota") {
+        return numberPayload(sysGetDisconnectsQuota());
+    }
+    if (topic == "$SYS/broker/disconnect/auth") {
+        return numberPayload(sysGetDisconnectsAuth());
+    }
+    if (topic == "$SYS/broker/disconnect/normal") {
+        return numberPayload(sysGetDisconnectsNormal());
+    }
+    if (topic == "$SYS/broker/disconnect/other") {
+        return numberPayload(sysGetDisconnectsOther());
     }
     if (topic == "$SYS/broker/messages/sent") {
         return numberPayload(sysGetTotalSent());

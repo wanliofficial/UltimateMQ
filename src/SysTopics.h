@@ -21,6 +21,17 @@ double sysUptimeSeconds();
 size_t sysGetWriteBufferBytes();
 size_t sysGetQueuedBytes();
 size_t sysGetConnectedClients();
+//! Cumulative disconnect counters by category, backing the
+//! $SYS/broker/disconnect/* topics: why clients leave (keep-alive timeout, a
+//! protocol/malformed violation, a rate/connection quota, an authentication
+//! refusal, a graceful disconnect, or anything else). Each is a monotonic count
+//! of connections that ended for that reason, incremented once at teardown.
+size_t sysGetDisconnectsKeepAlive();
+size_t sysGetDisconnectsProtocol();
+size_t sysGetDisconnectsQuota();
+size_t sysGetDisconnectsAuth();
+size_t sysGetDisconnectsNormal();
+size_t sysGetDisconnectsOther();
 
 //! Optional broker-side monitoring topic tree (the "$SYS/..." tree). When the
 //! feature is enabled the broker publishes its own counters as retained QoS 0
@@ -36,6 +47,12 @@ size_t sysGetConnectedClients();
 //! Implemented topics:
 //!   $SYS/broker/clients/connected    number of currently connected clients
 //!   $SYS/broker/clients/total        number of sessions the broker holds
+//!   $SYS/broker/disconnect/keepalive cumulative disconnects on keep-alive timeout
+//!   $SYS/broker/disconnect/protocol  cumulative disconnects on a protocol/malformed violation
+//!   $SYS/broker/disconnect/quota     cumulative disconnects on a rate/connection quota
+//!   $SYS/broker/disconnect/auth      cumulative disconnects on an authentication refusal
+//!   $SYS/broker/disconnect/normal    cumulative graceful (normal) disconnects
+//!   $SYS/broker/disconnect/other     cumulative disconnects for any other reason
 //!   $SYS/broker/messages/sent        total PUBLISHes the broker has delivered
 //!   $SYS/broker/messages/received    total PUBLISHes the broker has accepted
 //!   $SYS/broker/messages/dropped     total PUBLISHes dropped under backpressure

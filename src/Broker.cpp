@@ -26,6 +26,18 @@ std::atomic<uint64_t> totalMessagesDropped{0};
 // building BEFORE messages are dropped (messages/dropped stays 0 until a loss
 // has already happened).
 std::atomic<uint64_t> liveWriteBufferBytes{0};
+//! Cumulative disconnect counters split by why the connection ended, so an
+//! operator can see not just that clients leave but HOW: keep-alive timeout,
+//! a protocol/malformed violation, a quota/packet-size refusal, a graceful
+//! disconnect, or anything else. These back the $SYS/broker/disconnect/* topics.
+//! Monotonic counters (they never decrease), incremented once per connection at
+//! teardown from the reason the connection recorded for itself.
+std::atomic<uint64_t> disconnectsKeepAlive{0};
+std::atomic<uint64_t> disconnectsProtocol{0};
+std::atomic<uint64_t> disconnectsQuota{0};
+std::atomic<uint64_t> disconnectsAuth{0};
+std::atomic<uint64_t> disconnectsNormal{0};
+std::atomic<uint64_t> disconnectsOther{0};
 //! Live in-memory occupancy of every session's undelivered messages (payload +
 //! topic bytes in pendingDeliveries + blockedDeliveries + inflightMessages). A
 //! gauge, not a counter: it rises as fan-out queues messages for slow consumers
@@ -48,6 +60,14 @@ double sysUptimeSeconds();
 size_t sysGetRetainedCount();
 size_t sysGetWriteBufferBytes();
 size_t sysGetConnectedClients();
+//! Cumulative disconnect counters by category (keep-alive / protocol / quota /
+//! normal / other), backing the $SYS/broker/disconnect/* topics.
+size_t sysGetDisconnectsKeepAlive();
+size_t sysGetDisconnectsProtocol();
+size_t sysGetDisconnectsQuota();
+size_t sysGetDisconnectsAuth();
+size_t sysGetDisconnectsNormal();
+size_t sysGetDisconnectsOther();
 
 Broker::Broker(Auth* auth, Store* store) : trie(std::make_unique<Trie>()), auth(auth), store(store) {}
 
@@ -583,6 +603,30 @@ size_t sysGetConnectedClients() {
     return liveConnectedClients.load(std::memory_order_relaxed);
 }
 
+size_t sysGetDisconnectsKeepAlive() {
+    return disconnectsKeepAlive.load(std::memory_order_relaxed);
+}
+
+size_t sysGetDisconnectsProtocol() {
+    return disconnectsProtocol.load(std::memory_order_relaxed);
+}
+
+size_t sysGetDisconnectsQuota() {
+    return disconnectsQuota.load(std::memory_order_relaxed);
+}
+
+size_t sysGetDisconnectsAuth() {
+    return disconnectsAuth.load(std::memory_order_relaxed);
+}
+
+size_t sysGetDisconnectsNormal() {
+    return disconnectsNormal.load(std::memory_order_relaxed);
+}
+
+size_t sysGetDisconnectsOther() {
+    return disconnectsOther.load(std::memory_order_relaxed);
+}
+
 void Broker::adjustWriteBufferBytes(int64_t delta) {
     liveWriteBufferBytes.fetch_add(delta, std::memory_order_relaxed);
 }
@@ -593,6 +637,51 @@ void Broker::adjustQueuedBytes(int64_t delta) {
 
 void Broker::adjustConnectedClients(int64_t delta) {
     liveConnectedClients.fetch_add(delta, std::memory_order_relaxed);
+}
+
+void Broker::recordDisconnect(ReasonCode reason) {
+    // Classify the reason a connection ended into one of the $SYS/broker/disconnect/*
+    // categories. The mapping is deliberately coarse: an operator needs to tell a
+    // client that keeps the link open too long (keep-alive) from one the broker is
+    // actively refusing (a protocol/malformed violation, a rate or connection
+    // quota) apart from a clean leave (normal). The individual reason codes within
+    // the protocol and quota groups all call for the same operator response, so
+    // they are folded together. Purely informational; no correctness path reads
+    // these.
+    switch (reason) {
+        case ReasonCode::KEEP_ALIVE_TIMEOUT:
+            disconnectsKeepAlive.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case ReasonCode::MALFORMED_PACKET:
+        case ReasonCode::PROTOCOL_ERROR:
+        case ReasonCode::UNSUPPORTED_PROTOCOL_VERSION:
+        case ReasonCode::CLIENT_IDENTIFIER_NOT_VALID:
+        case ReasonCode::TOPIC_FILTER_INVALID:
+        case ReasonCode::TOPIC_NAME_INVALID:
+        case ReasonCode::PACKET_IDENTIFIER_IN_USE:
+        case ReasonCode::PACKET_IDENTIFIER_NOT_FOUND:
+        case ReasonCode::RECEIVE_MAXIMUM_EXCEEDED:
+        case ReasonCode::TOPIC_ALIAS_INVALID:
+        case ReasonCode::PACKET_TOO_LARGE:
+            disconnectsProtocol.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case ReasonCode::QUOTA_EXCEEDED:
+        case ReasonCode::MESSAGE_RATE_TOO_HIGH:
+        case ReasonCode::CONNECTION_RATE_EXCEEDED:
+            disconnectsQuota.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case ReasonCode::BAD_USERNAME_OR_PASSWORD:
+        case ReasonCode::NOT_AUTHORIZED:
+        case ReasonCode::BAD_AUTHENTICATION_METHOD:
+            disconnectsAuth.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case ReasonCode::NORMAL_DISCONNECTION:
+            disconnectsNormal.fetch_add(1, std::memory_order_relaxed);
+            break;
+        default:
+            disconnectsOther.fetch_add(1, std::memory_order_relaxed);
+            break;
+    }
 }
 
 double sysUptimeSeconds() {

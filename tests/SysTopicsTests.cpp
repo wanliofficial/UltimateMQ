@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <array>
+
 #include "../src/Broker.h"
 #include "../src/Session.h"
 #include "../src/SysTopics.h"
@@ -171,6 +173,66 @@ TEST(SysTopicsTest, QueuedBytesGaugeRisesAndFallsWithDelivery)
     session->discard();
     broker.sweepExpiredSessions();
     EXPECT_EQ(sysGetQueuedBytes(), baseline);
+}
+
+TEST(SysTopicsTest, DisconnectTopicsAreInTheMonitoringTree)
+{
+    EXPECT_EQ(SysTopics::matchedCount("$SYS/broker/disconnect/keepalive"), 1u);
+    EXPECT_EQ(SysTopics::matchedCount("$SYS/broker/disconnect/auth"), 1u);
+    EXPECT_EQ(SysTopics::matchedCount("$SYS/broker/disconnect/other"), 1u);
+    // The whole disconnect subtree is reached by a "$SYS/#" subscription.
+    EXPECT_EQ(SysTopics::matchedCount("$SYS/broker/disconnect/#"), 6u);
+    EXPECT_EQ(SysTopics::matchedCount("$SYS/#"), SysTopics::allTopics().size());
+}
+
+TEST(SysTopicsTest, DisconnectCategoriesClassifyEveryReason)
+{
+    // The taxonomy must map every ReasonCode that can end a connection into
+    // exactly one category, so the disconnect counters account for every client
+    // that leaves with none lost. Drive each representative reason through the
+    // broker and read the category it landed in.
+    Broker broker;
+    broker.setSysTopics(true);
+    broker.sweepExpiredSessions();
+    const std::string ka = "$SYS/broker/disconnect/keepalive";
+    const std::string proto = "$SYS/broker/disconnect/protocol";
+    const std::string quota = "$SYS/broker/disconnect/quota";
+    const std::string auth = "$SYS/broker/disconnect/auth";
+    const std::string normal = "$SYS/broker/disconnect/normal";
+    const std::string other = "$SYS/broker/disconnect/other";
+    // The disconnect counters are process-wide; other tests in the suite tear
+    // down connections and land here too, so measure the delta this test causes
+    // rather than assuming a zero baseline.
+    auto before = [&] {
+        auto v = broker.sysTopicValues();
+        auto get = [&](const std::string &t) {
+            auto it = v.find(t);
+            return it == v.end() ? 0u : std::stoul(it->second);
+        };
+        return std::array<size_t, 6>{get(ka), get(proto), get(quota),
+                                     get(auth), get(normal), get(other)};
+    };
+    const auto base = before();
+
+    broker.recordDisconnect(ReasonCode::KEEP_ALIVE_TIMEOUT);
+    broker.recordDisconnect(ReasonCode::PROTOCOL_ERROR);
+    broker.recordDisconnect(ReasonCode::MALFORMED_PACKET);
+    broker.recordDisconnect(ReasonCode::PACKET_TOO_LARGE);
+    broker.recordDisconnect(ReasonCode::QUOTA_EXCEEDED);
+    broker.recordDisconnect(ReasonCode::MESSAGE_RATE_TOO_HIGH);
+    broker.recordDisconnect(ReasonCode::BAD_USERNAME_OR_PASSWORD);
+    broker.recordDisconnect(ReasonCode::NOT_AUTHORIZED);
+    broker.recordDisconnect(ReasonCode::NORMAL_DISCONNECTION);
+    broker.recordDisconnect(ReasonCode::SERVER_UNAVAILABLE); // falls to other
+    broker.sweepExpiredSessions();
+
+    const auto after = before();
+    EXPECT_EQ(after[0] - base[0], 1u); // KEEP_ALIVE_TIMEOUT
+    EXPECT_EQ(after[1] - base[1], 3u); // PROTOCOL_ERROR, MALFORMED_PACKET, PACKET_TOO_LARGE
+    EXPECT_EQ(after[2] - base[2], 2u); // QUOTA_EXCEEDED, MESSAGE_RATE_TOO_HIGH
+    EXPECT_EQ(after[3] - base[3], 2u); // BAD_USERNAME_OR_PASSWORD, NOT_AUTHORIZED
+    EXPECT_EQ(after[4] - base[4], 1u); // NORMAL_DISCONNECTION
+    EXPECT_EQ(after[5] - base[5], 1u); // SERVER_UNAVAILABLE
 }
 
 TEST(SysTopicsTest, UnknownTopicYieldsNoPayload)

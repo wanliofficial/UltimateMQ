@@ -108,6 +108,16 @@ Connection::Connection(int sockfd, Broker* broker,
 }
 
 Connection::~Connection() {
+    // Record why this connection ended, classified, exactly once here: the
+    // destructor runs for every connection regardless of which path closed it
+    // (graceful DISCONNECT, keep-alive timeout, protocol error, rate limit, or a
+    // peer that simply vanished). disconnectReason was set at the decision point
+    // and defaults to NORMAL_DISCONNECTION, so even an unannounced close is
+    // counted. Recorded before the gauges are released so it captures this
+    // connection's full lifecycle.
+    if (broker) {
+        broker->recordDisconnect(disconnectReason);
+    }
     // Release this connection's contribution to the live gauges before the
     // socket goes away: any bytes still buffered (a slow reader we never caught
     // up with) leave the global write-buffer occupancy, and the client leaves
@@ -157,6 +167,7 @@ void Connection::run() {
                                                  : (e.detected == 3 ? Version::MQTT31
                                                                     : Version::MQTT311));
                 ConnackPacket connack{false, ReasonCode::UNSUPPORTED_PROTOCOL_VERSION};
+                disconnectReason = ReasonCode::UNSUPPORTED_PROTOCOL_VERSION;
                 connackSent = true;
                 sendPacket(connack);
             }
@@ -566,6 +577,7 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
             if (frame.getVersion() == Version::MQTT5) {
                 // MQTT 5 has a Protocol Error reason code for this.
                 ConnackPacket connack{false, ReasonCode::PROTOCOL_ERROR};
+                disconnectReason = ReasonCode::PROTOCOL_ERROR;
                 connackSent = true;
                 sendPacket(connack);
             }
@@ -592,6 +604,7 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
             logInfo("rejecting client %s: authentication data without a method",
                     connect->clientId.c_str());
             ConnackPacket connack{false, ReasonCode::PROTOCOL_ERROR};
+            disconnectReason = ReasonCode::PROTOCOL_ERROR;
             connackSent = true;
             sendPacket(connack);
             state = State::DISCONNECTED;
@@ -602,6 +615,7 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
             logInfo("rejecting client %s: unsupported authentication method",
                     connect->clientId.c_str());
             ConnackPacket connack{false, ReasonCode::BAD_AUTHENTICATION_METHOD};
+            disconnectReason = ReasonCode::BAD_AUTHENTICATION_METHOD;
             connackSent = true;
             sendPacket(connack);
             state = State::DISCONNECTED;
@@ -619,12 +633,14 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
         if (!connect->cleanStart) {
             logInfo("rejecting client: a zero-length ClientID requires a clean start");
             if (frame.getVersion() == Version::MQTT5) {
+                disconnectReason = ReasonCode::CLIENT_IDENTIFIER_NOT_VALID;
                 ConnackPacket connack{false, ReasonCode::CLIENT_IDENTIFIER_NOT_VALID};
                 connackSent = true;
                 sendPacket(connack);
             } else {
                 // MQTT 3.1.1 has no 0x85 reason code; its CONNACK return code for
                 // "identifier rejected" is 0x02.
+                disconnectReason = ReasonCode::CLIENT_IDENTIFIER_NOT_VALID;
                 ConnackPacket connack{false, static_cast<ReasonCode>(0x02)};
                 connackSent = true;
                 sendPacket(connack);
@@ -667,6 +683,7 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
                 logInfo("rejecting client %s: bad credentials for user %s",
                         connect->clientId.c_str(), username.c_str());
                 ConnackPacket connack{false, ReasonCode::BAD_USERNAME_OR_PASSWORD};
+                disconnectReason = ReasonCode::BAD_USERNAME_OR_PASSWORD;
                 connackSent = true;
                 sendPacket(connack);
                 state = State::DISCONNECTED;
@@ -679,6 +696,7 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
         if (auth && auth->authRequired()) {
             logInfo("rejecting client %s: username required", connect->clientId.c_str());
             ConnackPacket connack{false, ReasonCode::BAD_USERNAME_OR_PASSWORD};
+            disconnectReason = ReasonCode::BAD_USERNAME_OR_PASSWORD;
             connackSent = true;
             sendPacket(connack);
             state = State::DISCONNECTED;
@@ -703,6 +721,7 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
                 connect->clientId.c_str(), connect->willTopic->c_str());
         if (frame.getVersion() == Version::MQTT5) {
             ConnackPacket connack{false, ReasonCode::TOPIC_NAME_INVALID};
+            disconnectReason = ReasonCode::TOPIC_NAME_INVALID;
             connackSent = true;
             sendPacket(connack);
         }
@@ -727,6 +746,7 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
                 logInfo("rejecting client %s: Maximum Packet Size must not be 0",
                         connect->clientId.c_str());
                 ConnackPacket rejectConnack{false, ReasonCode::PROTOCOL_ERROR};
+                disconnectReason = ReasonCode::PROTOCOL_ERROR;
                 connackSent = true;
                 sendPacket(rejectConnack);
                 state = State::DISCONNECTED;
@@ -741,6 +761,7 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
                 logInfo("rejecting client %s: Receive Maximum must not be 0",
                         connect->clientId.c_str());
                 ConnackPacket rejectConnack{false, ReasonCode::PROTOCOL_ERROR};
+                disconnectReason = ReasonCode::PROTOCOL_ERROR;
                 connackSent = true;
                 sendPacket(rejectConnack);
                 state = State::DISCONNECTED;
@@ -761,6 +782,7 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
         logInfo("rejecting client %s: session belongs to a different user (%s)",
                 connect->clientId.c_str(), existing->getUsername().c_str());
         ConnackPacket connack{false, ReasonCode::NOT_AUTHORIZED};
+        disconnectReason = ReasonCode::NOT_AUTHORIZED;
         connackSent = true;
         sendPacket(connack);
         state = State::DISCONNECTED;
@@ -975,6 +997,9 @@ void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
     if (!allowPublish()) {
         logDebug("client %s: publish rate limit (%zu/s) exceeded",
                  session->getClientId().c_str(), publishRateLimit);
+        // Recorded for $SYS/broker/disconnect/quota: the client was refused for
+        // exceeding its publish rate, not for a protocol violation.
+        disconnectReason = ReasonCode::QUOTA_EXCEEDED;
         if (frame.getVersion() == Version::MQTT5) {
             DisconnectPacket disconnect{ReasonCode::QUOTA_EXCEEDED};
             sendPacket(disconnect);
@@ -1464,6 +1489,12 @@ void Connection::sendPubrel(uint16_t packetId) {
 }
 
 void Connection::closeWithReason(ReasonCode reason) {
+    // Record why the connection is ending so teardown counts it once into the
+    // right $SYS/broker/disconnect/* category. closeWithReason is the single
+    // choke point for every broker-initiated abnormal close (protocol error,
+    // keep-alive timeout, oversized packet, ...), so setting it here covers them
+    // all without touching each call site.
+    disconnectReason = reason;
     // MQTT 5 clients are told why the connection ends (MQTT-4.13). MQTT 3.1.1
     // has no DISCONNECT packet from the server, so the socket simply closes.
     if (frame.getVersion() == Version::MQTT5) {

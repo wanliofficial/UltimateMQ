@@ -195,6 +195,11 @@ public:
     //! Adjust the live connected-clients gauge by \p delta (+1 on connect,
     //! -1 on disconnect). Backs the connection-count view of the monitoring tree.
     void adjustConnectedClients(int64_t delta);
+    //! Count one connection ending, classified by \p reason into the
+    //! $SYS/broker/disconnect/* categories (keep-alive / protocol / quota /
+    //! normal / other). Called once per connection at teardown. Purely
+    //! informational; no correctness path reads it.
+    void recordDisconnect(ReasonCode reason);
 
     //! Configure the maximum number of subscriptions per session. Must be set
     //! before any client connects.

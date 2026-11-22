@@ -195,6 +195,13 @@ private:
     //! from it.
     bool willHasExpiry = false;
     uint32_t willExpiryInterval = 0;
+    //! The reason this connection ended, classified for the broker's
+    //! $SYS/broker/disconnect/* counters. Set wherever the connection decides why
+    //! it is closing (a protocol error, a keep-alive timeout, a rate-limit
+    //! refusal, a graceful DISCONNECT), read once at teardown. NORMAL_DISCONNECTION
+    //! is the default, so a peer that simply vanishes (no DISCONNECT, a network
+    /// fault) is still counted once, as a normal close.
+    ReasonCode disconnectReason = ReasonCode::NORMAL_DISCONNECTION;
     std::function<void()> disconnectCallback;
     std::unique_ptr<ClientTransport> transport;
     static const int BUFFER_SIZE = 4096;
