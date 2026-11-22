@@ -26,6 +26,7 @@ python3 wire/recvmax_window_test.py build/flowmq 18840
 | Script | Covers |
 |---|---|
 | `recvmax_window_test.py` | MQTT-4.9 / §3.1.2.11.9: the Receive Maximum window holds a QoS 2 message until PUBCOMP (not PUBREC), and at QoS 1 until PUBACK. |
+| `qos2_exactly_once_test.py` | End-to-end QoS 2 exactly-once over the wire (§4.3.3/§4.3.4): publisher and subscriber each complete the full PUBLISH/PUBREC/PUBREL/PUBCOMP handshake and the payload arrives exactly once; a DUP retransmit of an in-flight PUBLISH is answered PUBREC/SUCCESS and is not forwarded a second time. |
 | `sys_topics_test.py` | `FLOWMQ_SYS_TOPICS`: the `$SYS` tree is delivered retained and then keeps updating live; MQTT-4.7.2-1 (a root `#` never reaches it), MQTT-4.1.2-2 (a client publish into it is refused `0x87`), and the feature being off by default. |
 | `websocket_framing_test.py` | RFC 6455 §5.5.1 / §5.2: a fragmented control frame is refused with CLOSE 1002, and an oversized frame is refused with CLOSE 1009 before its payload is buffered. |
 | `websocket_sys_topics_test.py` | `$SYS/broker` monitoring tree over MQTT-over-WebSocket: the retained snapshot and live fan-out both reach a WebSocket subscriber (RETAIN cleared, MQTT-3.3.1-8), and a client PUBLISH into the tree is refused `0x87` (MQTT-4.1.2-2). |
