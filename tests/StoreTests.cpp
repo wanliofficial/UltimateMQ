@@ -533,6 +533,81 @@ TEST(StoreTest, LoadsAStateFileWithoutMessagePropertyColumns)
     ::remove(path.c_str());
 }
 
+TEST(StoreTest, RoundTripsAnEmptyPayloadOnAQosMessage)
+{
+    // An empty payload is legal on a QoS>0 message (e.g. a "ping" topic with no
+    // body). Hex-encoding it yields "", which would collapse the whitespace-
+    // delimited record and shift every later column -- silently corrupting the
+    // properties/expiry on reload, or failing the whole file. The empty field is
+    // written as "-" so the column count stays fixed.
+    const std::string path = tempPath("emptypayload.dat");
+    Store store(path, std::chrono::milliseconds(10));
+
+    PersistedState state;
+    PersistedSession session;
+    session.clientId = "empty";
+    session.nextPacketId = 2;
+    Message m = messageFor("a/b", "", QoS::QOS_1);
+    m.properties[PropertyID::CONTENT_TYPE] = std::string("application/octet-stream");
+    m.properties[PropertyID::USER_PROPERTY] = UserProperties{{"k", "v"}};
+    session.inflight.emplace_back(3, m);
+    state.sessions.push_back(session);
+
+    ASSERT_TRUE(store.flushNow([&state] { return state; }));
+
+    PersistedState loaded;
+    std::string error;
+    ASSERT_TRUE(store.load(loaded, &error)) << error;
+    ASSERT_EQ(loaded.sessions.size(), 1U);
+    ASSERT_EQ(loaded.sessions[0].inflight.size(), 1U);
+    const Message &back = loaded.sessions[0].inflight[0].second;
+    EXPECT_TRUE(back.payload.empty()) << "the empty payload must round-trip as empty";
+    ASSERT_EQ(back.properties.size(), 2U)
+        << "an empty payload must not shift the property column";
+    EXPECT_EQ(std::get<std::string>(back.properties.at(PropertyID::CONTENT_TYPE)),
+              "application/octet-stream");
+    EXPECT_EQ(std::get<UserProperties>(back.properties.at(PropertyID::USER_PROPERTY)).at("k"),
+              "v");
+
+    ::remove(path.c_str());
+}
+
+TEST(StoreTest, RejectsCorruptHexInAPayloadColumn)
+{
+    // A non-hex payload field must fail the load, not decode to an empty payload
+    // (which would silently turn a corrupt file into a wrong-but-accepted state).
+    const std::string path = tempPath("badhex.dat");
+    writeRaw(path, "FLOWMQ-STATE-1\n"
+                   "retained 612f62 0 1 ZZZZ\n");
+    Store store(path, std::chrono::milliseconds(10));
+
+    PersistedState state;
+    std::string error;
+    EXPECT_FALSE(store.load(state, &error));
+    EXPECT_NE(error.find("bad hex"), std::string::npos) << error;
+
+    ::remove(path.c_str());
+}
+
+TEST(StoreTest, RejectsAPropertyWhoseTypeDoesNotMatchItsID)
+{
+    // Property 2 (MESSAGE_EXPIRY_INTERVAL) is a Four Byte Integer. A corrupt
+    // file that stores it as a bool ('B1') would re-serialise on restore as a
+    // one-byte value under a four-byte property id -- a malformed PUBLISH -- so
+    // the mismatch must be rejected at load.
+    const std::string path = tempPath("proptype.dat");
+    writeRaw(path, "FLOWMQ-STATE-1\n"
+                   "retained 612f62 0 1 78 2:B1 -\n");
+    Store store(path, std::chrono::milliseconds(10));
+
+    PersistedState state;
+    std::string error;
+    EXPECT_FALSE(store.load(state, &error));
+    EXPECT_NE(error.find("bad properties"), std::string::npos) << error;
+
+    ::remove(path.c_str());
+}
+
 TEST(StoreTest, RoundTripsSubscriptionIdentifier)
 {
     const std::string path = tempPath("subid.dat");

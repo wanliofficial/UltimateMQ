@@ -58,13 +58,52 @@ bool fromHex(const std::string &hex, std::vector<uint8_t> &out) {
     return true;
 }
 
-Message decodeMessage(const std::string &topicHex, int qos, bool retain, const std::string &payloadHex) {
-    Message message;
-    fromHex(topicHex, message.topic);
-    fromHex(payloadHex, message.payload);
+//! Sentinel for an empty field in the whitespace-delimited records (an empty
+//! payload or topic hex-encodes to "", which would collapse the column and shift
+//! every later field). "-" never appears inside a hex string, so it is
+//! unambiguous.
+const char *EMPTY_FIELD = "-";
+
+//! Hex-encode \p in, or return the empty-field sentinel when it is empty so the
+//! fixed column count of a record is preserved (see EMPTY_FIELD).
+std::string toHexField(const std::string &in) {
+    return in.empty() ? std::string(EMPTY_FIELD) : toHex(in);
+}
+
+std::string toHexField(const std::vector<uint8_t> &in) {
+    return in.empty() ? std::string(EMPTY_FIELD) : toHex(in);
+}
+
+//! Decode a hex field that may be the empty-field sentinel ("-") back to "".
+//! Returns false only when \p hex is non-empty, not the sentinel, and not valid
+//! hex -- so a corrupt file is rejected rather than silently read as empty.
+bool fromHexField(const std::string &hex, std::string &out) {
+    if (hex == EMPTY_FIELD) {
+        out.clear();
+        return true;
+    }
+    return fromHex(hex, out);
+}
+
+bool fromHexField(const std::string &hex, std::vector<uint8_t> &out) {
+    if (hex == EMPTY_FIELD) {
+        out.clear();
+        return true;
+    }
+    return fromHex(hex, out);
+}
+
+//! Decode a message record's hex columns into \p message. Returns false when a
+//! column is not valid hex (nor the empty-field sentinel), so a corrupt file is
+//! rejected rather than silently read as an empty topic/payload.
+bool decodeMessage(const std::string &topicHex, int qos, bool retain,
+                   const std::string &payloadHex, Message &message) {
+    if (!fromHexField(topicHex, message.topic) || !fromHexField(payloadHex, message.payload)) {
+        return false;
+    }
     message.qos = static_cast<QoS>(qos);
     message.retain = retain;
-    return message;
+    return true;
 }
 
 //! Encode the forwardable MQTT 5 properties of a message as a single
@@ -157,6 +196,81 @@ bool readBounded(std::istringstream &in, unsigned long long limit,
     return out <= limit;
 }
 
+//! The canonical variant type a property id may hold, mirroring the decoder in
+//! Frame.cpp (e.g. MESSAGE_EXPIRY_INTERVAL is a uint32_t, CONTENT_TYPE a string,
+//! USER_PROPERTY a UserProperties). A durable file that stores a property id
+//! with the wrong type tag is corrupt: re-serialising it on restore would emit a
+//! malformed PUBLISH (a one-byte value under a four-byte property id), so it
+//! must be rejected at load rather than trusted.
+enum class PropKind { BOOL, UINT8, UINT16, UINT32, STRING, USER };
+
+bool propKindFor(PropertyID id, PropKind &kind) {
+    switch (id) {
+    case PropertyID::PAYLOAD_FORMAT_INDICATOR:
+    case PropertyID::MAXIMUM_QOS:
+        kind = PropKind::UINT8;
+        return true;
+    case PropertyID::REQUEST_PROBLEM_INFORMATION:
+    case PropertyID::REQUEST_RESPONSE_INFORMATION:
+    case PropertyID::RETAIN_AVAILABLE:
+    case PropertyID::WILDCARD_SUBSCRIPTION_AVAILABLE:
+    case PropertyID::SUBSCRIPTION_IDENTIFIER_AVAILABLE:
+    case PropertyID::SHARED_SUBSCRIPTION_AVAILABLE:
+        kind = PropKind::BOOL;
+        return true;
+    case PropertyID::SERVER_KEEP_ALIVE:
+    case PropertyID::RECEIVE_MAXIMUM:
+    case PropertyID::TOPIC_ALIAS_MAXIMUM:
+    case PropertyID::TOPIC_ALIAS:
+        kind = PropKind::UINT16;
+        return true;
+    case PropertyID::MESSAGE_EXPIRY_INTERVAL:
+    case PropertyID::SUBSCRIPTION_IDENTIFIER:
+    case PropertyID::SESSION_EXPIRY_INTERVAL:
+    case PropertyID::WILL_DELAY_INTERVAL:
+    case PropertyID::MAXIMUM_PACKET_SIZE:
+        kind = PropKind::UINT32;
+        return true;
+    case PropertyID::CONTENT_TYPE:
+    case PropertyID::RESPONSE_TOPIC:
+    case PropertyID::CORRELATION_DATA:
+    case PropertyID::REASON_STRING:
+    case PropertyID::SERVER_REFERENCE:
+    case PropertyID::ASSIGNED_CLIENT_IDENTIFIER:
+    case PropertyID::AUTHENTICATION_METHOD:
+    case PropertyID::AUTHENTICATION_DATA:
+        kind = PropKind::STRING;
+        return true;
+    case PropertyID::USER_PROPERTY:
+        kind = PropKind::USER;
+        return true;
+    }
+    return false; // unknown id: not a property this build ever writes
+}
+
+//! Whether \p value's variant alternative matches the canonical type for \p id.
+bool propertyTypeMatches(PropertyID id, const PropertyValue &value) {
+    PropKind expected;
+    if (!propKindFor(id, expected)) {
+        return false;
+    }
+    switch (expected) {
+    case PropKind::BOOL:
+        return std::holds_alternative<bool>(value);
+    case PropKind::UINT8:
+        return std::holds_alternative<uint8_t>(value);
+    case PropKind::UINT16:
+        return std::holds_alternative<uint16_t>(value);
+    case PropKind::UINT32:
+        return std::holds_alternative<uint32_t>(value);
+    case PropKind::STRING:
+        return std::holds_alternative<std::string>(value);
+    case PropKind::USER:
+        return std::holds_alternative<UserProperties>(value);
+    }
+    return false;
+}
+
 bool decodeMessageProperties(const std::string &encoded, Properties &out) {
     if (encoded == "-" || encoded.empty()) {
         return true;
@@ -220,6 +334,13 @@ bool decodeMessageProperties(const std::string &encoded, Properties &out) {
             break;
         }
         default:
+            return false;
+        }
+        // The tag must agree with the property id's canonical type; a mismatch
+        // (e.g. MESSAGE_EXPIRY_INTERVAL stored as a bool) would serialise into a
+        // malformed PUBLISH on restore, so reject the corrupt record.
+        auto stored = out.find(static_cast<PropertyID>(id));
+        if (stored == out.end() || !propertyTypeMatches(stored->first, stored->second)) {
             return false;
         }
     }
@@ -321,8 +442,8 @@ bool Store::write(const PersistedState &state) {
     out += '\n';
     for (const auto &entry : state.retained) {
         const Message &m = entry.second;
-        out += "retained " + toHex(m.topic) + " " + std::to_string(static_cast<int>(m.qos)) + " " +
-               (m.retain ? "1" : "0") + " " + toHex(m.payload) + " " +
+        out += "retained " + toHexField(m.topic) + " " + std::to_string(static_cast<int>(m.qos)) + " " +
+               (m.retain ? "1" : "0") + " " + toHexField(m.payload) + " " +
                encodeMessageProperties(m.properties) + " " + encodeMessageExpiry(m) + "\n";
     }
     for (const auto &session : state.sessions) {
@@ -330,30 +451,30 @@ bool Store::write(const PersistedState &state) {
         // field count would shift. "-" is written literally as the sentinel for
         // "no username"; a real username is hex-encoded.
         const std::string user = session.username.empty() ? "-" : toHex(session.username);
-        out += "session " + toHex(session.clientId) + " " + user + " " +
+        out += "session " + toHexField(session.clientId) + " " + user + " " +
                std::to_string(session.nextPacketId) + " " +
                (session.expiryRemainingSeconds < 0
                     ? "-"
                     : std::to_string(session.expiryRemainingSeconds)) + "\n";
         for (const auto &sub : session.subscriptions) {
             const SubscriptionOptions &opt = sub.second;
-            out += "sub " + toHex(sub.first) + " " + std::to_string(static_cast<int>(opt.maximumQos)) +
+            out += "sub " + toHexField(sub.first) + " " + std::to_string(static_cast<int>(opt.maximumQos)) +
                    " " + (opt.noLocal ? "1" : "0") + " " + (opt.retainAsPublished ? "1" : "0") + " " +
                    std::to_string(static_cast<int>(opt.retainHandling)) + " " +
                    std::to_string(opt.subscriptionIdentifier) + "\n";
         }
         for (const auto &inflight : session.inflight) {
             const Message &m = inflight.second;
-            out += "inflight " + std::to_string(inflight.first) + " " + toHex(m.topic) + " " +
+            out += "inflight " + std::to_string(inflight.first) + " " + toHexField(m.topic) + " " +
                    std::to_string(static_cast<int>(m.qos)) + " " + (m.retain ? "1" : "0") + " " +
-                   toHex(m.payload) + " " + encodeMessageProperties(m.properties) + " " +
+                   toHexField(m.payload) + " " + encodeMessageProperties(m.properties) + " " +
                    encodeMessageExpiry(m) + "\n";
         }
         for (const auto &blocked : session.blocked) {
             const Message &m = blocked;
-            out += "blocked 0 " + toHex(m.topic) + " " +
+            out += "blocked 0 " + toHexField(m.topic) + " " +
                    std::to_string(static_cast<int>(m.qos)) + " " + (m.retain ? "1" : "0") + " " +
-                   toHex(m.payload) + " " + encodeMessageProperties(m.properties) + " " +
+                   toHexField(m.payload) + " " + encodeMessageProperties(m.properties) + " " +
                    encodeMessageExpiry(m) + "\n";
         }
         for (uint16_t id : session.awaitingPubrel) {
@@ -479,7 +600,11 @@ bool Store::load(PersistedState &out, std::string *error) const {
                 if (error) *error = "bad retained record at line " + std::to_string(lineNo);
                 return false;
             }
-            Message m = decodeMessage(topicHex, static_cast<int>(qos), retain != 0, payloadHex);
+            Message m;
+            if (!decodeMessage(topicHex, static_cast<int>(qos), retain != 0, payloadHex, m)) {
+                if (error) *error = "bad hex in retained record at line " + std::to_string(lineNo);
+                return false;
+            }
             // The property trail field is optional: state written by an older
             // build has no such column and simply carries no properties.
             std::string encodedProperties;
@@ -505,14 +630,14 @@ bool Store::load(PersistedState &out, std::string *error) const {
                 return false;
             }
             PersistedSession session;
-            if (!fromHex(clientHex, session.clientId)) {
+            if (!fromHexField(clientHex, session.clientId)) {
                 if (error) *error = "bad hex in session record at line " + std::to_string(lineNo);
                 return false;
             }
             // "-" is the sentinel for "no username"; anything else is hex
             if (userHex == "-") {
                 session.username.clear();
-            } else if (!fromHex(userHex, session.username)) {
+            } else if (!fromHexField(userHex, session.username)) {
                 if (error) *error = "bad hex in session record at line " + std::to_string(lineNo);
                 return false;
             }
@@ -573,7 +698,7 @@ bool Store::load(PersistedState &out, std::string *error) const {
                     }
                 }
                 std::string filter;
-                if (!fromHex(filterHex, filter)) {
+                if (!fromHexField(filterHex, filter)) {
                     if (error) *error = "bad hex in sub record at line " + std::to_string(lineNo);
                     return false;
                 }
@@ -595,7 +720,11 @@ bool Store::load(PersistedState &out, std::string *error) const {
                     if (error) *error = "bad inflight record at line " + std::to_string(lineNo);
                     return false;
                 }
-                Message m = decodeMessage(topicHex, static_cast<int>(qos), retain != 0, payloadHex);
+                Message m;
+                if (!decodeMessage(topicHex, static_cast<int>(qos), retain != 0, payloadHex, m)) {
+                    if (error) *error = "bad hex in inflight record at line " + std::to_string(lineNo);
+                    return false;
+                }
                 std::string encodedProperties;
                 if (ss >> encodedProperties && !decodeMessageProperties(encodedProperties, m.properties)) {
                     if (error) *error = "bad properties in inflight record at line " + std::to_string(lineNo);
@@ -618,7 +747,11 @@ bool Store::load(PersistedState &out, std::string *error) const {
                     if (error) *error = "bad blocked record at line " + std::to_string(lineNo);
                     return false;
                 }
-                Message m = decodeMessage(topicHex, static_cast<int>(qos), retain != 0, payloadHex);
+                Message m;
+                if (!decodeMessage(topicHex, static_cast<int>(qos), retain != 0, payloadHex, m)) {
+                    if (error) *error = "bad hex in blocked record at line " + std::to_string(lineNo);
+                    return false;
+                }
                 std::string encodedProperties;
                 if (ss >> encodedProperties && !decodeMessageProperties(encodedProperties, m.properties)) {
                     if (error) *error = "bad properties in blocked record at line " + std::to_string(lineNo);
