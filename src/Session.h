@@ -162,6 +162,12 @@ public:
     bool hasSubscription(const std::string& topicFilter);
     //! Number of distinct topic filters this session holds (thread safe)
     size_t getSubscriptionCount();
+    //! Number of QoS 1/2 messages this session currently has in flight -- sent but
+    //! not yet acknowledged -- across both legs of the flow: messages awaiting
+    //! PUBACK/PUBCOMP (inflightMessages) plus QoS 2 packet ids awaiting PUBCOMP
+    //! after the PUBREL went out (pendingPubrel). Both occupy a Receive Maximum
+    //! slot, so their sum is the session's live flow-control occupancy (thread safe).
+    size_t getInflightCount();
     //! Upper bound on the number of subscriptions a single session may hold.
     //! Bounds per-client memory so one client cannot register an unbounded set
     //! of filters. Default is DEFAULT_MAX_SUBSCRIPTIONS; tunable via

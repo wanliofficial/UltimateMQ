@@ -28,6 +28,7 @@ const std::vector<std::string> kTopics = {
     "$SYS/broker/messages/sent",
     "$SYS/broker/messages/received",
     "$SYS/broker/messages/dropped",
+    "$SYS/broker/inflight/count",
     "$SYS/broker/writebuffer/bytes",
     "$SYS/broker/queued/bytes",
     "$SYS/broker/retaineds/count",
@@ -75,7 +76,7 @@ size_t matchedCount(const std::string &topicFilter) {
 }
 
 std::string payload(const std::string &topic, size_t connected, size_t sessions,
-                    size_t subscriptions, size_t retained) {
+                    size_t subscriptions, size_t inflight, size_t retained) {
     if (topic == "$SYS/broker/clients/connected") {
         return numberPayload(connected);
     }
@@ -84,6 +85,9 @@ std::string payload(const std::string &topic, size_t connected, size_t sessions,
     }
     if (topic == "$SYS/broker/subscriptions/count") {
         return numberPayload(subscriptions);
+    }
+    if (topic == "$SYS/broker/inflight/count") {
+        return numberPayload(inflight);
     }
     if (topic == "$SYS/broker/disconnect/keepalive") {
         return numberPayload(sysGetDisconnectsKeepAlive());

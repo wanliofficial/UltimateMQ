@@ -444,6 +444,14 @@ size_t Session::getSubscriptionCount() {
     return subscriptions.size();
 }
 
+size_t Session::getInflightCount() {
+    std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
+    // Both legs occupy a Receive Maximum slot (MQTT-4.9 / MQTT-3.1.2-26): a QoS 1
+    // message stays in inflightMessages until its PUBACK; a QoS 2 message moves to
+    // pendingPubrel once the PUBREL is sent and stays there until the PUBCOMP.
+    return inflightMessages.size() + pendingPubrel.size();
+}
+
 size_t Session::getSharedSubscriptionCount() {
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
     size_t count = 0;

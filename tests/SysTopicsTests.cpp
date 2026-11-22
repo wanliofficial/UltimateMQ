@@ -6,6 +6,7 @@
 #include "../src/Session.h"
 #include "../src/SysTopics.h"
 #include "../src/Topic.h"
+#include "TestClient.h"
 
 namespace MQTT {
 
@@ -39,17 +40,17 @@ TEST(SysTopicsTest, PublishesEveryMonitoringTopic)
     // The broker refreshes exactly the topics it advertises, so each name in
     // allTopics() must produce a payload.
     for (const std::string &topic : SysTopics::allTopics()) {
-        EXPECT_FALSE(SysTopics::payload(topic, 1, 1, 1, 1).empty())
+        EXPECT_FALSE(SysTopics::payload(topic, 1, 1, 1, 1, 1).empty())
             << "no payload for " << topic;
     }
 }
 
 TEST(SysTopicsTest, CountsAreReportedAsDecimalNumbers)
 {
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/clients/connected", 3, 3, 0, 0), "3");
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/clients/total", 0, 7, 0, 0), "7");
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/subscriptions/count", 0, 0, 5, 0), "5");
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/retaineds/count", 0, 0, 0, 4), "4");
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/clients/connected", 3, 3, 0, 0, 0), "3");
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/clients/total", 0, 7, 0, 0, 0), "7");
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/subscriptions/count", 0, 0, 5, 0, 0), "5");
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/retaineds/count", 0, 0, 0, 0, 4), "4");
 }
 
 TEST(SysTopicsTest, DroppedCountReflectsTheProcessCounter)
@@ -58,9 +59,9 @@ TEST(SysTopicsTest, DroppedCountReflectsTheProcessCounter)
     // connected/sessions/retained topics its value comes from a process-wide
     // counter (the same one sent/received use), not from the arguments, so a
     // subscriber sees the live cumulative drop count as a plain decimal.
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/messages/dropped", 0, 0, 0, 0),
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/messages/dropped", 0, 0, 0, 0, 0),
               std::to_string(sysGetTotalDropped()));
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/messages/dropped", 99, 0, 0, 0),
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/messages/dropped", 99, 0, 0, 0, 0),
               std::to_string(sysGetTotalDropped()));
 }
 
@@ -87,10 +88,10 @@ TEST(SysTopicsTest, WriteBufferBytesIsTheLiveGauge)
     // counters passed into payload(); it reads the live write-buffer occupancy
     // directly, so a subscriber sees current buffering as a plain decimal that
     // rises while a slow reader is behind and falls again as it drains.
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/writebuffer/bytes", 7, 7, 7, 7),
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/writebuffer/bytes", 7, 7, 7, 7, 7),
               std::to_string(sysGetWriteBufferBytes()));
     // The connected-clients gauge is the other live value exposed this way.
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/clients/connected", 0, 0, 0, 0),
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/clients/connected", 0, 0, 0, 0, 0),
               std::to_string(sysGetConnectedClients()));
 }
 
@@ -132,7 +133,7 @@ TEST(SysTopicsTest, QueuedBytesIsTheLiveGauge)
     // queues messages for slow consumers and falls as they are flushed, dropped
     // or acknowledged -- the stage of backpressure that writebuffer/bytes (the
     // socket) and messages/dropped (post-loss) cannot show.
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/queued/bytes", 7, 7, 7, 7),
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/queued/bytes", 7, 7, 7, 7, 7),
               std::to_string(sysGetQueuedBytes()));
 }
 
@@ -238,8 +239,8 @@ TEST(SysTopicsTest, DisconnectCategoriesClassifyEveryReason)
 
 TEST(SysTopicsTest, UnknownTopicYieldsNoPayload)
 {
-    EXPECT_TRUE(SysTopics::payload("$SYS/does/not/exist", 0, 0, 0, 0).empty());
-    EXPECT_TRUE(SysTopics::payload("not/sys", 0, 0, 0, 0).empty());
+    EXPECT_TRUE(SysTopics::payload("$SYS/does/not/exist", 0, 0, 0, 0, 0).empty());
+    EXPECT_TRUE(SysTopics::payload("not/sys", 0, 0, 0, 0, 0).empty());
 }
 
 // The next tests exercise the broker-level behaviour of the $SYS tree:
@@ -308,6 +309,74 @@ TEST(SysTopicsTest, SubscriptionCountIsInTheMonitoringTree)
         }
     }
     EXPECT_TRUE(found) << "subscriptions/count topic missing from allTopics()";
+}
+
+TEST(SysTopicsTest, InflightCountTracksQoSFlowControlOccupancy)
+{
+    // $SYS/broker/inflight/count is the count counterpart to queued/bytes: QoS
+    // 1/2 messages the broker has handed to the client but the client has not yet
+    // acknowledged. Each occupies a Receive Maximum slot (MQTT-4.9), so the sum is
+    // the broker's live flow-control occupancy. A QoS 2 message stays counted
+    // across BOTH legs -- PUBLISH..PUBACK and PUBREL..PUBCOMP -- because
+    // pubrec() moves the id from inflightMessages to pendingPubrel, and both sets
+    // occupy the window.
+    Broker broker;
+    broker.setSysTopics(true);
+    broker.sweepExpiredSessions();
+    auto count = [&] {
+        broker.refreshSysTopics();
+        auto values = broker.sysTopicValues();
+        auto it = values.find("$SYS/broker/inflight/count");
+        return it == values.end() ? 0u : std::stoul(it->second);
+    };
+
+    ASSERT_EQ(count(), 0u);
+
+    auto session = std::make_shared<Session>(&broker, "inflight-c");
+    session->connect(session, /*persistent=*/true);
+    auto client = test::attach(*session);
+    SubscriptionOptions options;
+    options.maximumQos = QoS::QOS_2;
+    session->subscribe("q/#", options);
+
+    // One QoS 1 and one QoS 2 message delivered and not yet acknowledged.
+    broker.publish(Message("q/t", "a", QoS::QOS_1));
+    broker.publish(Message("q/t", "b", QoS::QOS_2));
+    session->flush();
+    ASSERT_EQ(client->size(), 2u);
+    EXPECT_EQ(count(), 2u);
+
+    const uint16_t qos1Id = client->packetIds[0];
+    const uint16_t qos2Id = client->packetIds[1];
+
+    // A QoS 1 message leaves the window on its PUBACK.
+    session->puback(qos1Id);
+    EXPECT_EQ(count(), 1u);
+
+    // A QoS 2 message does NOT leave on PUBREC: the flow swaps to the PUBREL /
+    // PUBCOMP leg, still consuming a slot, so the count must stay at 1. (Counting
+    // only inflightMessages here would wrongly drop it to 0 during that leg and
+    // let the flow admit an extra message, MQTT-4.9.)
+    session->pubrec(qos2Id, ReasonCode::SUCCESS);
+    EXPECT_EQ(count(), 1u);
+
+    // Only the PUBCOMP completes the QoS 2 handshake and frees the slot.
+    session->pubcomp(qos2Id);
+    EXPECT_EQ(count(), 0u);
+}
+
+TEST(SysTopicsTest, InflightCountIsInTheMonitoringTree)
+{
+    EXPECT_EQ(SysTopics::matchedCount("$SYS/broker/inflight/count"), 1u);
+    EXPECT_EQ(SysTopics::matchedCount("$SYS/#"), SysTopics::allTopics().size());
+    bool found = false;
+    for (const auto &topic : SysTopics::allTopics()) {
+        if (topic == "$SYS/broker/inflight/count") {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found) << "inflight/count topic missing from allTopics()";
 }
 
 TEST(SysTopicsTest, RetainedCountExcludesTheMonitoringTree)

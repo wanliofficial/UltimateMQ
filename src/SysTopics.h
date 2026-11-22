@@ -57,6 +57,7 @@ size_t sysGetDisconnectsOther();
 //!   $SYS/broker/messages/sent        total PUBLISHes the broker has delivered
 //!   $SYS/broker/messages/received    total PUBLISHes the broker has accepted
 //!   $SYS/broker/messages/dropped     total PUBLISHes dropped under backpressure
+//!   $SYS/broker/inflight/count       QoS 1/2 messages sent but not yet acknowledged (Receive Maximum occupancy)
 //!   $SYS/broker/writebuffer/bytes    live outbound write-buffer bytes (backpressure gauge)
 //!   $SYS/broker/queued/bytes         live in-memory bytes of undelivered messages (backpressure gauge)
 //!   $SYS/broker/retaineds/count      number of retained messages held
@@ -80,12 +81,12 @@ const std::vector<std::string> &allTopics();
 size_t matchedCount(const std::string &topicFilter);
 
 //! Build the payload of one $SYS topic from the broker's counters. All the
-//! counts (connected clients, sessions, subscription instances, retained
-//! messages) are read under the broker lock by the caller; the rest use
-//! process-wide state, so the payload of a single topic is internally
-//! consistent. Returns an empty string for an unknown topic.
+//! counts (connected clients, sessions, subscription instances, in-flight QoS
+//! messages, retained messages) are read under the broker lock by the caller;
+//! the rest use process-wide state, so the payload of a single topic is
+//! internally consistent. Returns an empty string for an unknown topic.
 std::string payload(const std::string &topic, size_t connected, size_t sessions,
-                    size_t subscriptions, size_t retained);
+                    size_t subscriptions, size_t inflight, size_t retained);
 
 } // namespace SysTopics
 

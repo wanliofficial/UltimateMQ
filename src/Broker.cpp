@@ -698,12 +698,24 @@ std::map<std::string, std::string> Broker::sysTopicValues() const {
     size_t sessionCount = 0;
     size_t retainedCount = 0;
     size_t subscriptionCount = 0;
+    size_t inflightCount = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(mutex);
         for (const auto &[clientId, session] : sessions) {
-            if (session && session->isConnected()) {
+            if (!session) {
+                continue;
+            }
+            if (session->isConnected()) {
                 ++connected;
             }
+            // QoS 1/2 messages the broker has sent but the client has not yet
+            // acknowledged, aggregated across every session. Each occupies a
+            // Receive Maximum slot (MQTT-4.9), so this is the broker's live
+            // flow-control occupancy: it rises when clients are slow to ack and
+            // is the count counterpart to queued/bytes (which also covers the
+            // not-yet-sent queue and QoS 0). Safely read under the broker lock:
+            // Broker -> Session is the documented lock order.
+            inflightCount += session->getInflightCount();
         }
         sessionCount = sessions.size();
         // Total subscription instances the broker routes: every (client, filter)
@@ -731,8 +743,9 @@ std::map<std::string, std::string> Broker::sysTopicValues() const {
         }
     }
     for (const std::string &topic : SysTopics::allTopics()) {
-        const std::string value =
-            SysTopics::payload(topic, connected, sessionCount, subscriptionCount, retainedCount);
+        const std::string value = SysTopics::payload(topic, connected, sessionCount,
+                                                     subscriptionCount, inflightCount,
+                                                     retainedCount);
         if (!value.empty()) {
             values[topic] = value;
         }
