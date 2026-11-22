@@ -186,6 +186,12 @@ public:
     //! connections) by \p delta. Called by Connection as its buffer grows and
     //! drains, so $SYS/broker/writebuffer/bytes reflects current backpressure.
     void adjustWriteBufferBytes(int64_t delta);
+    //! Adjust the live in-memory queued-bytes gauge (bytes of undelivered
+    //! messages held across all sessions) by \p delta. Called by Session as its
+    //! delivery queues grow and drain, so $SYS/broker/queued/bytes reflects
+    //! current in-process backpressure before any message is dropped or handed to
+    //! the socket.
+    void adjustQueuedBytes(int64_t delta);
     //! Adjust the live connected-clients gauge by \p delta (+1 on connect,
     //! -1 on disconnect). Backs the connection-count view of the monitoring tree.
     void adjustConnectedClients(int64_t delta);

@@ -26,6 +26,16 @@ std::atomic<uint64_t> totalMessagesDropped{0};
 // building BEFORE messages are dropped (messages/dropped stays 0 until a loss
 // has already happened).
 std::atomic<uint64_t> liveWriteBufferBytes{0};
+//! Live in-memory occupancy of every session's undelivered messages (payload +
+//! topic bytes in pendingDeliveries + blockedDeliveries + inflightMessages). A
+//! gauge, not a counter: it rises as fan-out queues messages for slow consumers
+//! and falls as they are flushed, dropped or acknowledged. It backs
+//! $SYS/broker/queued/bytes, the in-process stage of the backpressure signal
+//! that writebuffer/bytes (the socket buffer) and messages/dropped (post-loss)
+//! cannot see: under the default DropNewest policy a message can be discarded
+//! before it ever reaches the socket, so this gauge is the only one that shows
+//! the pressure building up beforehand.
+std::atomic<uint64_t> liveQueuedBytes{0};
 std::atomic<uint64_t> liveConnectedClients{0};
 std::chrono::steady_clock::time_point sysStartedAt{std::chrono::steady_clock::now()};
 
@@ -565,12 +575,20 @@ size_t sysGetWriteBufferBytes() {
     return liveWriteBufferBytes.load(std::memory_order_relaxed);
 }
 
+size_t sysGetQueuedBytes() {
+    return liveQueuedBytes.load(std::memory_order_relaxed);
+}
+
 size_t sysGetConnectedClients() {
     return liveConnectedClients.load(std::memory_order_relaxed);
 }
 
 void Broker::adjustWriteBufferBytes(int64_t delta) {
     liveWriteBufferBytes.fetch_add(delta, std::memory_order_relaxed);
+}
+
+void Broker::adjustQueuedBytes(int64_t delta) {
+    liveQueuedBytes.fetch_add(delta, std::memory_order_relaxed);
 }
 
 void Broker::adjustConnectedClients(int64_t delta) {

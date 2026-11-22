@@ -1,8 +1,9 @@
 #include <gtest/gtest.h>
 
-#include "Broker.h"
-#include "SysTopics.h"
-#include "Topic.h"
+#include "../src/Broker.h"
+#include "../src/Session.h"
+#include "../src/SysTopics.h"
+#include "../src/Topic.h"
 
 namespace MQTT {
 
@@ -102,6 +103,74 @@ TEST(SysTopicsTest, WriteBufferBytesIsInTheMonitoringTree)
         }
     }
     EXPECT_TRUE(found) << "writebuffer/bytes topic missing from allTopics()";
+}
+
+TEST(SysTopicsTest, QueuedBytesIsInTheMonitoringTree)
+{
+    EXPECT_EQ(SysTopics::matchedCount("$SYS/broker/queued/bytes"), 1u);
+    EXPECT_EQ(SysTopics::matchedCount("$SYS/#"), SysTopics::allTopics().size());
+    bool found = false;
+    for (const auto &topic : SysTopics::allTopics()) {
+        if (topic == "$SYS/broker/queued/bytes") {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found) << "queued/bytes topic missing from allTopics()";
+}
+
+TEST(SysTopicsTest, QueuedBytesIsTheLiveGauge)
+{
+    // $SYS/broker/queued/bytes backs the live in-memory queued-bytes gauge: the
+    // bytes of undelivered messages held across all session queues. Like the
+    // write-buffer gauge it is not one of the cumulative counters passed into
+    // payload(); it reads the live gauge directly, so a subscriber sees the
+    // current in-process backpressure as a plain decimal that rises as fan-out
+    // queues messages for slow consumers and falls as they are flushed, dropped
+    // or acknowledged -- the stage of backpressure that writebuffer/bytes (the
+    // socket) and messages/dropped (post-loss) cannot show.
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/queued/bytes", 7, 7, 7),
+              std::to_string(sysGetQueuedBytes()));
+}
+
+TEST(SysTopicsTest, QueuedBytesGaugeRisesAndFallsWithDelivery)
+{
+    // Drive a real session's queues through publish -> discard and check the live
+    // gauge tracks the held bytes and returns exactly to zero, proving the
+    // session reconciles the gauge on enqueue and on teardown with no drift.
+    Broker broker;
+    broker.setSysTopics(true);
+    broker.sweepExpiredSessions();
+    // The gauge is process-wide; other tests in the suite may leave held bytes,
+    // so measure the delta around this session's activity rather than assuming a
+    // zero baseline.
+    const size_t baseline = sysGetQueuedBytes();
+
+    auto session = std::make_shared<Session>(&broker, "queued-gauge", /*cleanStart=*/false);
+    session->setPersistent(true);
+    session->connect(session, /*persistent=*/true);
+    session->subscribe("t/#", SubscriptionOptions{});
+    // No client attached: the session is offline, so flush() keeps the queue and
+    // the published messages stay held in memory.
+
+    // Two QoS 1 messages (payload 1000 + topic "t/a") and one QoS 0 (payload 50
+    // + topic "t/b"). With no client bound to flush() they sit in the queues.
+    std::string big(1000, 'x');
+    broker.publish(Message("t/a", big, QoS::QOS_1));
+    broker.publish(Message("t/b", std::string(50, 'y'), QoS::QOS_0));
+    broker.publish(Message("t/c", big, QoS::QOS_1));
+    broker.sweepExpiredSessions();
+
+    // 2 * (1000 payload + 3 topic) + 1 * (50 payload + 3 topic) added on top of
+    // whatever the gauge already held.
+    const size_t expected = baseline + 2 * (1000 + 3) + (50 + 3);
+    EXPECT_EQ(sysGetQueuedBytes(), expected);
+
+    // Discarding the session throws away everything it held; the gauge must drop
+    // back to the baseline (the session reconciles on teardown).
+    session->discard();
+    broker.sweepExpiredSessions();
+    EXPECT_EQ(sysGetQueuedBytes(), baseline);
 }
 
 TEST(SysTopicsTest, UnknownTopicYieldsNoPayload)

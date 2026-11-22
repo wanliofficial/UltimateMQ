@@ -97,6 +97,9 @@ void Session::restore(const Snapshot &snapshot) {
         } else {
             hasExpiry = false;
         }
+        // The restored queues carry bytes that must be reflected in the live
+        // queued-bytes gauge.
+        syncQueuedBytesLocked();
     }
     connected = false;
 }
@@ -138,6 +141,9 @@ void Session::close(const std::shared_ptr<Client> &client) {
             inflightMessages.clear();
             awaitingPubrel.clear();
             pendingPubrel.clear();
+            // The queues are now empty; reconcile the gauge (the held bytes just
+            // left this session's contribution).
+            syncQueuedBytesLocked();
             filters.swap(subscriptions);
         }
         // A persistent session keeps its subscriptions, its offline message
@@ -184,6 +190,43 @@ uint64_t Session::countHeldDeliveriesLocked() {
     return lost;
 }
 
+size_t Session::queuedBytesApprox() const {
+    // Directional, allocator-independent estimate: the payload plus the topic
+    // name of every undelivered message. Both grow with the traffic a consumer
+    // is falling behind on, which is what the gauge is meant to show. Property
+    // storage and container overhead are intentionally excluded.
+    size_t total = 0;
+    for (const auto &d : pendingDeliveries) {
+        total += d.message.payload.size() + d.message.topic.size();
+    }
+    for (const auto &d : blockedDeliveries) {
+        total += d.message.payload.size() + d.message.topic.size();
+    }
+    for (const auto &[id, message] : inflightMessages) {
+        total += message->payload.size() + message->topic.size();
+    }
+    return total;
+}
+
+void Session::syncQueuedBytesLocked() {
+    if (!broker) {
+        return;
+    }
+    // Reconcile the gauge with reality by recounting the whole queue set and
+    // applying only the difference from what this session last reported. This
+    // stays exact no matter how the containers changed (enqueue, flush, drop,
+    // clear, restore, reconnect), because it never assumes a particular delta:
+    // it derives it from the current contents. Called with deliveryMutex held;
+    // adjustQueuedBytes touches only the broker's atomic gauge, so it takes no
+    // broker lock and cannot deadlock against the broker-lock fan-out path.
+    const size_t now = queuedBytesApprox();
+    const int64_t delta = static_cast<int64_t>(now) - static_cast<int64_t>(reportedQueuedBytes);
+    if (delta != 0) {
+        reportedQueuedBytes = static_cast<uint64_t>(now);
+        broker->adjustQueuedBytes(delta);
+    }
+}
+
 void Session::discard() {
     logDebug("session discarded: %s", clientId.c_str());
     std::function<void()> notify;
@@ -205,6 +248,9 @@ void Session::discard() {
         inflightMessages.clear();
         awaitingPubrel.clear();
         pendingPubrel.clear();
+        // Everything the session was holding is gone; reconcile the gauge down to
+        // this session's (now zero) contribution.
+        syncQueuedBytesLocked();
         client.reset();
         notify = std::move(onDisconnect);
         onDisconnect = nullptr;
@@ -279,6 +325,9 @@ void Session::puback(uint16_t packetId) {
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
     if (inflightMessages.erase(packetId) > 0) {
         inflightIdentifiers.erase(packetId);
+        // The acknowledged message's bytes left the inflight set; reconcile the
+        // gauge (its queued copy was already handed to the client by flush()).
+        syncQueuedBytesLocked();
         notifyMutation();
         releaseBlocked();
     }
@@ -297,6 +346,8 @@ std::optional<ReasonCode> Session::pubrec(uint16_t packetId, ReasonCode clientRe
         // of the QoS 2 flow is outstanding. Remember it so a resume can re-send
         // the PUBREL if the connection drops before the PUBCOMP (MQTT-4.4.0-1).
         // A rejected message has no such leg, so its id is not remembered.
+        // Either way the inflight copy's bytes left the held set; reconcile.
+        syncQueuedBytesLocked();
         if (!rejected) {
             pendingPubrel.insert(packetId);
         }
@@ -341,6 +392,8 @@ void Session::pubcomp(uint16_t packetId) {
         freed = true;
     }
     if (freed) {
+        // The completed QoS 2 message's bytes left the inflight set; reconcile.
+        syncQueuedBytesLocked();
         notifyMutation();
         releaseBlocked();
     }
@@ -363,6 +416,8 @@ void Session::retransmitInflight(uint16_t packetId) {
     }
     pendingDeliveries.emplace_back(std::move(outgoing), packetId, it->second->qos, identifiers,
                                    ++deliverySequence);
+    // The retransmission occupies the in-memory queue again; reconcile the gauge.
+    syncQueuedBytesLocked();
 }
 
 void Session::subscribe(const std::string &topicFilter, const SubscriptionOptions &options) {
@@ -423,7 +478,12 @@ bool Session::unsubscribe(const std::string &topicFilter) {
 void Session::bindClient(const std::shared_ptr<Client>& client) {
     std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
     this->client = client;
-    pendingDeliveries.clear();
+    // A reconnecting client abandons whatever it was still owed: those undelivered
+    // messages leave this session's queue and the gauge must reflect that.
+    if (!pendingDeliveries.empty()) {
+        pendingDeliveries.clear();
+        syncQueuedBytesLocked();
+    }
 }
 
 void Session::resume(const std::shared_ptr<Client>& client, Version protocolVersion) {
@@ -689,6 +749,8 @@ void Session::pushDelivery(const Message &message, QoS qos,
                  clientId.c_str(), receiveMaximum, message.topic.c_str());
         blockedDeliveries.emplace_back(std::move(outgoing), /*packetId=*/0, qos,
                                        subscriptionIdentifiers, sequence);
+        // This message now occupies the in-memory queue; reconcile the gauge.
+        syncQueuedBytesLocked();
         return;
     }
     uint16_t id = 0;
@@ -705,6 +767,9 @@ void Session::pushDelivery(const Message &message, QoS qos,
     // Only queue while the broker lock is held (Broker::publish) or while this
     // session lock is held: flush() is then called outside of both.
     pendingDeliveries.emplace_back(std::move(outgoing), id, qos, subscriptionIdentifiers, sequence);
+    // The message (and, for QoS>0, its inflight copy) now occupies the in-memory
+    // queue; reconcile the gauge.
+    syncQueuedBytesLocked();
 }
 
 void Session::releaseInflightIfPresent(uint16_t packetId) {
@@ -721,6 +786,8 @@ void Session::releaseInflightIfPresent(uint16_t packetId) {
     }
     if (freed) {
         notifyMutation();
+        // The inflight copy's bytes left the held set; reconcile the gauge.
+        syncQueuedBytesLocked();
     }
 }
 
@@ -746,12 +813,16 @@ void Session::dropOldestQueued() {
         }
         logDebug("session %s: queue full, dropping oldest queued message on %s "
                  "(drop-oldest backpressure)", clientId.c_str(), dropped.message.topic.c_str());
+        // A held message left the queue (and its inflight copy, if any, was just
+        // released); reconcile the gauge down.
+        syncQueuedBytesLocked();
         return;
     }
     const Delivery dropped = std::move(blockedDeliveries.front());
     blockedDeliveries.erase(blockedDeliveries.begin());
     logDebug("session %s: queue full, dropping oldest blocked message on %s "
              "(drop-oldest backpressure)", clientId.c_str(), dropped.message.topic.c_str());
+    syncQueuedBytesLocked();
 }
 
 void Session::releaseBlocked() {
@@ -777,6 +848,10 @@ void Session::releaseBlocked() {
         pendingDeliveries.emplace_back(std::move(blocked.message), id, blocked.qos,
                                         blocked.subscriptionIdentifiers);
     }
+    // The promotions are byte-neutral moves (blocked -> pending + inflight), so
+    // this normally adjusts nothing; the recount keeps the gauge exact if the
+    // window bounds admitted fewer than all blocked messages.
+    syncQueuedBytesLocked();
 }
 
 void Session::flush() {
@@ -791,6 +866,11 @@ void Session::flush() {
             return;
         }
         deliveries.swap(pendingDeliveries);
+        // The queued messages are now handed to the client: their bytes leave the
+        // in-memory held set regardless of whether the socket takes them now. Sync
+        // here (still under deliveryMutex) so the gauge drops at hand-off, not when
+        // flush() returns and the local vector is destroyed.
+        syncQueuedBytesLocked();
     }
     for (const auto &delivery : deliveries) {
         // Skip messages that expired while queued offline: delivering a stale
@@ -829,6 +909,8 @@ void Session::releaseInflight(uint16_t packetId) {
     }
     if (freed) {
         notifyMutation();
+        // The inflight copy's bytes left the held set; reconcile the gauge.
+        syncQueuedBytesLocked();
         releaseBlocked();
     }
 }

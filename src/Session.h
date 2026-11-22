@@ -260,6 +260,11 @@ private:
     //! MQTT 5 Receive Maximum. They have no packet id yet and are not inflight,
     //! so they are not retransmitted until released into the inflight set.
     std::vector<Delivery> blockedDeliveries;
+    //! The queued-bytes contribution this session has most recently reported to
+    //! the broker's live gauge (via syncQueuedBytesLocked). The delta between it
+    //! and a fresh recount is what gets added to the gauge, so the gauge stays
+    /// accurate as messages enter and leave the queues. Guarded by deliveryMutex.
+    uint64_t reportedQueuedBytes = 0;
     std::shared_ptr<Client> client;
 
     //! Disconnect-time session expiry. hasExpiry marks the deadline as armed;
@@ -292,6 +297,21 @@ private:
     //! that had claimed an inflight slot releases it, so the Receive Maximum
     //! window never leaks. Called with deliveryMutex held.
     void dropOldestQueued();
+    //! Approximate in-memory bytes the session's undelivered messages occupy
+    //! (payload + topic of every pending, flow-blocked and unacknowledged
+    //! inflight message). Used only for the $SYS/broker/queued/bytes gauge, so
+    //! it deliberately counts neither container/vector overhead nor property
+    //! storage: it is a directional backpressure signal, not an allocator-accurate
+    //! figure. Reads only; may be called with or without deliveryMutex held (it
+    //! copies nothing and touches no shared mutable state).
+    size_t queuedBytesApprox() const;
+    //! Reconcile the broker's live queued-bytes gauge with what this session
+    //! currently holds, by recounting all three delivery queues and applying the
+    //! difference. Called with deliveryMutex held at every point the queues
+    //! change (enqueue, flush, drop, discard, restore, reconnect), so the gauge
+    //! tracks the real in-process buffer instead of drifting. A no-op without a
+    //! broker. Purely informational: nothing depends on it for correctness.
+    void syncQueuedBytesLocked();
     //! Forget an inflight QoS>0 message and release its window slot without
     //! retransmitting it (used when a queued copy is dropped before it was ever
     //! sent). Called with deliveryMutex held.

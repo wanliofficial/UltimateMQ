@@ -22,6 +22,7 @@ const std::vector<std::string> kTopics = {
     "$SYS/broker/messages/received",
     "$SYS/broker/messages/dropped",
     "$SYS/broker/writebuffer/bytes",
+    "$SYS/broker/queued/bytes",
     "$SYS/broker/retaineds/count",
     "$SYS/broker/uptime",
     "$SYS/broker/load",
@@ -85,6 +86,9 @@ std::string payload(const std::string &topic, size_t connected, size_t sessions,
     }
     if (topic == "$SYS/broker/writebuffer/bytes") {
         return numberPayload(sysGetWriteBufferBytes());
+    }
+    if (topic == "$SYS/broker/queued/bytes") {
+        return numberPayload(sysGetQueuedBytes());
     }
     if (topic == "$SYS/broker/retaineds/count") {
         return numberPayload(retained);
