@@ -80,13 +80,32 @@ const std::vector<std::string> &allTopics();
 //! be a concrete name or a wildcard; a leading level wildcard matches none.
 size_t matchedCount(const std::string &topicFilter);
 
-//! Build the payload of one $SYS topic from the broker's counters. All the
-//! counts (connected clients, sessions, subscription instances, in-flight QoS
-//! messages, retained messages) are read under the broker lock by the caller;
-//! the rest use process-wide state, so the payload of a single topic is
-//! internally consistent. Returns an empty string for an unknown topic.
-std::string payload(const std::string &topic, size_t connected, size_t sessions,
-                    size_t subscriptions, size_t inflight, size_t retained);
+//! The broker-level counts the $SYS tree reports, gathered by the caller under
+//! the broker lock. A named-field record, not a long positional argument list:
+//! every field is a size_t, so appending a metric to a positional signature
+//! invites a silent transposition at one of the call sites (swapping, say,
+//! subscriptions and inflight), which would report the wrong number under a
+//! correct-looking topic.
+struct BrokerCounts {
+    //! Clients whose connection is currently up.
+    size_t connected = 0;
+    //! Sessions the broker holds, connected or not.
+    size_t sessions = 0;
+    //! Subscription instances the broker routes: every (client, filter) normal
+    //! subscription plus every shared-subscription member.
+    size_t subscriptions = 0;
+    //! QoS 1/2 messages handed to a client but not yet acknowledged, across all
+    //! sessions (the live Receive Maximum occupancy, MQTT-4.9).
+    size_t inflight = 0;
+    //! Retained messages held, excluding the broker's own $SYS tree.
+    size_t retained = 0;
+};
+
+//! Build the payload of one $SYS topic from the broker's counters. The counts in
+//! \p counts are read under the broker lock by the caller; the rest use
+//! process-wide state, so the payload of a single topic is internally consistent.
+//! Returns an empty string for an unknown topic.
+std::string payload(const std::string &topic, const BrokerCounts &counts);
 
 } // namespace SysTopics
 

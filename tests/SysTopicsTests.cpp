@@ -39,18 +39,30 @@ TEST(SysTopicsTest, PublishesEveryMonitoringTopic)
 {
     // The broker refreshes exactly the topics it advertises, so each name in
     // allTopics() must produce a payload.
+    SysTopics::BrokerCounts counts;
+    counts.connected = counts.sessions = counts.subscriptions = counts.inflight =
+        counts.retained = 1;
     for (const std::string &topic : SysTopics::allTopics()) {
-        EXPECT_FALSE(SysTopics::payload(topic, 1, 1, 1, 1, 1).empty())
+        EXPECT_FALSE(SysTopics::payload(topic, counts).empty())
             << "no payload for " << topic;
     }
 }
 
 TEST(SysTopicsTest, CountsAreReportedAsDecimalNumbers)
 {
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/clients/connected", 3, 3, 0, 0, 0), "3");
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/clients/total", 0, 7, 0, 0, 0), "7");
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/subscriptions/count", 0, 0, 5, 0, 0), "5");
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/retaineds/count", 0, 0, 0, 0, 4), "4");
+    // Each named field feeds its own topic; distinct values prove the report is
+    // not reading a neighbour's field.
+    SysTopics::BrokerCounts counts;
+    counts.connected = 3;
+    counts.sessions = 7;
+    counts.subscriptions = 5;
+    counts.inflight = 9;
+    counts.retained = 4;
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/clients/connected", counts), "3");
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/clients/total", counts), "7");
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/subscriptions/count", counts), "5");
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/inflight/count", counts), "9");
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/retaineds/count", counts), "4");
 }
 
 TEST(SysTopicsTest, DroppedCountReflectsTheProcessCounter)
@@ -59,9 +71,12 @@ TEST(SysTopicsTest, DroppedCountReflectsTheProcessCounter)
     // connected/sessions/retained topics its value comes from a process-wide
     // counter (the same one sent/received use), not from the arguments, so a
     // subscriber sees the live cumulative drop count as a plain decimal.
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/messages/dropped", 0, 0, 0, 0, 0),
+    SysTopics::BrokerCounts zeros;
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/messages/dropped", zeros),
               std::to_string(sysGetTotalDropped()));
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/messages/dropped", 99, 0, 0, 0, 0),
+    SysTopics::BrokerCounts high;
+    high.connected = 99;
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/messages/dropped", high),
               std::to_string(sysGetTotalDropped()));
 }
 
@@ -88,10 +103,15 @@ TEST(SysTopicsTest, WriteBufferBytesIsTheLiveGauge)
     // counters passed into payload(); it reads the live write-buffer occupancy
     // directly, so a subscriber sees current buffering as a plain decimal that
     // rises while a slow reader is behind and falls again as it drains.
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/writebuffer/bytes", 7, 7, 7, 7, 7),
+    // The counts are deliberately non-zero: neither topic may read them.
+    SysTopics::BrokerCounts counts;
+    counts.connected = counts.sessions = counts.subscriptions = counts.inflight =
+        counts.retained = 7;
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/writebuffer/bytes", counts),
               std::to_string(sysGetWriteBufferBytes()));
     // The connected-clients gauge is the other live value exposed this way.
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/clients/connected", 0, 0, 0, 0, 0),
+    SysTopics::BrokerCounts zeros;
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/clients/connected", zeros),
               std::to_string(sysGetConnectedClients()));
 }
 
@@ -133,7 +153,10 @@ TEST(SysTopicsTest, QueuedBytesIsTheLiveGauge)
     // queues messages for slow consumers and falls as they are flushed, dropped
     // or acknowledged -- the stage of backpressure that writebuffer/bytes (the
     // socket) and messages/dropped (post-loss) cannot show.
-    EXPECT_EQ(SysTopics::payload("$SYS/broker/queued/bytes", 7, 7, 7, 7, 7),
+    SysTopics::BrokerCounts counts;
+    counts.connected = counts.sessions = counts.subscriptions = counts.inflight =
+        counts.retained = 7;
+    EXPECT_EQ(SysTopics::payload("$SYS/broker/queued/bytes", counts),
               std::to_string(sysGetQueuedBytes()));
 }
 
@@ -239,8 +262,9 @@ TEST(SysTopicsTest, DisconnectCategoriesClassifyEveryReason)
 
 TEST(SysTopicsTest, UnknownTopicYieldsNoPayload)
 {
-    EXPECT_TRUE(SysTopics::payload("$SYS/does/not/exist", 0, 0, 0, 0, 0).empty());
-    EXPECT_TRUE(SysTopics::payload("not/sys", 0, 0, 0, 0, 0).empty());
+    SysTopics::BrokerCounts counts;
+    EXPECT_TRUE(SysTopics::payload("$SYS/does/not/exist", counts).empty());
+    EXPECT_TRUE(SysTopics::payload("not/sys", counts).empty());
 }
 
 // The next tests exercise the broker-level behaviour of the $SYS tree:

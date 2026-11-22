@@ -75,19 +75,18 @@ size_t matchedCount(const std::string &topicFilter) {
     return count;
 }
 
-std::string payload(const std::string &topic, size_t connected, size_t sessions,
-                    size_t subscriptions, size_t inflight, size_t retained) {
+std::string payload(const std::string &topic, const BrokerCounts &counts) {
     if (topic == "$SYS/broker/clients/connected") {
-        return numberPayload(connected);
+        return numberPayload(counts.connected);
     }
     if (topic == "$SYS/broker/clients/total") {
-        return numberPayload(sessions);
+        return numberPayload(counts.sessions);
     }
     if (topic == "$SYS/broker/subscriptions/count") {
-        return numberPayload(subscriptions);
+        return numberPayload(counts.subscriptions);
     }
     if (topic == "$SYS/broker/inflight/count") {
-        return numberPayload(inflight);
+        return numberPayload(counts.inflight);
     }
     if (topic == "$SYS/broker/disconnect/keepalive") {
         return numberPayload(sysGetDisconnectsKeepAlive());
@@ -123,7 +122,7 @@ std::string payload(const std::string &topic, size_t connected, size_t sessions,
         return numberPayload(sysGetQueuedBytes());
     }
     if (topic == "$SYS/broker/retaineds/count") {
-        return numberPayload(retained);
+        return numberPayload(counts.retained);
     }
     if (topic == "$SYS/broker/uptime") {
         return numberPayload(static_cast<size_t>(sysUptimeSeconds()));

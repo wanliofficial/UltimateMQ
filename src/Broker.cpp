@@ -694,11 +694,9 @@ std::map<std::string, std::string> Broker::sysTopicValues() const {
     if (!sysTopicsEnabled) {
         return values;
     }
-    size_t connected = 0;
-    size_t sessionCount = 0;
-    size_t retainedCount = 0;
-    size_t subscriptionCount = 0;
-    size_t inflightCount = 0;
+    // Gather every broker-level count under the broker lock, then build each
+    // topic's payload from the snapshot outside the (much longer) publish path.
+    SysTopics::BrokerCounts counts;
     {
         std::lock_guard<std::recursive_mutex> lock(mutex);
         for (const auto &[clientId, session] : sessions) {
@@ -706,7 +704,7 @@ std::map<std::string, std::string> Broker::sysTopicValues() const {
                 continue;
             }
             if (session->isConnected()) {
-                ++connected;
+                ++counts.connected;
             }
             // QoS 1/2 messages the broker has sent but the client has not yet
             // acknowledged, aggregated across every session. Each occupies a
@@ -714,10 +712,11 @@ std::map<std::string, std::string> Broker::sysTopicValues() const {
             // flow-control occupancy: it rises when clients are slow to ack and
             // is the count counterpart to queued/bytes (which also covers the
             // not-yet-sent queue and QoS 0). Safely read under the broker lock:
-            // Broker -> Session is the documented lock order.
-            inflightCount += session->getInflightCount();
+            // Broker -> Session is the documented lock order, and no Session
+            // method calls back into the Broker while holding its own lock.
+            counts.inflight += session->getInflightCount();
         }
-        sessionCount = sessions.size();
+        counts.sessions = sessions.size();
         // Total subscription instances the broker routes: every (client, filter)
         // normal subscription in `subscriptions`, plus every shared-subscription
         // member (which lives only in `sharedSubscriptions`, not `subscriptions`).
@@ -725,11 +724,11 @@ std::map<std::string, std::string> Broker::sysTopicValues() const {
         // the capacity-planning complement to clients/total (how many sessions)
         // and the backpressure gauges (how hard each one is pushed).
         for (const auto &[filter, clients] : subscriptions) {
-            subscriptionCount += clients.size();
+            counts.subscriptions += clients.size();
         }
         for (const auto &[filter, groups] : sharedSubscriptions) {
             for (const auto &[group, members] : groups) {
-                subscriptionCount += members.size();
+                counts.subscriptions += members.size();
             }
         }
         // $SYS/broker/retaineds/count reports the retained messages clients have
@@ -738,14 +737,12 @@ std::map<std::string, std::string> Broker::sysTopicValues() const {
         // time a topic were added), so the monitoring topics are excluded.
         for (const auto &[topic, message] : retainedMessages) {
             if (!SysTopics::isSysTopic(topic)) {
-                ++retainedCount;
+                ++counts.retained;
             }
         }
     }
     for (const std::string &topic : SysTopics::allTopics()) {
-        const std::string value = SysTopics::payload(topic, connected, sessionCount,
-                                                     subscriptionCount, inflightCount,
-                                                     retainedCount);
+        const std::string value = SysTopics::payload(topic, counts);
         if (!value.empty()) {
             values[topic] = value;
         }
