@@ -37,6 +37,7 @@ PROBES = [
     ("tls_handshake_timeout_test", "TLS handshake: a silent peer is dropped, not held forever"),
     ("mqttsn_large_publish_test", "MQTT-SN §5.2.1 three-octet Length field"),
     ("mqttsn_subscribe_topicid_test", "MQTT-SN gateway: subscribe-by-name assigns a topic id, publish-by-id is routed back to the name, id is reused on re-subscribe"),
+    ("mqttsn_register_topicid_test", "MQTT-SN REGISTER/REGACK (§5.3.8/§5.3.9): a valid name is assigned an id a publish-by-id uses, a wildcard topic name is refused with INVALID_TOPIC_ID"),
     ("write_buffer_test", "FLOWMQ_WRITE_BUFFER: a slow reader is buffered, not dropped"),
     ("sys_topics_test", "FLOWMQ_SYS_TOPICS: $SYS tree live updates, §4.7.2-1, §4.1.2-2, off by default"),
     ("topic_alias_test", "MQTT 5 Topic Alias: register/reuse over a connection + §3.3.2.7/8, §3.3.2.3.4, OASIS MQTT-474 refusals (0x82/0x94)"),
