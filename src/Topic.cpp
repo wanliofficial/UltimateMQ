@@ -51,23 +51,37 @@ bool Topic::isValid(const std::string &topic) {
     // it. Without this check "$share//t" and "$share/g" were accepted as
     // ordinary filters that simply never match, and a wildcard in the
     // ShareName was treated as one.
+    //
+    // This MUST be iterative, not recursive: a filter of the form
+    // "$share/a/$share/a/.../t" peels one prefix per level, and recursing per
+    // level let a ~45 KB SUBSCRIBE filter overflow the 512 KB per-connection
+    // thread stack (a remote denial of service). Peeling in a loop bounds the
+    // work by the filter length with no stack growth.
     const std::string sharedPrefix = "$share/";
-    if (topic.compare(0, sharedPrefix.size(), sharedPrefix) == 0) {
-        const size_t secondSlash = topic.find('/', sharedPrefix.size());
+    std::string remainder = topic;
+    while (remainder.compare(0, sharedPrefix.size(), sharedPrefix) == 0) {
+        const size_t secondSlash = remainder.find('/', sharedPrefix.size());
         if (secondSlash == std::string::npos || secondSlash == sharedPrefix.size()) {
             return false;
         }
-        const std::string shareName = topic.substr(sharedPrefix.size(),
-                                                   secondSlash - sharedPrefix.size());
+        const std::string shareName = remainder.substr(sharedPrefix.size(),
+                                                       secondSlash - sharedPrefix.size());
         if (shareName.find_first_of("+#") != std::string::npos) {
             return false;
         }
-        // The remainder is an ordinary Topic Filter and is validated as one.
-        return isValid(topic.substr(secondSlash + 1));
+        remainder = remainder.substr(secondSlash + 1);
     }
 
-    // Split the topic into levels
-    std::vector<std::string> levels = split(topic);
+    // A shared filter whose remainder is empty ("$share/g/") has no real Topic
+    // Filter after the ShareName, so it is invalid (MQTT-4.8.2-2); the recursive
+    // form caught this by validating the empty remainder as an ordinary filter.
+    // An empty (non-shared) topic is likewise invalid (MQTT-3.3.2-1).
+    if (remainder.empty()) {
+        return false;
+    }
+
+    // Split the (non-shared) topic into levels
+    std::vector<std::string> levels = split(remainder);
 
     // A wildcard character must occupy an entire level
     for (const auto& level : levels) {
