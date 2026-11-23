@@ -425,6 +425,17 @@ bool WebSocketTransport::nextFrame() {
                     return false;
                 }
             }
+            // RFC 6455 §5.2: a 127-prefixed length is an 8-byte unsigned
+            // integer whose most significant bit MUST be 0. A set MSB is a
+            // framing (protocol) error, so reject it as such with 1002 before
+            // decoding; otherwise it would surface only as an over-large length
+            // and be answered 1009, i.e. for the wrong reason.
+            if (raw_[offset] & 0x80) {
+                logDebug("websocket: 64-bit frame length has the MSB set, closing (1002)");
+                sendClose(1002);
+                closedByPeer_ = true;
+                return false;
+            }
             length = 0;
             for (int i = 0; i < 8; ++i) {
                 length = (length << 8) | raw_[offset + i];
