@@ -684,7 +684,11 @@ void Gateway::handleWillTopic(const sockaddr_in &addr, const Parsed &p) {
         }
         peer->hasWill = true;
         peer->willTopic = p.topic;
-        peer->willQos = static_cast<QoS>(p.flags.qos & 0x03);
+        // §5.3.1: a raw QoS of 3 means "QoS -1" (fire-and-forget). The publish
+        // path normalises it to QoS 0; the Will must too, or an internal QoS of
+        // 3 would be carried into the retained table and persisted, where the
+        // Store parser (bounded by QOS_2) rejects it and aborts startup.
+        peer->willQos = static_cast<QoS>(p.flags.qos == 3 ? 0 : (p.flags.qos & 0x03));
         peer->willRetain = p.flags.retain;
         peer->willPayload.clear();
     } else {
@@ -718,7 +722,9 @@ void Gateway::handleWillTopicUpdate(const sockaddr_in &addr, const Parsed &p) {
     }
     peer->hasWill = !p.topic.empty();
     peer->willTopic = p.topic;
-    peer->willQos = static_cast<QoS>(p.flags.qos & 0x03);
+    // §5.3.1 / §5.3.17: a raw QoS of 3 means "QoS -1" (fire-and-forget); the
+    // publish path normalises it to QoS 0, so the updated Will must too.
+    peer->willQos = static_cast<QoS>(p.flags.qos == 3 ? 0 : (p.flags.qos & 0x03));
     peer->willRetain = p.flags.retain;
     peer->willPayload.clear();
     sendWillResp(addr, MsgType::WILLTOPICRESP, ReturnCode::ACCEPTED);

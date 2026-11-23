@@ -59,6 +59,7 @@ PROBES = [
     ("will_delay_cancel_test", "MQTT 5 Will Delay: a reconnect inside the delay window cancels the pending Will (MQTT-3.1.4-6), while one with no reconnect does fire"),
     ("will_session_end_test", "MQTT 5 §3.1.2.11.3: ending the Session at DISCONNECT publishes an armed Will at once, not after its Will Delay"),
     ("mqttsn_qos1_ping_will_test", "MQTT-SN QoS 1 PUBACK round-trip, PINGREQ/PINGRESP, Will published on abnormal keep-alive disconnect"),
+    ("mqttsn_will_qos3_retained_test", "MQTT-SN §5.3.1: a Will with a raw QoS of 3 (\"QoS -1\") is normalised to QoS 0, so a retained Will cannot poison FLOWMQ_STATE_FILE into a startup abort"),
     ("retained_messages_test", "retained: snapshot-to-new-subscriber with RETAIN=1, live delivery clears RETAIN, empty payload clears, wildcard match"),
     ("mqtt311_test", "MQTT 3.1.1: protocol level 4 round-trip, 0x80 SUBACK refusal, silent QoS 0 drop"),
     ("qos2_exactly_once_test", "QoS 2: full PUBLISH/PUBREC/PUBREL/PUBCOMP handshake delivers exactly once + a DUP retransmit gets PUBREC/SUCCESS (not re-routed)"),
