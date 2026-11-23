@@ -55,6 +55,7 @@ def free_port():
 
 PROBES = [
     ("durable_state_restart_test", "durable state: retained messages and persistent sessions survive a broker restart (FLOWMQ_STATE_FILE)"),
+    ("will_delay_cancel_test", "MQTT 5 Will Delay: a reconnect inside the delay window cancels the pending Will (MQTT-3.1.4-6), while one with no reconnect does fire"),
     ("mqttsn_qos1_ping_will_test", "MQTT-SN QoS 1 PUBACK round-trip, PINGREQ/PINGRESP, Will published on abnormal keep-alive disconnect"),
     ("retained_messages_test", "retained: snapshot-to-new-subscriber with RETAIN=1, live delivery clears RETAIN, empty payload clears, wildcard match"),
     ("mqtt311_test", "MQTT 3.1.1: protocol level 4 round-trip, 0x80 SUBACK refusal, silent QoS 0 drop"),
