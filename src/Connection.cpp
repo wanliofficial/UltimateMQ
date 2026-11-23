@@ -181,17 +181,21 @@ void Connection::run() {
 
     // An abnormal termination publishes the Will message.
     if (willPending) {
-        // MQTT-3.1.2-8 / MQTT-3.1.3-9: releasing a Will is triggered by the
-        // Will Delay Interval elapsing *or* the Session ending, whichever comes
-        // first. The Session ends here - the moment its state is destroyed, which
-        // happens only for a non-persistent session (Session Expiry Interval 0,
-        // or MQTT 3.1.1 Clean Session 1). A persistent session merely goes
-        // dormant: its Will Delay runs in full, and when it *does* end (the
-        // sweeper discarding it at the Session Expiry) the Will goes out then.
-        // `session` is checked because a CONNECT refused before the session is
-        // assigned must not turn this teardown into a null dereference.
-        const bool persistentSession = session && session->isPersistent();
-        if (willDelay > 0 && persistentSession) {
+        // MQTT-3.1.2-8 / §3.1.2.11.3: releasing a Will is triggered by the Will
+        // Delay Interval elapsing *or* the Session ending, whichever comes
+        // first. A Session ends here only when it is not carried past this
+        // connection - a non-persistent session, or a persistent one whose
+        // DISCONNECT lowered the Session Expiry Interval to 0 (MQTT-3.14.4-2).
+        // A session that survives merely goes dormant: its Will Delay runs in
+        // full, and when it *does* end later (the sweeper discarding it at the
+        // Session Expiry) the Will goes out then. The decision must use
+        // sessionEndsAtClose(), not the CONNECT-time persistence alone, or a
+        // session ended by the DISCONNECT would still serve out a Will Delay
+        // for a Session that no longer exists. `session` is checked because a
+        // CONNECT refused before the session is assigned must not turn this
+        // teardown into a null dereference.
+        const bool delayWill = willDelay > 0 && session && !sessionEndsAtClose(*session);
+        if (delayWill) {
             // MQTT-3.1.3.2: the Will Delay Interval is measured from the moment
             // this Network Connection closes, so arm the Will on the broker now
             // (at disconnect). The sweeper publishes it once the delay elapses,
@@ -213,6 +217,24 @@ void Connection::run() {
     closeSocket();
 }
 
+bool Connection::sessionEndsAtClose(const Session &liveSession) const {
+    // Whether the session outlives this Network Connection. MQTT 3.1.x has no
+    // Session Expiry Interval, so its Clean Session flag is the whole story:
+    // CleanSession=0 keeps the session until a later CleanSession=1 replaces it,
+    // and there is no deadline to arm. MQTT 5 uses the interval instead, which a
+    // DISCONNECT may lower - down to 0, which ends the session at once
+    // (MQTT-3.14.4-2). Reading it as "sessionExpirySeconds == 0 means discard"
+    // dropped every MQTT 3.1.1 persistent session, because that field is only
+    // ever set for MQTT 5.
+    //
+    // The session is passed in rather than read from this->session so
+    // releaseSession() can ask before it drops the member.
+    if (!liveSession.isPersistent()) {
+        return true;
+    }
+    return frame.getVersion() == Version::MQTT5 && sessionExpirySeconds == 0;
+}
+
 void Connection::releaseSession() {
     // Connection and Session hold strong references to each other while the
     // session is bound (Connection::session and Session::client), so somebody
@@ -226,17 +248,7 @@ void Connection::releaseSession() {
             owned = session;
             session.reset();
         }
-        // Whether the session outlives this Network Connection. MQTT 3.1.x has no
-        // Session Expiry Interval, so its Clean Session flag is the whole story:
-        // CleanSession=0 keeps the session until a later CleanSession=1 replaces
-        // it, and there is no deadline to arm. MQTT 5 uses the interval instead,
-        // which a DISCONNECT may lower - down to 0, which ends the session at
-        // once (MQTT-3.14.4-2). Reading it as "sessionExpirySeconds == 0 means
-        // discard" dropped every MQTT 3.1.1 persistent session, because that
-        // field is only ever set for MQTT 5.
-        const bool expiryEndsSession = frame.getVersion() == Version::MQTT5 &&
-                                       sessionExpirySeconds == 0;
-        if (!owned->isPersistent() || expiryEndsSession) {
+        if (sessionEndsAtClose(*owned)) {
             // The client asked to end the session (MQTT 3.1.1 Clean Session 1, or
             // an MQTT 5 Session Expiry Interval of 0): drop it rather than
             // leaving it resumable.

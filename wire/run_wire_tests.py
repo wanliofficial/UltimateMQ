@@ -57,6 +57,7 @@ PROBES = [
     ("durable_state_restart_test", "durable state: retained messages and persistent sessions survive a broker restart (FLOWMQ_STATE_FILE)"),
     ("sys_will_bypass_test", "MQTT-4.1.2-2: a client Will on a $SYS topic cannot forge the monitoring tree"),
     ("will_delay_cancel_test", "MQTT 5 Will Delay: a reconnect inside the delay window cancels the pending Will (MQTT-3.1.4-6), while one with no reconnect does fire"),
+    ("will_session_end_test", "MQTT 5 §3.1.2.11.3: ending the Session at DISCONNECT publishes an armed Will at once, not after its Will Delay"),
     ("mqttsn_qos1_ping_will_test", "MQTT-SN QoS 1 PUBACK round-trip, PINGREQ/PINGRESP, Will published on abnormal keep-alive disconnect"),
     ("retained_messages_test", "retained: snapshot-to-new-subscriber with RETAIN=1, live delivery clears RETAIN, empty payload clears, wildcard match"),
     ("mqtt311_test", "MQTT 3.1.1: protocol level 4 round-trip, 0x80 SUBACK refusal, silent QoS 0 drop"),

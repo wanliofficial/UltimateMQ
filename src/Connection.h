@@ -121,6 +121,12 @@ private:
     //! the end of run() and from detach().
     void releaseSession();
     void publishWill();
+    //! Whether the Session ends when this Network Connection closes: always for
+    //! a non-persistent session, and for a persistent one when the DISCONNECT
+    //! lowered its Session Expiry Interval to 0 (MQTT-3.14.4-2). Single source
+    //! of truth for the Will decision and for releaseSession(): they must agree,
+    //! because §3.1.2.11.3 releases the Will "when the Session ends".
+    bool sessionEndsAtClose(const Session &liveSession) const;
     //! Stamps the Will's Message Expiry Interval onto \p will as a deadline
     //! starting now (MQTT-3.3.2-9). No-op when the CONNECT carried no interval.
     void armWillExpiry(Message &will) const;
