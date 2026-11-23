@@ -301,8 +301,15 @@ struct Gateway::Peer : public Client {
         (void)subscriptionIdentifiers; // MQTT 5 concept, not representable in SN
         // A concrete topic may never have been mapped (e.g. matched through a
         // wildcard filter). Allocate the id lazily so the client can refer to
-        // it later with REGISTER-less publishes if it learned it.
-        uint16_t id = topicIdFor(message.topic);
+        // it later with REGISTER-less publishes if it learned it. If the peer's
+        // id space is exhausted there is no id to address this PUBLISH with, so
+        // drop it rather than emit a PUBLISH carrying id 0 (never a valid id).
+        uint16_t id = 0;
+        if (!topicIdFor(message.topic, id)) {
+            logDebug("mqtt-sn: peer %s topic-id space full, dropping PUBLISH on %s",
+                     clientId.c_str(), message.topic.c_str());
+            return false;
+        }
         Flags flags;
         flags.dup = message.dup;
         flags.qos = static_cast<uint8_t>(qos);
@@ -339,19 +346,40 @@ struct Gateway::Peer : public Client {
 
     // --- session & topic bookkeeping --------------------------------
 
-    //! Map (or lazily allocate) the topic id for a topic name
-    uint16_t topicIdFor(const std::string &topic) {
+    //! Map (or lazily allocate) the topic id for a topic name. Returns false when
+    //! the peer's 16-bit id space is exhausted (no free id), leaving \p id
+    //! untouched. The scan below is bounded by the 65535 ids and never wraps into
+    //! an infinite loop: once every id is taken it gives up instead of spinning,
+    //! because the gateway runs on the broker's single event-loop thread and a
+    //! spin there would hang the whole broker (a denial of service reachable by
+    //! registering 65535 distinct topic names -- §5.3.9).
+    bool topicIdFor(const std::string &topic, uint16_t &id) {
         auto it = topicNameToId.find(topic);
         if (it != topicNameToId.end()) {
-            return it->second;
+            id = it->second;
+            return true;
         }
-        while (nextTopicId == 0 || topicIdToName.count(nextTopicId) > 0) {
-            ++nextTopicId;
+        // At most 65534 ids (1..65535; 0 is never a valid id) can be allocated.
+        if (topicIdToName.size() >= 65535) {
+            return false;
         }
-        const uint16_t id = nextTopicId++;
-        topicIdToName[id] = topic;
-        topicNameToId[topic] = id;
-        return id;
+        // Find the next free id in the 1..65535 space without looping forever: a
+        // bounded sweep from the cursor, wrapping once at most.
+        uint16_t candidate = nextTopicId;
+        for (uint32_t tries = 0; tries < 65535; ++tries) {
+            if (candidate == 0) {
+                candidate = 1;
+            }
+            if (topicIdToName.count(candidate) == 0) {
+                id = candidate;
+                topicIdToName[id] = topic;
+                topicNameToId[topic] = id;
+                nextTopicId = static_cast<uint16_t>(candidate + 1);
+                return true;
+            }
+            ++candidate;
+        }
+        return false;
     }
 
     //! The topic name an inbound topic id refers to, or empty when unknown
@@ -799,7 +827,13 @@ void Gateway::handleRegister(const sockaddr_in &addr, const Parsed &p) {
         ack(0, ReturnCode::INVALID_TOPIC_ID);
         return;
     }
-    ack(peer->topicIdFor(p.topic), ReturnCode::ACCEPTED);
+    uint16_t topicId = 0;
+    if (!peer->topicIdFor(p.topic, topicId)) {
+        // The peer's id space is full: reject with congestion rather than hang.
+        ack(0, ReturnCode::REJECTED_CONGESTION);
+        return;
+    }
+    ack(topicId, ReturnCode::ACCEPTED);
 }
 
 void Gateway::handlePublish(const sockaddr_in &addr, const Parsed &p) {
@@ -877,10 +911,14 @@ void Gateway::handlePublish(const sockaddr_in &addr, const Parsed &p) {
     if (qos == 1) {
         std::vector<uint8_t> body;
         // §5.3.6: the PUBACK carries the topic id the gateway knows the topic
-        // by, which for a topic-name publish is the one it assigns now.
-        const uint16_t ackId = p.flags.topicIdType == TopicIdType::NAME
-                                   ? peer->topicIdFor(topic)
-                                   : p.topicId;
+        // by, which for a topic-name publish is the one it assigns now. If the
+        // peer's id space is exhausted the message was still routed; ack with id
+        // 0 so the client is not left waiting (the flow completed).
+        uint16_t ackId = p.topicId;
+        if (p.flags.topicIdType == TopicIdType::NAME &&
+            !peer->topicIdFor(topic, ackId)) {
+            ackId = 0;
+        }
         appendU16(body, ackId);
         appendU16(body, p.msgId);
         body.push_back(static_cast<uint8_t>(reason == ReasonCode::SUCCESS
@@ -955,8 +993,14 @@ void Gateway::handleSubscribe(const sockaddr_in &addr, const Parsed &p) {
     options.retainAsPublished = true;
     options.retainHandling = RetainHandling::SEND_RETAINED_MESSAGES_AT_SUBSCRIBE;
     const bool isNew = !peer->session->hasSubscription(filter);
-    const uint16_t grantedId =
-        p.flags.topicIdType == TopicIdType::NAME ? peer->topicIdFor(filter) : filterId;
+    // A topic-name SUBSCRIBE is granted the id the gateway assigns to the filter.
+    // If the peer's id space is exhausted, still honour the subscription but grant
+    // id 0 rather than hang; the client can then only address it by name.
+    uint16_t grantedId = filterId;
+    if (p.flags.topicIdType == TopicIdType::NAME &&
+        !peer->topicIdFor(filter, grantedId)) {
+        grantedId = 0;
+    }
     peer->session->subscribe(filter, options);
     // SUBACK first (§5.3.10), then the retained messages it unlocks. The
     // granted QoS rides in the flag byte's QoS bits.
