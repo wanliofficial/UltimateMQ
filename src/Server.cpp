@@ -11,6 +11,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <string>
+#include <limits>
 #include <cerrno>
 #include <fcntl.h>
 #include <poll.h>
@@ -212,7 +213,13 @@ Server::Server(int port, size_t maxConnections)
     if (writeTimeout && *writeTimeout) {
         char* end = nullptr;
         long parsed = std::strtol(writeTimeout, &end, 10);
-        if (end == writeTimeout || *end != '\0' || parsed <= 0) {
+        // Reject anything that does not fit the int the broker stores: a value
+        // above INT_MAX would pass the > 0 check yet truncate to a bogus (often
+        // negative) int, silently disabling the stall bound instead of bounding
+        // it. The write timeout is a millisecond count a few hours at most, so
+        // an out-of-range value is a configuration error worth failing on.
+        if (end == writeTimeout || *end != '\0' || parsed <= 0 ||
+            parsed > std::numeric_limits<int>::max()) {
             delete broker;
             broker = nullptr;
             throw std::runtime_error(std::string("invalid FLOWMQ_WRITE_TIMEOUT_MS: ") +
