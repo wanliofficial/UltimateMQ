@@ -171,12 +171,16 @@ bool WebSocketTransport::handshake(std::string *error) {
     // error so a misdirected browser tab sees something intelligible.
     if (method != "GET" || toLower(upgradeHeader).find("websocket") == std::string::npos ||
         !headerContains(connectionHeader, "upgrade") || keyHeader.empty()) {
-        std::string response =
+        // Derive Content-Length from the body: a hardcoded count drifts from the
+        // literal the moment the text changes, and an off-by-one desyncs the
+        // HTTP framing (the client waits for a byte that never comes, or reads
+        // into the next record).
+        const std::string body = "websocket required.\n";
+        const std::string response =
             "HTTP/1.1 400 Bad Request\r\n"
             "Content-Type: text/plain\r\n"
-            "Content-Length: 21\r\n"
-            "\r\n"
-            "websocket required.\n";
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "\r\n" + body;
         inner_->writeAll(reinterpret_cast<const uint8_t *>(response.data()),
                          response.size());
         if (error) {
@@ -243,6 +247,7 @@ bool WebSocketTransport::handshake(std::string *error) {
     }
     logInfo("websocket connection upgraded (subprotocol %s)",
             subprotocol_.empty() ? "none" : subprotocol_.c_str());
+    established_ = true;
     return true;
 }
 
@@ -515,7 +520,12 @@ ssize_t WebSocketTransport::writeSome(const uint8_t *buf, size_t len) {
 }
 
 void WebSocketTransport::teardown() {
-    sendClose(1000);
+    // Only a peer that completed the upgrade is in a WebSocket session; sending
+    // CLOSE to one still stuck at the HTTP stage would append WebSocket framing
+    // to the HTTP error response already written.
+    if (established_) {
+        sendClose(1000);
+    }
     inner_->teardown();
 }
 

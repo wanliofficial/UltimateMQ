@@ -67,6 +67,7 @@ PROBES = [
     ("session_resume_test", "session resume: an unacked QoS 1 message is retransmitted with DUP on reconnect (sessionPresent=1), and a fresh session is not"),
     ("recvmax_window_test", "MQTT-4.9 Receive Maximum window (QoS 2 / QoS 1)"),
     ("websocket_framing_test", "WebSocket framing: cap-before-buffer + no fragmented control frames"),
+    ("websocket_reject_response_test", "WebSocket reject: clean 400 (Content-Length exact) and no CLOSE frame appended"),
     ("websocket_sys_topics_test", "WebSocket $SYS: monitoring tree reaches a subscriber + §4.1.2-2"),
     ("accept_backoff_test", "accept(): EMFILE/ENFILE backs off instead of spinning"),
     ("tls_handshake_timeout_test", "TLS handshake: a silent peer is dropped, not held forever"),

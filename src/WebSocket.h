@@ -87,6 +87,11 @@ private:
     bool fragmenting_ = false;
     bool closedByPeer_ = false;
     bool closeSent_ = false;
+    //! True only once the HTTP upgrade completed and the 101 was sent. A CLOSE
+    //! frame is meaningful solely inside an established WebSocket session; on a
+    //! rejected upgrade the peer is still speaking HTTP, so teardown must not
+    //! append WebSocket framing to the plain HTTP error response.
+    bool established_ = false;
 };
 
 } // namespace MQTT
