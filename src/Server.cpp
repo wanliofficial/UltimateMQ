@@ -1,6 +1,7 @@
 #include "Topic.h"
 #include "Server.h"
 #include "Connection.h"
+#include "Env.h"
 #include "WebSocket.h"
 #include <csignal>
 #if defined(FLOWMQ_WITH_QUIC)
@@ -101,7 +102,7 @@ Server::Server(int port, size_t maxConnections)
     // and payload is encrypted on the wire.
     const char* tlsCert = getenv("FLOWMQ_TLS_CERT");
     const char* tlsKey = getenv("FLOWMQ_TLS_KEY");
-    bool tlsVerifyClients = getenv("FLOWMQ_TLS_VERIFY_CLIENTS") != nullptr;
+    bool tlsVerifyClients = Env::isEnabled("FLOWMQ_TLS_VERIFY_CLIENTS");
     const char* tlsCa = getenv("FLOWMQ_TLS_CA");
     std::string tlsError;
     TLS = TLSContext::load(tlsCert ? tlsCert : "", tlsKey ? tlsKey : "",

@@ -1,5 +1,6 @@
 #include "Frame.h"
 #include "Connection.h"
+#include "Env.h"
 #include "Topic.h"
 #include "Utf8.h"
 #include "Session.h"
@@ -672,7 +673,7 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     // MQTT username, the certificate's identity can stand in for the username
     // (mTLS authorisation). Gated behind FLOWMQ_TLS_CERT_AS_USERNAME so the
     // default behaviour is unchanged.
-    const bool certAsUsername = getenv("FLOWMQ_TLS_CERT_AS_USERNAME") != nullptr;
+    const bool certAsUsername = Env::isEnabled("FLOWMQ_TLS_CERT_AS_USERNAME");
     bool certificateAuthenticated = false;
     if (certAsUsername && !connect->username) {
         const std::string identity = transport->peerIdentity();

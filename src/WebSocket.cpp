@@ -1,4 +1,5 @@
 #include "WebSocket.h"
+#include "Env.h"
 #include "SHA1.h"
 #include "Log.h"
 #include <cctype>
@@ -234,7 +235,7 @@ bool WebSocketTransport::handshake(std::string *error) {
     // knob such clients are still accepted, as before.
     if (headerContains(protocolHeader, WEBSOCKET_SUBPROTOCOL)) {
         subprotocol_ = WEBSOCKET_SUBPROTOCOL;
-    } else if (getenv("FLOWMQ_WS_REQUIRE_SUBPROTOCOL") != nullptr) {
+    } else if (Env::isEnabled("FLOWMQ_WS_REQUIRE_SUBPROTOCOL")) {
         std::string response =
             "HTTP/1.1 400 Bad Request\r\n"
             "Content-Type: text/plain\r\n"
