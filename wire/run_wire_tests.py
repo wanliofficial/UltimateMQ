@@ -69,6 +69,7 @@ PROBES = [
     ("websocket_framing_test", "WebSocket framing: cap-before-buffer + no fragmented control frames"),
     ("websocket_upgrade_token_test", "WebSocket upgrade: the |Upgrade| token is matched exactly, not as a substring"),
     ("websocket_length_msb_test", "WebSocket: a 64-bit frame length with the MSB set is rejected with CLOSE 1002, not 1009"),
+    ("websocket_close_echo_test", "WebSocket CLOSE: the reply echoes the peer's status code (and none when it sent none)"),
     ("websocket_reject_response_test", "WebSocket reject: clean 400 (Content-Length exact) and no CLOSE frame appended"),
     ("websocket_handshake_deadline_test", "WebSocket upgrade: one absolute deadline drops a slowloris (not per-byte)"),
     ("websocket_write_buffer_test", "WebSocket: FLOWMQ_WRITE_BUFFER buffers/ serves a slow reader (writeSome non-blocking)"),

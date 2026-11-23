@@ -355,13 +355,17 @@ bool WebSocketTransport::sendFrameNonBlocking(uint8_t opcode, const uint8_t *pay
 }
 
 void WebSocketTransport::sendClose(uint16_t status) {
+    uint8_t payload[2] = {static_cast<uint8_t>(status >> 8),
+                          static_cast<uint8_t>(status & 0xFF)};
+    sendCloseFrame(payload, sizeof(payload));
+}
+
+void WebSocketTransport::sendCloseFrame(const uint8_t *payload, size_t len) {
     if (closeSent_) {
         return;
     }
     closeSent_ = true;
-    uint8_t payload[2] = {static_cast<uint8_t>(status >> 8),
-                          static_cast<uint8_t>(status & 0xFF)};
-    const std::vector<uint8_t> closeFrame = buildFrame(0x08, payload, sizeof(payload));
+    const std::vector<uint8_t> closeFrame = buildFrame(0x08, payload, len);
     if (pendingFrame_.empty()) {
         // Nothing stuck ahead of the CLOSE: block to get it out (teardown path).
         inner_->writeAll(closeFrame.data(), closeFrame.size());
@@ -497,8 +501,29 @@ bool WebSocketTransport::nextFrame() {
 
         const uint8_t *payload = raw_.data() + offset;
         // Control frames may be interleaved between fragments and never continue.
-        if (opcode == 0x08) { // CLOSE: echo it and signal the orderly end
-            sendClose(1000);
+        if (opcode == 0x08) { // CLOSE: echo the peer's status and end the stream
+            // RFC 6455 §5.5.1: a received Close MUST be answered with a Close,
+            // and the reply "typically echos the status code it received". If
+            // the peer's Close carried no body, reply with none: the implied
+            // code 1005 is reserved and MUST NOT be sent on the wire (§7.4.1).
+            // A one-byte body cannot hold the mandatory 2-byte status code and
+            // is itself a protocol error (§5.5.1).
+            if (length == 1) {
+                logDebug("websocket: 1-byte CLOSE body, closing (1002)");
+                sendClose(1002);
+                closedByPeer_ = true;
+                return false;
+            }
+            if (length == 0) {
+                sendCloseFrame(payload, 0); // no status code to echo
+            } else {
+                // The body arrives masked; unmask it before echoing it back.
+                std::vector<uint8_t> body(static_cast<size_t>(length));
+                for (uint64_t i = 0; i < length; ++i) {
+                    body[i] = payload[i] ^ mask[i % 4];
+                }
+                sendCloseFrame(body.data(), body.size());
+            }
             closedByPeer_ = true;
             return false;
         }

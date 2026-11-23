@@ -82,6 +82,10 @@ private:
     int flushPending();
     //! Best-effort CLOSE frame (unless one was already sent).
     void sendClose(uint16_t status);
+    //! Best-effort CLOSE frame carrying an explicit body (possibly empty), used
+    //! to echo a peer's status code/reason. Honours pendingFrame_ ordering and
+    //! the one-CLOSE-per-connection rule shared with sendClose().
+    void sendCloseFrame(const uint8_t *payload, size_t len);
 
     std::unique_ptr<SecureTransport> inner_;
     std::string subprotocol_;
