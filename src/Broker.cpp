@@ -452,6 +452,20 @@ std::shared_ptr<Session> Broker::nextSharedMember(const std::string &topicFilter
 }
 
 void Broker::publish(const Message &message) {
+    // MQTT-4.1.2-2: while the $SYS monitoring tree is enabled only the broker
+    // writes it. A client PUBLISH to a $SYS topic is refused in
+    // Connection::handlePublish, but a Will that the broker publishes on the
+    // client's behalf (Connection::publishWill and the delayed path in
+    // publishDueWills, plus an MQTT-SN Will) reaches this method directly and
+    // used to bypass that rule, letting any client inject or forge monitoring
+    // topics. Enforce it at the one choke point every brokered publish passes
+    // through. refreshSysTopics() does not call this method - it writes the
+    // tree through dispatchTargets() directly - so the real monitoring tree is
+    // unaffected.
+    if (sysTopicsEnabled && SysTopics::isSysTopic(message.topic)) {
+        logDebug("broker: refused publish to $SYS topic %s", message.topic.c_str());
+        return;
+    }
     std::vector<std::pair<std::shared_ptr<Session>, std::string>> targets;
     {
         std::lock_guard<std::recursive_mutex> lock(mutex);
