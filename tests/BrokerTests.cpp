@@ -551,7 +551,7 @@ TEST(BrokerSharedOptionsTest, SharedSubscriptionHonoursNoLocal)
     member.session->subscribe("$share/g/nl/x", opts(MQTT::QoS::QOS_0, /*noLocal=*/true));
 
     MQTT::Message message("nl/x", "self");
-    message.originSession = member.session.get();
+    message.originClientId = "nolocal";
     broker->publish(message);
 
     EXPECT_EQ(member.client->size(), 0u)
@@ -771,7 +771,7 @@ TEST_F(BrokerTest, NoLocalOnOneOverlappingSubscriptionStillDelivers)
     session->subscribe("a/#", opts(MQTT::QoS::QOS_0, /*noLocal=*/false));
 
     MQTT::Message message("a/b", "self");
-    message.originSession = session.get();
+    message.originClientId = "overlap-nl";
     broker->publish(message);
 
     EXPECT_EQ(client->size(), 1u)
@@ -787,7 +787,7 @@ TEST_F(BrokerTest, NoLocalOnEveryOverlappingSubscriptionSuppressesTheCopy)
     session->subscribe("a/#", opts(MQTT::QoS::QOS_0, /*noLocal=*/true));
 
     MQTT::Message message("a/b", "self");
-    message.originSession = session.get();
+    message.originClientId = "overlap-nl2";
     broker->publish(message);
 
     EXPECT_EQ(client->size(), 0u)

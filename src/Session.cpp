@@ -286,12 +286,13 @@ bool Session::isExpired(std::chrono::steady_clock::time_point now) const {
 }
 
 ReasonCode Session::publish(uint16_t packetId, const Message &message, bool duplicate) {
-    // Tag the message with this session so the fan-out can honour the MQTT 5
-    // No Local option: a subscriber that opted in must not receive its own
-    // publications. Set for every inbound publish; a restored (durable) message
-    // never goes through here, so its originator stays null.
+    // Tag the message with this session's ClientID so the fan-out can honour the
+    // MQTT 5 No Local option: a subscriber that opted in must not receive its
+    // own publications, retained ones included (MQTT-3.8.3-3). Set for every
+    // inbound publish; a restored (durable) message never goes through here, so
+    // its originator stays empty.
     Message outgoing = message;
-    outgoing.originSession = this;
+    outgoing.originClientId = clientId;
     if (outgoing.qos == QoS::QOS_2) {
         {
             std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
@@ -644,9 +645,11 @@ void Session::deliver(const std::vector<std::string> &filters, const Message &me
         return;
     }
     // MQTT-3.8.3-3: a subscription with the No Local option set must not
-    // receive messages this same client published. Compare the originator set
-    // on the live fan-out path.
-    if (allRequestedNoLocal && anyRequestedNoLocal && message.originSession == this) {
+    // receive messages this same client published. Compare the stored origin
+    // ClientID, which is stable across reconnects (and safe for retained copies
+    // whose publishing session may already be gone).
+    if (allRequestedNoLocal && anyRequestedNoLocal &&
+        message.originClientId == clientId) {
         logDebug("session %s: skipping own message on %s (no local)",
                  clientId.c_str(), message.topic.c_str());
         return;
@@ -696,6 +699,16 @@ void Session::deliverRetained(const std::string &topicFilter, const Subscription
         // deliver it (and the broker purges it from the retained set on sweep).
         if (message.isExpired(std::chrono::steady_clock::now())) {
             logDebug("session %s: skipping expired retained message on %s", clientId.c_str(), topic.c_str());
+            continue;
+        }
+        // MQTT-3.8.3-3: No Local also applies to retained messages a new
+        // subscription unlocks - a No Local subscriber must not be handed its own
+        // retained publication back on the subscribe. Match on the stored origin
+        // ClientID (empty for a restored retained copy, which has no originator).
+        if (options.noLocal && !message.originClientId.empty() &&
+            message.originClientId == clientId) {
+            logDebug("session %s: skipping own retained message on %s (no local)",
+                     clientId.c_str(), topic.c_str());
             continue;
         }
         Message outgoing = message;

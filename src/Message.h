@@ -23,11 +23,14 @@ struct Message {
     //! remaining seconds, which are turned back into a deadline on restore.
     bool hasExpiry = false;
     std::chrono::steady_clock::time_point expiryDeadline;
-    //! The session that originated this message, set on the live fan-out path.
-    //! Used to honour the MQTT 5 No Local subscription option: a subscriber that
-    //! asked for it must not receive its own publications. Never written to the
+    //! The ClientID of the session that originated this message, set on the
+    //! live fan-out path. Used to honour the MQTT 5 No Local subscription option
+    //! (MQTT-3.8.3-3): a subscriber that asked for it must not receive its own
+    //! publications, retained ones included. A ClientID (not a Session pointer)
+    //! is the right key so the check stays correct across reconnects and for
+    //! retained copies outliving the publishing session. Never written to the
     //! durable state, so a restored message has no originator.
-    void* originSession = nullptr;
+    std::string originClientId;
     //! MQTT 5 properties that travel with the publication and must be repeated on
     //! every delivery it causes (MQTT-3.3.2-4): Payload Format Indicator,
     //! Content Type, Response Topic, Correlation Data and User Properties.
