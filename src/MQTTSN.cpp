@@ -833,7 +833,11 @@ void Gateway::handlePublish(const sockaddr_in &addr, const Parsed &p) {
         topic.assign(2, '\0');
         topic[0] = static_cast<char>(p.topicId >> 8);
         topic[1] = static_cast<char>(p.topicId & 0xFF);
-        known = true;
+        // The bytes are an MQTT Topic Name and must obey the same "no wildcard
+        // characters" rule as a full topic-name publish (MQTT-3.3.2-1); the
+        // SUBSCRIBE path already validates its SHORT filter, so PUBLISH must too,
+        // or a device could route an illegal name like "++" or "#x".
+        known = Topic::isValidTopicName(topic);
         break;
     }
     // MQTT-SN §6.6: "Regardless of the requested QoS level the client may

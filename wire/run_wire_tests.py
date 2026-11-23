@@ -61,6 +61,7 @@ PROBES = [
     ("mqttsn_qos1_ping_will_test", "MQTT-SN QoS 1 PUBACK round-trip, PINGREQ/PINGRESP, Will published on abnormal keep-alive disconnect"),
     ("mqttsn_will_qos3_retained_test", "MQTT-SN §5.3.1: a Will with a raw QoS of 3 (\"QoS -1\") is normalised to QoS 0, so a retained Will cannot poison FLOWMQ_STATE_FILE into a startup abort"),
     ("mqttsn_qos2_reject_test", "MQTT-SN §6.6: a QoS 2 PUBLISH that must be rejected (unknown topic id) is answered with a PUBACK carrying the ReturnCode, not a bare PUBREC indistinguishable from an acceptance, so the client never believes a rejected message was delivered exactly-once"),
+    ("mqttsn_short_topic_test", "MQTT-SN §5.3.1: a SHORT-topic PUBLISH carrying wildcard bytes (\"++\") is rejected PUBACK+INVALID_TOPIC_ID, matching how a SHORT SUBSCRIBE is already refused"),
     ("retained_messages_test", "retained: snapshot-to-new-subscriber with RETAIN=1, live delivery clears RETAIN, empty payload clears, wildcard match"),
     ("mqtt311_test", "MQTT 3.1.1: protocol level 4 round-trip, 0x80 SUBACK refusal, silent QoS 0 drop"),
     ("qos2_exactly_once_test", "QoS 2: full PUBLISH/PUBREC/PUBREL/PUBCOMP handshake delivers exactly once + a DUP retransmit gets PUBREC/SUCCESS (not re-routed)"),
