@@ -783,7 +783,16 @@ PublishPacket Frame::parsePublish(const FixedHeader &header, const uint8_t *buff
     offset += topicName.length() + 2;
 
     // Parse packet identifier if QoS > 0
-    if (publish.qos > QoS::QOS_0) { 
+    if (publish.qos > QoS::QOS_0) {
+        // MQTT-2.2.1-3: a PUBLISH with QoS > 0 MUST carry a Packet Identifier. It
+        // is a rule the packet breaks, not an encoding fault, so a missing
+        // identifier is a PROTOCOL_ERROR (0x82), distinct from MALFORMED_PACKET.
+        // parsePacketId only reports its "absent" case as a generic parse error
+        // (which the connection maps to MALFORMED_PACKET), so require the two
+        // bytes here and let parsePacketId enforce the non-zero rule.
+        if (length - offset < 2) {
+            throw ProtocolViolation("Packet Identifier missing in QoS > 0 PUBLISH (MQTT-2.2.1-3)");
+        }
         publish.packetId = parsePacketId(buffer+offset, length-offset);
         offset += 2;
     }
