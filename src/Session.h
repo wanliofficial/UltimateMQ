@@ -185,8 +185,14 @@ public:
     size_t getSharedSubscriptionCount();
     //! MQTT 5 Receive Maximum: cap on the number of QoS 1/2 messages the broker
     //! may keep outstanding (sent, unacknowledged) to this client. Defaults to
-    //! the protocol default of 65535, i.e. no effective limit.
-    void setReceiveMaximum(uint16_t limit) { receiveMaximum = limit; }
+    //! the protocol default of 65535, i.e. no effective limit. Written under
+    //! deliveryMutex: it is set on the connect path before the session delivers,
+    //! but the delivery path reads it under the lock, so the write takes the lock
+    //! too (a recursive mutex, so a nested call is safe).
+    void setReceiveMaximum(uint16_t limit) {
+        std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
+        receiveMaximum = limit;
+    }
     //! Choose what happens when the delivery queue is full. DropNewest (the
     //! default) drops the incoming message; DropOldest evicts the oldest buffered
     //! message to keep the newest. Opt-in via FLOWMQ_QUEUE_DROP=oldest; the
@@ -221,6 +227,14 @@ private:
         //! one queue are split across the two containers (the drop-oldest policy
         //! compares the two fronts). Assigned once when the delivery is created.
         unsigned long long sequence = 0;
+        //! Set on a PUBLISH the broker is retransmitting because it was already
+        //! sent (and still unacknowledged) before the connection dropped. A
+        //! retransmission is re-sent on resume regardless of the Receive Maximum
+        //! window (it was already outstanding), so it must never be demoted back
+        //! to the blocked queue by the reconnect re-flow-control (MQTT-4.4,
+        //! MQTT-4.6). Offline-buffered messages that were never sent are not
+        //! flagged and remain subject to the window.
+        bool retransmit = false;
 
         Delivery(Message message, uint16_t packetId, QoS qos,
                  SubscriptionIdentifiers subscriptionIdentifiers = {},
@@ -327,6 +341,11 @@ private:
     //! Move blocked QoS>0 messages into the inflight set / send queue while the
     //! outstanding count is below the client's Receive Maximum.
     void releaseBlocked();
+    //! On resume, demote the excess never-sent offline-buffered QoS>0 messages
+    //! (queued under the default Receive Maximum) back to the blocked queue so a
+    //! reconnect with a smaller window is not over-sent (MQTT-4.9.0-2). Retrans-
+    //! missions are left in place. Called with deliveryMutex held.
+    void reflowToReceiveMaximum();
     //! Forget an inflight QoS>0 message that will never be acknowledged (it was
     //! dropped by flow control/expiry or refused by the client) and release its
     //! slot so the Receive Maximum window does not leak.

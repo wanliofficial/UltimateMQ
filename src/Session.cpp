@@ -539,11 +539,20 @@ void Session::resume(const std::shared_ptr<Client>& client, Version protocolVers
             if (idIt != inflightIdentifiers.end()) {
                 identifiers = idIt->second;
             }
-            retransmissions.emplace_back(std::move(outgoing), id, stored->qos, identifiers);
+            Delivery retransmit(std::move(outgoing), id, stored->qos, identifiers);
+            // This PUBLISH was already on the wire before the disconnect; the
+            // reconnect re-flow-control must not demote it to the blocked queue.
+            retransmit.retransmit = true;
+            retransmissions.push_back(std::move(retransmit));
         }
         pendingDeliveries.insert(pendingDeliveries.begin(),
                                  std::make_move_iterator(retransmissions.begin()),
                                  std::make_move_iterator(retransmissions.end()));
+        // MQTT-4.9.0-2: now that the client's real Receive Maximum is known, trim
+        // the never-sent offline buffer back to the window before flushing, so a
+        // resumed session is not blasted with more unacknowledged QoS>0 PUBLISHes
+        // than it agreed to. Genuine retransmissions stay in front (§4.6).
+        reflowToReceiveMaximum();
         // §4.6 requires the unacked retransmissions to go out before the offline
         // buffer (their originals were sent first). The container therefore
         // stays in send order, not sequence order: pendingDeliveries.front() is
@@ -844,6 +853,59 @@ void Session::dropOldestQueued() {
     logDebug("session %s: queue full, dropping oldest blocked message on %s "
              "(drop-oldest backpressure)", clientId.c_str(), dropped.message.topic.c_str());
     syncQueuedBytesLocked();
+}
+
+void Session::reflowToReceiveMaximum() {
+    // Called with deliveryMutex held from resume(), after setReceiveMaximum has
+    // applied the client's freshly negotiated window. A durable session buffers
+    // an offline subscriber's QoS>0 messages under the protocol-default Receive
+    // Maximum (65535), because the real window is only declared on reconnect
+    // (setReceiveMaximum is called just before resume()). If the client then
+    // reconnects with a SMALLER window, the offline buffer holds more never-sent
+    // messages than the connection may have outstanding at once. flush() would
+    // otherwise send them all, violating MQTT-4.9.0-2 ("The Server MUST NOT send
+    // more than Receive Maximum QoS 1 and QoS 2 PUBLISH packets for which it has
+    // not received PUBACK/PUBCOMP >= 0x80").
+    //
+    // Demote the excess never-sent, non-retransmit entries from pendingDeliveries
+    // back to blockedDeliveries (clearing their packet id so releaseBlocked()
+    // reassigns one when a slot frees). Retransmissions of messages that were
+    // already on the wire before the disconnect are never demoted -- they were
+    // outstanding before the window was renegotiated and must be resent (§4.4,
+    // §4.6). Walking pendingDeliveries from the back demotes the newest first, so
+    // the oldest entries are the ones kept and sent now, preserving global send
+    // order once the demoted ones are released as the client acknowledges.
+    if (receiveMaximum == 0) {
+        return;
+    }
+    size_t outstanding = inflightMessages.size() + pendingPubrel.size();
+    if (outstanding <= receiveMaximum) {
+        return;
+    }
+    for (auto it = pendingDeliveries.end(); it != pendingDeliveries.begin();) {
+        if (outstanding <= receiveMaximum) {
+            break;
+        }
+        --it;
+        // Only never-sent, non-retransmit QoS>0 entries are subject to the
+        // window. QoS 0 is never flow-controlled; retransmissions were already
+        // outstanding before the renegotiated window and must go out (§4.4).
+        if (it->retransmit || it->qos == QoS::QOS_0) {
+            continue;
+        }
+        // Free the inflight slot this entry held and re-queue it as blocked (no
+        // id yet); releaseBlocked() will promote it once a slot frees. Inserting
+        // at the front keeps the globally-oldest demoted message at the front, so
+        // releaseBlocked() releases them in send order as slots free up.
+        releaseInflightIfPresent(it->packetId);
+        blockedDeliveries.insert(blockedDeliveries.begin(),
+                                 Delivery(std::move(it->message), /*packetId=*/0,
+                                          it->qos, it->subscriptionIdentifiers,
+                                          it->sequence));
+        it = pendingDeliveries.erase(it);
+        --outstanding;
+        syncQueuedBytesLocked();
+    }
 }
 
 void Session::releaseBlocked() {
