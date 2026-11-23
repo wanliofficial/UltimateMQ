@@ -64,6 +64,7 @@ PROBES = [
     ("mqttsn_short_topic_test", "MQTT-SN §5.3.1: a SHORT-topic PUBLISH carrying wildcard bytes (\"++\") is rejected PUBACK+INVALID_TOPIC_ID, matching how a SHORT SUBSCRIBE is already refused"),
     ("nolocal_retained_test", "MQTT 5 No Local: a No Local=1 subscriber is not handed its own retained message back (MQTT-3.8.3-3)"),
     ("publish_missing_packetid_test", "MQTT-2.2.1-3: a QoS>0 PUBLISH with no Packet Identifier is a Protocol Error (DISCONNECT 0x82), not Malformed (0x81)"),
+    ("pubrel_dup_bit_test", "MQTT-3.6.1-1: a PUBREL re-sent after reconnect keeps the reserved bits 0010 (0x62), never a DUP bit (0x6A)"),
     ("retained_messages_test", "retained: snapshot-to-new-subscriber with RETAIN=1, live delivery clears RETAIN, empty payload clears, wildcard match"),
     ("mqtt311_test", "MQTT 3.1.1: protocol level 4 round-trip, 0x80 SUBACK refusal, silent QoS 0 drop"),
     ("qos2_exactly_once_test", "QoS 2: full PUBLISH/PUBREC/PUBREL/PUBCOMP handshake delivers exactly once + a DUP retransmit gets PUBREC/SUCCESS (not re-routed)"),

@@ -1551,7 +1551,9 @@ std::vector<uint8_t> Frame::serializePubrec(const PubrecPacket &packet) {
 std::vector<uint8_t> Frame::serializePubrel(const PubrelPacket &packet) {
     std::vector<uint8_t> buffer;
     uint8_t flags = (static_cast<uint8_t>(PacketType::PUBREL) << 4) | 0x02;
-    if (packet.dup) flags |= 0x08;
+    // PUBREL carries no DUP flag: its fixed-header bits are reserved and MUST be
+    // 0010 (MQTT-3.6.1-1). Any other value is malformed, so the bit is never set
+    // here regardless of what the packet struct carries.
     buffer.push_back(flags);
     // Calculate remaining length
     // MQTT 3.1.1 acks are exactly a packet identifier: no reason code and no

@@ -1494,9 +1494,10 @@ void Connection::sendPubrel(uint16_t packetId) {
     }
     // A re-sent PUBREL always carries SUCCESS (the PUBREC that opened this leg
     // was accepted), so the client can finish the flow with PUBCOMP.
-    // §4.4: DUP MUST be set to 1 when re-delivering a PUBREL.
+    // PUBREL has no DUP flag: its fixed-header bits are reserved and MUST be
+    // 0010 (MQTT-3.6.1-1); §4.4 resends the PUBREL with its original Packet
+    // Identifier but never grants it a DUP bit, so dup stays false on the wire.
     PubrelPacket pubrel{packetId, ReasonCode::SUCCESS};
-    pubrel.dup = true;
     logDebug("resend PUBREL packetId=%u (awaiting PUBCOMP)", packetId);
     sendPacket(pubrel);
 }

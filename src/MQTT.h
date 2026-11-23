@@ -231,10 +231,12 @@ struct FixedHeader {
             }
             return true;
         case PacketType::PUBREL:
-            // §4.4: DUP MUST be 1 on a re-delivered PUBREL. The fixed-header
-            // bits are 0010 (MQTT-3.6.1-1) but §4.4 overrides bit 3 for
-            // retransmissions, so both DUP=0 and DUP=1 are legal here.
-            return (qos == QoS::QOS_1) && !retain;
+            // MQTT-3.6.1-1: bits 3,2,1,0 of the fixed header are reserved and MUST
+            // be 0,0,1,0. PUBREL has no DUP flag (DUP is defined only for PUBLISH,
+            // §3.3.1-8); §4.4 resends the PUBREL with its original Packet
+            // Identifier but says nothing about a DUP bit. So both DUP=0 and
+            // DUP=1 must satisfy QoS=1, and only DUP=0 is a legal PUBREL.
+            return (qos == QoS::QOS_1) && !retain && !dup;
         case PacketType::SUBSCRIBE:
         case PacketType::UNSUBSCRIBE:
             // These packets must have QoS = 1, and dup and retain must be false
