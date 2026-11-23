@@ -29,14 +29,6 @@ struct QUICStreamState {
     std::atomic<bool> closed{false};
     HQUIC stream = nullptr;
     HQUIC connection = nullptr;
-    //! Set when a peer-initiated stream has finished starting. msquic forbids
-    //! sending before QUIC_STREAM_EVENT_START_COMPLETE, so the serving thread
-    //! waits for this instead of writing straight out of PEER_STREAM_STARTED.
-    std::atomic<bool> started{false};
-    //! Spawns the Connection that serves this stream. Set when the connection
-    //! accepts the peer stream; invoked once from START_COMPLETE so the thread
-    //! never writes before msquic allows it.
-    std::function<void()> startServing;
 };
 
 //! The msquic API table, opened once per process. msquic expects the table to
@@ -256,16 +248,10 @@ public:
         if (len == 0) {
             return true;
         }
-        // msquic answers StreamSend with INVALID_STATE before the stream's
-        // START_COMPLETE, so the very first packet (CONNACK) would be lost.
-        // Wait for the start instead of racing it.
-        {
-            std::unique_lock<std::mutex> lock(state_->mutex);
-            state_->condition.wait_for(lock, std::chrono::seconds(5), [&] {
-                return state_->started.load(std::memory_order_acquire) ||
-                       state_->closed.load(std::memory_order_acquire);
-            });
-        }
+        // A peer-initiated stream is officially started once
+        // QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED is delivered, so the server
+        // sends with QUIC_SEND_FLAG_NONE. QUIC_SEND_FLAG_START is wrong here: it
+        // attempts an async StreamStart on a stream the peer already started.
         if (state_->closed.load(std::memory_order_acquire)) {
             return false;
         }
@@ -276,14 +262,10 @@ public:
         QUIC_BUFFER quicBuffer;
         quicBuffer.Buffer = copy;
         quicBuffer.Length = static_cast<uint32_t>(len);
-        // The first write carries START: msquic then starts the stream and
-        // sends the buffer in one step, which is the only ordering that both
-        // starts the stream and gets the first packet (CONNACK) on the wire.
-        const QUIC_SEND_FLAGS sendFlags =
-            state_->started.load(std::memory_order_acquire) ? QUIC_SEND_FLAG_NONE
-                                                            : QUIC_SEND_FLAG_START;
+        // QUIC_STATUS_PENDING (-2) is a *success* here: QUIC_FAILED(int(X) > 0)
+        // is false for it, and msquic delivers SEND_COMPLETE asynchronously.
         QUIC_STATUS sendStatus = quicApi()->StreamSend(state_->stream, &quicBuffer, 1,
-                                                       sendFlags, copy);
+                                                       QUIC_SEND_FLAG_NONE, copy);
         if (QUIC_FAILED(sendStatus)) {
             delete[] copy;
             state_->closed.store(true, std::memory_order_release);
@@ -331,9 +313,10 @@ struct QUICListener::Impl {
     QUIC_HANDLE *registration = nullptr;
     QUIC_HANDLE *configuration = nullptr;
     QUIC_HANDLE *listener = nullptr;
-    //! Cap matching the TCP listener's default, so QUIC cannot sidestep the
-    //! process-wide connection budget.
-    static constexpr size_t MAX_QUIC_CONNECTIONS = 1024;
+    //! Process-wide connection budget. Set by the Server from
+    //! FLOWMQ_MAX_CONNECTIONS so QUIC and TCP share one cap; falls back to the
+    //! TCP default when the listener is built without one.
+    size_t maxConnections = 1024;
     std::atomic<bool> stopped{false};
     std::atomic<size_t> activeConnections{0};
     //! Live MQTT-over-QUIC connections, each on its own serving thread (the
@@ -417,11 +400,16 @@ QUIC_STATUS QUIC_API connectionCallback(HQUIC connection, void *context,
             quicApi()->SetCallbackHandler(event->PEER_STREAM_STARTED.Stream,
                                           reinterpret_cast<void *>(streamCallback),
                                           conn->state.get());
-            // A peer-initiated stream receives as soon as the client sends,
-            // but msquic only transmits what is written to it after the start
-            // completes. The serving thread is spawned from the
-            // START_COMPLETE event, and the first write carries
-            // QUIC_SEND_FLAG_START so the two cannot race.
+            // The stream is already started: msquic delivers PEER_STREAM_STARTED
+            // once the peer has started it, and the server may send on a
+            // peer-initiated bidirectional stream immediately. Spawn the serving
+            // thread here - NOT from QUIC_STREAM_EVENT_START_COMPLETE, which
+            // msquic only raises for *locally*-initiated streams. The original
+            // wiring waited for START_COMPLETE, which never fired for this
+            // peer-initiated stream, so no Connection was ever constructed and
+            // the client's CONNECT was never served (the listener was a black
+            // hole until the idle timeout).
+            serveConnection(conn);
         } else {
             // Exactly one MQTT stream per connection; extra streams are
             // aborted rather than half-served.
@@ -463,13 +451,11 @@ QUIC_STATUS QUIC_API streamCallback(HQUIC stream, void *context,
         break;
     }
     case QUIC_STREAM_EVENT_START_COMPLETE:
-        // The stream is ready for sends only now; hand it to the serving
-        // thread.
-        state->started.store(true, std::memory_order_release);
-        state->condition.notify_all();
-        if (state->startServing) {
-            state->startServing();
-        }
+        // msquic only raises START_COMPLETE for a *locally*-initiated stream;
+        // the peer-initiated streams this gateway serves never reach here. The
+        // serving thread is already spawned from PEER_STREAM_STARTED and the
+        // server side of the stream is started by the first write's
+        // SEND_FLAG_START, so there is nothing to do here.
         break;
     case QUIC_STREAM_EVENT_SEND_COMPLETE:
         // The payload handed to StreamSend is copied per send and released
@@ -478,12 +464,17 @@ QUIC_STATUS QUIC_API streamCallback(HQUIC stream, void *context,
         break;
     case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:
         state->closed.store(true, std::memory_order_release);
+        state->condition.notify_all();
         // Same rule as the connection handle: close from the shutdown event.
         quicApi()->StreamClose(stream);
         break;
     default:
         break;
     }
+    // Wake any serving thread parked in readSome()/readable(): a RECEIVE
+    // appended bytes above and must hand them over. Done after the switch (and
+    // outside the per-case lock) so every event type that changes the buffer or
+    // the closed flag signals the waiter exactly once.
     state->condition.notify_all();
     return QUIC_STATUS_SUCCESS;
 }
@@ -494,7 +485,7 @@ QUIC_STATUS QUIC_API listenerCallback(HQUIC /*listener*/, void *context,
     switch (event->Type) {
     case QUIC_LISTENER_EVENT_NEW_CONNECTION: {
         if (accept->impl->activeConnections.load(std::memory_order_relaxed) >=
-            QUICListener::Impl::MAX_QUIC_CONNECTIONS) {
+            accept->impl->maxConnections) {
             logError("too many QUIC connections, refusing client");
             return QUIC_STATUS_CONNECTION_REFUSED;
         }
@@ -528,9 +519,16 @@ QUIC_STATUS QUIC_API listenerCallback(HQUIC /*listener*/, void *context,
 
 } // namespace
 
-QUICListener::QUICListener(Broker *broker, uint16_t port)
+QUICListener::QUICListener(Broker *broker, uint16_t port, size_t maxConnections)
     : impl(std::make_unique<Impl>()), broker_(broker), port_(port) {
     impl->broker = broker;
+    // Default to the TCP listener's own default (1024) only when the caller did
+    // not pass a configured budget; the Server always passes its maxConnections
+    // so FLOWMQ_MAX_CONNECTIONS governs TCP and QUIC alike and QUIC cannot
+    // sidestep the process-wide connection budget.
+    if (maxConnections != 0) {
+        impl->maxConnections = maxConnections;
+    }
     impl->acceptContext = std::make_unique<QUICAcceptContext>(
         QUICAcceptContext{impl.get(), broker});
 }
@@ -658,8 +656,16 @@ void QUICListener::stop() {
     // callbacks close the last msquic handles before the registration goes.
     impl->reapFinished();
     for (;;) {
-        std::lock_guard<std::mutex> lock(impl->servingMutex);
-        if (impl->serving.empty()) {
+        // Snapshot emptiness under the lock, then release it before calling
+        // reapFinished(): reapFinished() locks servingMutex itself, so holding
+        // it here would self-deadlock on the non-recursive mutex the first time
+        // a serving thread is still live.
+        bool empty;
+        {
+            std::lock_guard<std::mutex> lock(impl->servingMutex);
+            empty = impl->serving.empty();
+        }
+        if (empty) {
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));

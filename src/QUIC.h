@@ -31,7 +31,7 @@ constexpr const char *QUIC_ALPN_MQTT = "mqtt";
  */
 class QUICListener {
 public:
-    QUICListener(Broker *broker, uint16_t port);
+    QUICListener(Broker *broker, uint16_t port, size_t maxConnections = 1024);
     ~QUICListener();
     QUICListener(const QUICListener &) = delete;
     QUICListener &operator=(const QUICListener &) = delete;

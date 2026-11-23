@@ -180,7 +180,8 @@ Server::Server(int port, size_t maxConnections)
             throw std::runtime_error(std::string("invalid FLOWMQ_QUIC_PORT: ") +
                                      quicPort);
         }
-        quicListener = std::make_unique<QUICListener>(broker, static_cast<uint16_t>(parsed));
+        quicListener = std::make_unique<QUICListener>(broker, static_cast<uint16_t>(parsed),
+                                                      maxConnections);
         logInfo("quic listener on UDP port %d", static_cast<int>(parsed));
     }
 #endif
