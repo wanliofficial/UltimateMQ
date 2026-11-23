@@ -118,7 +118,15 @@ std::shared_ptr<TLSContext> TLSContext::load(const std::string &certPath,
     // Modern TLS only
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
 
-    if (SSL_CTX_use_certificate_file(ctx, certPath.c_str(), SSL_FILETYPE_PEM) != 1) {
+    // Load the certificate as a CHAIN, not a single certificate: an operator who
+    // points FLOWMQ_TLS_CERT at a PEM bundle (leaf first, then its intermediate
+    // CA certificates) expects the intermediate chain to be sent so clients that
+    // do not already hold it can build the path to their trust anchor.
+    // SSL_CTX_use_certificate_file loads only the FIRST certificate in the file,
+    // silently dropping the intermediates, so such a client fails to verify the
+    // server. _chain_file also accepts a single-certificate file unchanged, so
+    // the common case is unaffected.
+    if (SSL_CTX_use_certificate_chain_file(ctx, certPath.c_str()) != 1) {
         if (error) {
             *error = "cannot load certificate file: " + certPath;
         }

@@ -75,6 +75,7 @@ PROBES = [
     ("tls_handshake_timeout_test", "TLS handshake: a silent peer is dropped, not held forever"),
     ("tls_write_timeout_test", "TLS write: a client that stops reading is dropped for its stalled write"),
     ("tls_mtls_without_cert_test", "TLS: VERIFY_CLIENTS/CA without a certificate is refused, not plaintext"),
+    ("tls_cert_chain_test", "TLS: a leaf+intermediate PEM bundle is sent as a chain"),
     ("write_timeout_range_test", "FLOWMQ_WRITE_TIMEOUT_MS above INT_MAX is refused, not truncated"),
     ("mqttsn_large_publish_test", "MQTT-SN §5.2.1 three-octet Length field"),
     ("mqttsn_subscribe_topicid_test", "MQTT-SN gateway: subscribe-by-name assigns a topic id, publish-by-id is routed back to the name, id is reused on re-subscribe"),
