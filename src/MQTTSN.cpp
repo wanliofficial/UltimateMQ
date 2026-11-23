@@ -836,19 +836,23 @@ void Gateway::handlePublish(const sockaddr_in &addr, const Parsed &p) {
         known = true;
         break;
     }
-    const bool qos2 = p.flags.qos == 2;
+    // MQTT-SN §6.6: "Regardless of the requested QoS level the client may
+    // receive in response to its PUBLISH a PUBACK message which contains either
+    // ReturnCode = 'Rejection: invalid topic Id' ... or 'Rejection: congestion'."
+    // Only PUBACK has a ReturnCode field; PUBREC/PUBREL/PUBCOMP carry none, so a
+    // rejection at ANY QoS must be a PUBACK. An earlier shape answered a QoS 2
+    // rejection with a bare PUBREC - byte-for-byte identical to the PUBREC sent
+    // on a *successful* QoS 2 publish - so the client could not tell rejection
+    // from acceptance and would complete PUBREL/PUBCOMP believing an
+    // exactly-once delivery that never happened. Answer every rejection with a
+    // PUBACK carrying the code (topic id, msg id, return code), as the QoS 1
+    // branch already does.
     const auto reject = [&](ReturnCode code) {
-        if (qos2) {
-            std::vector<uint8_t> body;
-            appendU16(body, p.msgId);
-            sendTo(addr, encode(MsgType::PUBREC, body));
-        } else if (p.flags.qos == 1) {
-            std::vector<uint8_t> body;
-            appendU16(body, p.topicId);
-            appendU16(body, p.msgId);
-            body.push_back(static_cast<uint8_t>(code));
-            sendTo(addr, encode(MsgType::PUBACK, body));
-        }
+        std::vector<uint8_t> body;
+        appendU16(body, p.topicId);
+        appendU16(body, p.msgId);
+        body.push_back(static_cast<uint8_t>(code));
+        sendTo(addr, encode(MsgType::PUBACK, body));
     };
     if (!known) {
         reject(ReturnCode::INVALID_TOPIC_ID);
