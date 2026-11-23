@@ -2,6 +2,7 @@
 #include "SHA1.h"
 #include "Log.h"
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
@@ -98,6 +99,15 @@ bool WebSocketTransport::handshake(std::string *error) {
     }
     // Read the request headers byte by byte until the blank line, so a huge
     // header block cannot blow the buffer.
+    //
+    // HANDSHAKE_TIMEOUT_MS bounds the WHOLE upgrade, not each byte. A per-byte
+    // budget would let a slowloris dribble one byte just under every timeout and
+    // hold the connection for MAX_HANDSHAKE_BYTES * HANDSHAKE_TIMEOUT_MS (~22h
+    // with the defaults), which is a cheap way to pin every handler thread. A
+    // single absolute deadline makes the entire handshake cost at most that one
+    // window no matter how the bytes are spread.
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(HANDSHAKE_TIMEOUT_MS);
     std::string request;
     while (request.find("\r\n\r\n") == std::string::npos) {
         if (request.size() >= MAX_HANDSHAKE_BYTES) {
@@ -111,8 +121,18 @@ bool WebSocketTransport::handshake(std::string *error) {
             }
             return false;
         }
+        // Refuse to wait past the shared deadline; readable() also takes a
+        // timeout, so hand it only the time actually left.
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        if (remaining.count() <= 0) {
+            if (error) {
+                *error = "websocket handshake timed out";
+            }
+            return false;
+        }
         uint8_t byte = 0;
-        if (inner_->readable(HANDSHAKE_TIMEOUT_MS) != 1) {
+        if (inner_->readable(static_cast<int>(remaining.count())) != 1) {
             if (error) {
                 *error = "websocket handshake timed out";
             }
