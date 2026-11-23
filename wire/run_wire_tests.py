@@ -9,6 +9,7 @@ Usage: run_wire_tests.py [build_dir]
 Defaults to ./build relative to the repo root.
 """
 import os
+import random
 import socket
 import subprocess
 import sys
@@ -22,6 +23,29 @@ BINARY = os.path.join(BUILD, "flowmq")
 
 
 def free_port():
+    """Return an unused TCP port that the broker can bind without racing an
+    outgoing connection.
+
+    bind(("127.0.0.1", 0)) hands back a port from the OS's ephemeral range
+    (49152-65535 on macOS) - the very range the kernel also auto-assigns to
+    *outgoing* connections. The runner closes its probe socket and passes the
+    number to a subprocess that binds it a moment later; in that window an
+    unrelated outgoing connection can take the port, so the broker's bind()
+    fails with EADDRINUSE and exits (a probe then reports "server did not
+    start" at random). Pick a port from below the ephemeral range instead and
+    probe it for availability, so nothing on the machine is competing for it.
+    """
+    for _ in range(200):
+        port = random.randint(20000, 45000)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            s.close()
+            continue
+        s.close()
+        return port
+    # Fall back to the kernel's pick if the band is somehow exhausted.
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
@@ -30,6 +54,7 @@ def free_port():
 
 
 PROBES = [
+    ("durable_state_restart_test", "durable state: retained messages and persistent sessions survive a broker restart (FLOWMQ_STATE_FILE)"),
     ("mqttsn_qos1_ping_will_test", "MQTT-SN QoS 1 PUBACK round-trip, PINGREQ/PINGRESP, Will published on abnormal keep-alive disconnect"),
     ("retained_messages_test", "retained: snapshot-to-new-subscriber with RETAIN=1, live delivery clears RETAIN, empty payload clears, wildcard match"),
     ("mqtt311_test", "MQTT 3.1.1: protocol level 4 round-trip, 0x80 SUBACK refusal, silent QoS 0 drop"),
