@@ -67,8 +67,19 @@ private:
     //! state. Returns false when the peer is gone or the framing is invalid.
     bool nextFrame();
     //! Send one frame with \p opcode and the given payload (unmasked: only
-    //! clients mask).
+    //! clients mask). Blocks until the whole frame is out (writeAll path).
     bool sendFrame(uint8_t opcode, const uint8_t *payload, size_t len);
+    //! Build one complete frame (header + payload) into a byte vector.
+    static std::vector<uint8_t> buildFrame(uint8_t opcode, const uint8_t *payload,
+                                           size_t len);
+    //! Non-blocking counterpart: queues \p payload as a frame after any pending
+    //! tail, then flushes what the socket takes, retaining the rest. Returns
+    //! true when the frame was accepted (flushed or safely retained), false on a
+    //! dead peer. Used by writeSome() so FLOWMQ_WRITE_BUFFER works over WS/WSS.
+    bool sendFrameNonBlocking(uint8_t opcode, const uint8_t *payload, size_t len);
+    //! Try to push pendingFrame_ out. Returns 1 = fully flushed, 0 = would-block
+    //! with a tail retained, -1 = peer gone.
+    int flushPending();
     //! Best-effort CLOSE frame (unless one was already sent).
     void sendClose(uint16_t status);
 
@@ -92,6 +103,11 @@ private:
     //! rejected upgrade the peer is still speaking HTTP, so teardown must not
     //! append WebSocket framing to the plain HTTP error response.
     bool established_ = false;
+    //! Raw frame bytes a would-block left unsent (header + payload already
+    //! framed). writeSome() flushes these before framing a new unit; because the
+    //! frame header must not be re-prepended on a retry, a partial send is held
+    //! here rather than reported as a short payload count.
+    std::vector<uint8_t> pendingFrame_;
 };
 
 } // namespace MQTT

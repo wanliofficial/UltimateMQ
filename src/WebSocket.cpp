@@ -292,7 +292,8 @@ bool WebSocketTransport::fillRawBuffer() {
     return true;
 }
 
-bool WebSocketTransport::sendFrame(uint8_t opcode, const uint8_t *payload, size_t len) {
+std::vector<uint8_t> WebSocketTransport::buildFrame(uint8_t opcode, const uint8_t *payload,
+                                                    size_t len) {
     std::vector<uint8_t> frame;
     frame.push_back(0x80 | opcode); // FIN set: every message goes out whole
     if (len < 126) {
@@ -308,7 +309,44 @@ bool WebSocketTransport::sendFrame(uint8_t opcode, const uint8_t *payload, size_
         }
     }
     frame.insert(frame.end(), payload, payload + len);
+    return frame;
+}
+
+bool WebSocketTransport::sendFrame(uint8_t opcode, const uint8_t *payload, size_t len) {
+    const std::vector<uint8_t> frame = buildFrame(opcode, payload, len);
     return inner_->writeAll(frame.data(), frame.size());
+}
+
+int WebSocketTransport::flushPending() {
+    size_t sent = 0;
+    const size_t total = pendingFrame_.size();
+    while (sent < total) {
+        const ssize_t n = inner_->writeSome(pendingFrame_.data() + sent, total - sent);
+        if (n < 0) {
+            pendingFrame_.clear();
+            return -1; // peer gone
+        }
+        if (n == 0) {
+            // Would-block: drop the bytes already sent so the next call resumes
+            // exactly where the socket stopped (the header is not re-added).
+            pendingFrame_.erase(pendingFrame_.begin(),
+                                pendingFrame_.begin() + static_cast<long>(sent));
+            return 0;
+        }
+        sent += static_cast<size_t>(n);
+    }
+    pendingFrame_.clear();
+    return 1;
+}
+
+bool WebSocketTransport::sendFrameNonBlocking(uint8_t opcode, const uint8_t *payload,
+                                              size_t len) {
+    // Queue the whole frame (header + payload) after any tail still pending from
+    // an earlier would-block, then flush as much as the socket takes. The header
+    // is built exactly once, so a resumed flush never re-prepends it.
+    std::vector<uint8_t> frame = buildFrame(opcode, payload, len);
+    pendingFrame_.insert(pendingFrame_.end(), frame.begin(), frame.end());
+    return flushPending() != -1; // 0 (would-block) is fine: the tail is retained
 }
 
 void WebSocketTransport::sendClose(uint16_t status) {
@@ -318,7 +356,17 @@ void WebSocketTransport::sendClose(uint16_t status) {
     closeSent_ = true;
     uint8_t payload[2] = {static_cast<uint8_t>(status >> 8),
                           static_cast<uint8_t>(status & 0xFF)};
-    sendFrame(0x08, payload, sizeof(payload));
+    const std::vector<uint8_t> closeFrame = buildFrame(0x08, payload, sizeof(payload));
+    if (pendingFrame_.empty()) {
+        // Nothing stuck ahead of the CLOSE: block to get it out (teardown path).
+        inner_->writeAll(closeFrame.data(), closeFrame.size());
+        return;
+    }
+    // A tail is still pending from an earlier would-block: the CLOSE must not
+    // jump ahead of those bytes. Append it and flush the lot non-blockingly;
+    // teardown follows regardless, so a short flush here is acceptable.
+    pendingFrame_.insert(pendingFrame_.end(), closeFrame.begin(), closeFrame.end());
+    flushPending();
 }
 
 bool WebSocketTransport::nextFrame() {
@@ -524,20 +572,44 @@ bool WebSocketTransport::writeAll(const uint8_t *buf, size_t len) {
     if (closedByPeer_ && closeSent_) {
         return false;
     }
+    // Normally empty here (writeAll is the unbuffered path), but a tail could
+    // linger if the write buffer was toggled off mid-stream; push it out first so
+    // the new frame does not jump ahead of older bytes.
+    if (!pendingFrame_.empty()) {
+        while (!pendingFrame_.empty()) {
+            if (!inner_->writeAll(pendingFrame_.data(), pendingFrame_.size())) {
+                return false;
+            }
+            pendingFrame_.clear();
+        }
+    }
     return sendFrame(0x02, buf, len); // one BINARY frame per write
 }
 
 ssize_t WebSocketTransport::writeSome(const uint8_t *buf, size_t len) {
-    // A WebSocket write unit is one complete masked BINARY frame (sendFrame
-    // builds the whole frame, including the payload, before touching the inner
-    // socket). So the buffered path can treat writeAll's bytes as one atomic
-    // unit: send it whole or report would-block, never a partial frame. The
-    // inner transport (a SecureTransport) already writes the frame bytes
-    // without blocking under the buffer, so delegating is safe.
+    // Non-blocking path for FLOWMQ_WRITE_BUFFER. WebSocket framing means a write
+    // unit is one whole frame (header + payload): the caller re-sends a remainder
+    // verbatim, so writeSome must never report a partial payload count or the
+    // header would be re-prepended and corrupt the stream. Contract:
+    //   len  -> the unit is accepted (whole frame flushed, or its tail retained
+    //           in pendingFrame_ and resumed by a later call);
+    //   0    -> a previously retained tail is still blocked, so this unit was not
+    //           consumed at all and must be retried;
+    //   -1   -> the peer is gone.
     if (closedByPeer_ && closeSent_) {
         return -1;
     }
-    return sendFrame(0x02, buf, len) ? static_cast<ssize_t>(len) : -1;
+    // Flush any tail left by an earlier would-block before framing a new unit.
+    if (!pendingFrame_.empty()) {
+        const int flushed = flushPending();
+        if (flushed < 0) {
+            return -1;
+        }
+        if (flushed == 0) {
+            return 0; // still blocked: do not consume this unit
+        }
+    }
+    return sendFrameNonBlocking(0x02, buf, len) ? static_cast<ssize_t>(len) : -1;
 }
 
 void WebSocketTransport::teardown() {
