@@ -51,10 +51,9 @@ Server::Server(int port, size_t maxConnections)
     // overrides it so a deployment can fit its thread/memory budget.
     const char* maxConnectionsEnv = getenv("FLOWMQ_MAX_CONNECTIONS");
     if (maxConnectionsEnv && *maxConnectionsEnv) {
-        char* end = nullptr;
-        unsigned long long parsed = std::strtoull(maxConnectionsEnv, &end, 10);
-        if (end == maxConnectionsEnv || *end != '\0' || *maxConnectionsEnv == '-' ||
-            parsed == 0) {
+        unsigned long long parsed;
+        if (!Env::parseLimit(maxConnectionsEnv,
+                             std::numeric_limits<size_t>::max(), parsed)) {
             throw std::runtime_error(std::string("invalid FLOWMQ_MAX_CONNECTIONS: ") +
                                      maxConnectionsEnv);
         }
@@ -194,9 +193,8 @@ Server::Server(int port, size_t maxConnections)
     // behaviour; only raise it when the deployment needs large payloads.
     const char* maxPacketSize = getenv("FLOWMQ_MAX_PACKET_SIZE");
     if (maxPacketSize && *maxPacketSize) {
-        char* end = nullptr;
-        unsigned long long parsed = std::strtoull(maxPacketSize, &end, 10);
-        if (end == maxPacketSize || *end != '\0' || *maxPacketSize == '-' || parsed == 0) {
+        unsigned long long parsed;
+        if (!Env::parseLimit(maxPacketSize, std::numeric_limits<size_t>::max(), parsed)) {
             delete broker;
             broker = nullptr;
             throw std::runtime_error(std::string("invalid FLOWMQ_MAX_PACKET_SIZE: ") +
@@ -237,9 +235,8 @@ Server::Server(int port, size_t maxConnections)
     // Must be set before any client connects.
     const char* writeBuffer = getenv("FLOWMQ_WRITE_BUFFER");
     if (writeBuffer && *writeBuffer) {
-        char* end = nullptr;
-        unsigned long long parsed = std::strtoull(writeBuffer, &end, 10);
-        if (end == writeBuffer || *end != '\0' || parsed == 0) {
+        unsigned long long parsed;
+        if (!Env::parseLimit(writeBuffer, std::numeric_limits<size_t>::max(), parsed)) {
             delete broker;
             broker = nullptr;
             throw std::runtime_error(std::string("invalid FLOWMQ_WRITE_BUFFER: ") +
@@ -253,9 +250,8 @@ Server::Server(int port, size_t maxConnections)
     // may register, so it cannot exhaust memory with an unbounded set.
     const char* maxSubscriptions = getenv("FLOWMQ_MAX_SUBSCRIPTIONS");
     if (maxSubscriptions && *maxSubscriptions) {
-        char* end = nullptr;
-        unsigned long long parsed = std::strtoull(maxSubscriptions, &end, 10);
-        if (end == maxSubscriptions || *end != '\0' || *maxSubscriptions == '-' || parsed == 0) {
+        unsigned long long parsed;
+        if (!Env::parseLimit(maxSubscriptions, std::numeric_limits<size_t>::max(), parsed)) {
             delete broker;
             broker = nullptr;
             throw std::runtime_error(std::string("invalid FLOWMQ_MAX_SUBSCRIPTIONS: ") +
@@ -270,14 +266,14 @@ Server::Server(int port, size_t maxConnections)
     // member in the broker. Defaults to the subscription limit.
     const char* maxSharedSubscriptions = getenv("FLOWMQ_MAX_SHARED_SUBSCRIPTIONS");
     if (maxSharedSubscriptions && *maxSharedSubscriptions) {
-        char* end = nullptr;
-        unsigned long long parsed = std::strtoull(maxSharedSubscriptions, &end, 10);
-        if (end == maxSharedSubscriptions || *end != '\0' || *maxSharedSubscriptions == '-' ||
-            parsed == 0) {
+        unsigned long long parsed;
+        if (!Env::parseLimit(maxSharedSubscriptions,
+                             std::numeric_limits<size_t>::max(), parsed)) {
             delete broker;
             broker = nullptr;
-            throw std::runtime_error(std::string("invalid FLOWMQ_MAX_SHARED_SUBSCRIPTIONS: ") +
-                                     maxSharedSubscriptions);
+            throw std::runtime_error(
+                std::string("invalid FLOWMQ_MAX_SHARED_SUBSCRIPTIONS: ") +
+                maxSharedSubscriptions);
         }
         broker->setMaxSharedSubscriptions(static_cast<size_t>(parsed));
         logInfo("max shared subscriptions per session: %zu",
@@ -290,9 +286,8 @@ Server::Server(int port, size_t maxConnections)
     // unlimited behaviour unchanged.
     const char* maxRetained = getenv("FLOWMQ_MAX_RETAINED");
     if (maxRetained && *maxRetained) {
-        char* end = nullptr;
-        unsigned long long parsed = std::strtoull(maxRetained, &end, 10);
-        if (end == maxRetained || *end != '\0' || *maxRetained == '-' || parsed == 0) {
+        unsigned long long parsed;
+        if (!Env::parseLimit(maxRetained, std::numeric_limits<size_t>::max(), parsed)) {
             delete broker;
             broker = nullptr;
             throw std::runtime_error(std::string("invalid FLOWMQ_MAX_RETAINED: ") +
@@ -307,9 +302,8 @@ Server::Server(int port, size_t maxConnections)
     // the broker's fan-out path with an unbounded burst.
     const char* maxPublishRate = getenv("FLOWMQ_MAX_PUBLISH_RATE");
     if (maxPublishRate && *maxPublishRate) {
-        char* end = nullptr;
-        unsigned long long parsed = std::strtoull(maxPublishRate, &end, 10);
-        if (end == maxPublishRate || *end != '\0' || *maxPublishRate == '-' || parsed == 0) {
+        unsigned long long parsed;
+        if (!Env::parseLimit(maxPublishRate, std::numeric_limits<size_t>::max(), parsed)) {
             delete broker;
             broker = nullptr;
             throw std::runtime_error(std::string("invalid FLOWMQ_MAX_PUBLISH_RATE: ") +
@@ -348,10 +342,8 @@ Server::Server(int port, size_t maxConnections)
     // value through the Server Keep Alive property.
     const char* serverKeepAlive = getenv("FLOWMQ_SERVER_KEEP_ALIVE");
     if (serverKeepAlive && *serverKeepAlive) {
-        char* end = nullptr;
-        unsigned long long parsed = std::strtoull(serverKeepAlive, &end, 10);
-        if (end == serverKeepAlive || *end != '\0' || *serverKeepAlive == '-' ||
-            parsed == 0 || parsed > 65535) {
+        unsigned long long parsed;
+        if (!Env::parseLimit(serverKeepAlive, 65535, parsed)) {
             delete broker;
             broker = nullptr;
             throw std::runtime_error(std::string("invalid FLOWMQ_SERVER_KEEP_ALIVE: ") +

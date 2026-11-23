@@ -66,6 +66,7 @@ PROBES = [
     ("publish_missing_packetid_test", "MQTT-2.2.1-3: a QoS>0 PUBLISH with no Packet Identifier is a Protocol Error (DISCONNECT 0x82), not Malformed (0x81)"),
     ("pubrel_dup_bit_test", "MQTT-3.6.1-1: a PUBREL re-sent after reconnect keeps the reserved bits 0010 (0x62), never a DUP bit (0x6A)"),
     ("receive_maximum_resume_test", "MQTT-4.9.0-2: a resumed session is not sent more than Receive Maximum unacked QoS>0 PUBLISHes, even when buffered offline under the default window"),
+    ("env_limit_overflow_test", "config: an out-of-range FLOWMQ_* resource limit (strtoull ERANGE) is rejected at startup instead of silently becoming ULLONG_MAX and removing the cap"),
     ("retained_messages_test", "retained: snapshot-to-new-subscriber with RETAIN=1, live delivery clears RETAIN, empty payload clears, wildcard match"),
     ("mqtt311_test", "MQTT 3.1.1: protocol level 4 round-trip, 0x80 SUBACK refusal, silent QoS 0 drop"),
     ("qos2_exactly_once_test", "QoS 2: full PUBLISH/PUBREC/PUBREL/PUBCOMP handshake delivers exactly once + a DUP retransmit gets PUBREC/SUCCESS (not re-routed)"),
