@@ -77,6 +77,19 @@ std::shared_ptr<TLSContext> TLSContext::load(const std::string &certPath,
                                             const std::string &caPath,
                                             std::string *error) {
     if (certPath.empty() && keyPath.empty()) {
+        // No certificate configured. This is a plaintext broker ONLY when TLS
+        // was not otherwise requested. If the operator asked for client
+        // verification or supplied a CA, they intended mutual TLS; silently
+        // falling back to plaintext would run unencrypted with no client auth
+        // while the configuration reads as if it were on, so refuse instead.
+        if (verifyClients || !caPath.empty()) {
+            if (error) {
+                *error = "FLOWMQ_TLS_VERIFY_CLIENTS/FLOWMQ_TLS_CA require "
+                         "FLOWMQ_TLS_CERT and FLOWMQ_TLS_KEY (refusing to run "
+                         "plaintext)";
+            }
+            return nullptr;
+        }
         // No TLS requested: plaintext broker
         return nullptr;
     }
