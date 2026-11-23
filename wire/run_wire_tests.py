@@ -72,6 +72,7 @@ PROBES = [
     ("websocket_sys_topics_test", "WebSocket $SYS: monitoring tree reaches a subscriber + §4.1.2-2"),
     ("accept_backoff_test", "accept(): EMFILE/ENFILE backs off instead of spinning"),
     ("tls_handshake_timeout_test", "TLS handshake: a silent peer is dropped, not held forever"),
+    ("tls_write_timeout_test", "TLS write: a client that stops reading is dropped for its stalled write"),
     ("mqttsn_large_publish_test", "MQTT-SN §5.2.1 three-octet Length field"),
     ("mqttsn_subscribe_topicid_test", "MQTT-SN gateway: subscribe-by-name assigns a topic id, publish-by-id is routed back to the name, id is reused on re-subscribe"),
     ("mqttsn_register_topicid_test", "MQTT-SN REGISTER/REGACK (§5.3.8/§5.3.9): a valid name is assigned an id a publish-by-id uses, a wildcard topic name is refused with INVALID_TOPIC_ID"),

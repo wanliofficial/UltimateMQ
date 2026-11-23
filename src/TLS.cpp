@@ -157,12 +157,15 @@ SecureTransport::SecureTransport(int fd, std::shared_ptr<TLSContext> TLS,
         if (ssl_) {
             SSL_set_fd(ssl_, fd_);
         }
-    } else {
-        // Plaintext socket: it stays blocking, but a blocking ::send would
-        // otherwise wait forever on a client that stops reading, pinning this
-        // connection's thread and its queued messages. Bound the wait so a
-        // stalled peer is dropped instead of held (a stalled send returns
-        // EAGAIN, which writeAll already treats as a dropped connection).
+    }
+    // Bound the send wait for BOTH the plaintext and the TLS path. A blocking
+    // ::send or SSL_write waits forever on a client that stops reading, pinning
+    // this connection's thread and its queued messages. For TLS the socket is
+    // blocking again after the handshake, so a stalled SSL_write blocks inside
+    // write(2) and never returns WANT_WRITE - the poll() fallback in writeAll()
+    // is unreachable without this. SO_SNDTIMEO turns both into EAGAIN, which
+    // writeAll() already treats as a dropped connection.
+    {
         struct timeval tv;
         tv.tv_sec = writeTimeoutMs_ / 1000;
         tv.tv_usec = (writeTimeoutMs_ % 1000) * 1000;
