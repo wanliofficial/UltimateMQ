@@ -67,6 +67,7 @@ PROBES = [
     ("session_resume_test", "session resume: an unacked QoS 1 message is retransmitted with DUP on reconnect (sessionPresent=1), and a fresh session is not"),
     ("recvmax_window_test", "MQTT-4.9 Receive Maximum window (QoS 2 / QoS 1)"),
     ("websocket_framing_test", "WebSocket framing: cap-before-buffer + no fragmented control frames"),
+    ("websocket_upgrade_token_test", "WebSocket upgrade: the |Upgrade| token is matched exactly, not as a substring"),
     ("websocket_reject_response_test", "WebSocket reject: clean 400 (Content-Length exact) and no CLOSE frame appended"),
     ("websocket_handshake_deadline_test", "WebSocket upgrade: one absolute deadline drops a slowloris (not per-byte)"),
     ("websocket_write_buffer_test", "WebSocket: FLOWMQ_WRITE_BUFFER buffers/ serves a slow reader (writeSome non-blocking)"),

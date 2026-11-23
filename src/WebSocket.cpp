@@ -190,7 +190,12 @@ bool WebSocketTransport::handshake(std::string *error) {
 
     // The binding requires an upgrade request; anything else gets a plain HTTP
     // error so a misdirected browser tab sees something intelligible.
-    if (method != "GET" || toLower(upgradeHeader).find("websocket") == std::string::npos ||
+    // RFC 6455 §4.2.1 item 3 requires the |Upgrade| header to contain the value
+    // "websocket" (case-insensitive). Like |Connection|, |Upgrade| is a
+    // comma-separated list of protocol tokens (RFC 9110 §7.8), so match the
+    // token rather than a substring: "notwebsocket"/"xwebsocketx" only *contain*
+    // the letters and must not be upgraded.
+    if (method != "GET" || !headerContains(upgradeHeader, "websocket") ||
         !headerContains(connectionHeader, "upgrade") || keyHeader.empty()) {
         // Derive Content-Length from the body: a hardcoded count drifts from the
         // literal the moment the text changes, and an off-by-one desyncs the
