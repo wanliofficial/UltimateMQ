@@ -3,8 +3,13 @@
 #include "../src/Broker.h"
 #include "../src/SysTopics.h"
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <unistd.h>
+#include <cerrno>
 #include <memory>
+#include <vector>
 
 namespace MQTT {
 
@@ -50,6 +55,69 @@ struct SocketPairConnection {
         return got < 0 ? 0 : static_cast<size_t>(got);
     }
 };
+
+//! A Connection bound to one end of a real TCP loopback connection, with a
+//! deliberately tiny send buffer so a write the peer never drains stalls. A TCP
+//! socket is required (not socketpair(AF_UNIX)) because only TCP distinguishes a
+//! graceful FIN from a RST: AF_UNIX delivers a clean EOF however the socket is
+//! closed, so it cannot observe the write-stall teardown this pins.
+struct TCPLoopbackConnection {
+    std::shared_ptr<Connection> connection;
+    int peer = -1;
+
+    explicit TCPLoopbackConnection(Broker *broker) {
+        const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (listener < 0) {
+            throw std::runtime_error("socket failed");
+        }
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        if (::bind(listener, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0 ||
+            ::listen(listener, 1) != 0) {
+            ::close(listener);
+            throw std::runtime_error("bind/listen failed");
+        }
+        socklen_t addrLen = sizeof(addr);
+        if (::getsockname(listener, reinterpret_cast<sockaddr *>(&addr), &addrLen) != 0) {
+            ::close(listener);
+            throw std::runtime_error("getsockname failed");
+        }
+        peer = ::socket(AF_INET, SOCK_STREAM, 0);
+        // A small receive buffer on the peer keeps the kernel from absorbing the
+        // whole payload, so the broker's write is forced to stall.
+        const int rcvbuf = 4096;
+        ::setsockopt(peer, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+        if (peer < 0 ||
+            ::connect(peer, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+            if (peer >= 0) {
+                ::close(peer);
+            }
+            ::close(listener);
+            throw std::runtime_error("connect failed");
+        }
+        const int server = ::accept(listener, nullptr, nullptr);
+        ::close(listener);
+        if (server < 0) {
+            ::close(peer);
+            throw std::runtime_error("accept failed");
+        }
+        const int sndbuf = 4096;
+        ::setsockopt(server, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+        connection = std::make_shared<Connection>(server, broker);
+    }
+
+    ~TCPLoopbackConnection() {
+        connection->detach();
+        connection.reset();
+        if (peer >= 0) {
+            ::close(peer);
+            peer = -1;
+        }
+    }
+};
+
 } // namespace
 
 class ConnectionStateTests : public ::testing::Test {
@@ -307,6 +375,73 @@ TEST_F(ConnectionStateTests, NoWriteBufferKeepsThePathSynchronous)
     EXPECT_TRUE(pair.connection->sendPacketForTest(*publish));
     EXPECT_EQ(pair.connection->writeBufferBytesForTest(), 0u);
     EXPECT_EQ(sysGetWriteBufferBytes(), 0u);
+}
+
+TEST_F(ConnectionStateTests, WriteStallDropResetsThePeerSoItSeesTheEndImmediately)
+{
+    // A peer that stops reading fills the kernel send buffer until the blocking
+    // write stalls past FLOWMQ_WRITE_TIMEOUT_MS, and the connection is dropped.
+    // The teardown must reach the peer as a RST (SO_LINGER={1,0}), not a
+    // graceful FIN: in production the autotuned send buffer holds megabytes the
+    // peer refuses to read, and a plain close() would keep that data queued
+    // ahead of the FIN, so the stalled reader would never see EOF and would leak.
+    // (This test caps the send buffer to 4KB so the stall happens at once; the
+    // RST-vs-FIN distinction is what it pins.)
+    broker.setWriteTimeoutMs(200);
+    TCPLoopbackConnection pair(&broker);
+
+    std::vector<uint8_t> payload(1024 * 1024, 'x');
+    auto publish = std::make_shared<PublishPacket>("stall/t", payload, QoS::QOS_0);
+    EXPECT_FALSE(pair.connection->sendPacketForTest(*publish))
+        << "a write the peer never drains must be reported as failed";
+    EXPECT_FALSE(pair.connection->isConnected());
+
+    // Tear down exactly as run() does after a failed write.
+    pair.connection->detach();
+
+    // Bound the drain so a regression (data queued ahead of a FIN) fails here
+    // instead of hanging the suite.
+    timeval tv{2, 0};
+    ::setsockopt(pair.peer, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    std::vector<char> buf(64 * 1024);
+    size_t total = 0;
+    ssize_t n = 0;
+    while ((n = ::recv(pair.peer, buf.data(), buf.size(), 0)) > 0) {
+        total += static_cast<size_t>(n);
+        if (total >= payload.size()) {
+            break;
+        }
+    }
+    const int lastErrno = n < 0 ? errno : 0;
+    EXPECT_EQ(lastErrno, ECONNRESET)
+        << "a write-stall drop must reach the peer as a RST, not a clean FIN";
+    EXPECT_LT(total, payload.size())
+        << "the undeliverable send buffer must be discarded, not drained";
+}
+
+TEST_F(ConnectionStateTests, GracefulCloseStillDeliversQueuedDataThenEOF)
+{
+    // The complement of the write-stall drop: a close that is not a drop keeps
+    // the historical FIN semantics, so the peer still receives every buffered
+    // byte and then a clean EOF (recv() == 0).
+    TCPLoopbackConnection pair(&broker);
+
+    std::vector<uint8_t> payload(1024, 'x');
+    auto publish = std::make_shared<PublishPacket>("graceful/t", payload, QoS::QOS_0);
+    ASSERT_TRUE(pair.connection->sendPacketForTest(*publish));
+
+    pair.connection->detach();
+
+    timeval tv{2, 0};
+    ::setsockopt(pair.peer, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    std::vector<char> buf(64 * 1024);
+    size_t total = 0;
+    ssize_t n = 0;
+    while ((n = ::recv(pair.peer, buf.data(), buf.size(), 0)) > 0) {
+        total += static_cast<size_t>(n);
+    }
+    EXPECT_EQ(n, 0) << "a graceful close must end with a clean EOF, not an error";
+    EXPECT_GT(total, 0u) << "the graceful path must still deliver the queued bytes";
 }
 
 } // namespace MQTT

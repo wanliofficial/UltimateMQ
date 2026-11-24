@@ -208,6 +208,14 @@ private:
     //! is the default, so a peer that simply vanishes (no DISCONNECT, a network
     /// fault) is still counted once, as a normal close.
     ReasonCode disconnectReason = ReasonCode::NORMAL_DISCONNECTION;
+    //! Set when a write failed outright (the peer stopped reading, so the kernel
+    //! send buffer filled and SO_SNDTIMEO elapsed in writeAll). The connection is
+    //! then torn down with a RST rather than a graceful close: the send buffer
+    //! still holds undeliverable data, and a plain close() would leave that data
+    //! stuck behind the peer's closed window, delaying the FIN indefinitely --
+    //! the peer would never see EOF and the stalled reader would leak. Read once
+    //! at teardown (closeSocket), like disconnectReason.
+    std::atomic<bool> writeStallDrop{false};
     std::function<void()> disconnectCallback;
     std::unique_ptr<ClientTransport> transport;
     static const int BUFFER_SIZE = 4096;

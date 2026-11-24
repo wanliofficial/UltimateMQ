@@ -428,6 +428,22 @@ bool Connection::isConnected() const {
 }
 
 void Connection::closeSocket() {
+    // A write-stall drop must reach the peer as a RST, not a graceful FIN. The
+    // kernel send buffer is still full of data the peer refuses to read, so a
+    // plain close() would leave that data queued behind the peer's closed
+    // receive window and the FIN would never be sent: the stalled reader would
+    // never see EOF and would leak. SO_LINGER={1,0} makes close() discard the
+    // queued data and send a RST immediately, so the peer sees the end of the
+    // connection at once regardless of how much is stuck in the buffer.
+    if (writeStallDrop && sockfd >= 0) {
+        struct linger lingerOpt{};
+        lingerOpt.l_onoff = 1;
+        lingerOpt.l_linger = 0;
+        ::setsockopt(sockfd, SOL_SOCKET, SO_LINGER, &lingerOpt, sizeof(lingerOpt));
+        close(sockfd);
+        sockfd = -1;
+        return;
+    }
     // Flush the TLS close_notify before the descriptor goes away
     if (transport) {
         transport->teardown();
@@ -1604,6 +1620,11 @@ bool Connection::sendPacket(Packet &packet) {
         // tears the socket down and publishes the Will.
         logDebug("outbound write failed; closing connection after %zu-byte packet",
                  data.size());
+        // Mark it as a write-stall drop so teardown sends a RST, not a graceful
+        // FIN: the send buffer still holds undeliverable data and a plain
+        // close() would leave the FIN stuck behind the peer's closed window, so
+        // the stalled reader would never see EOF (see writeStallDrop).
+        writeStallDrop = true;
         state = State::DISCONNECTED;
         return false;
     }

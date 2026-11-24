@@ -122,13 +122,24 @@ def read_pkt(c, timeout=1.0):
         h = c.recv(1)
     except socket.timeout:
         return ("timeout",)
+    except ConnectionResetError:
+        # A write-stall drop tears the connection down with a RST (SO_LINGER
+        # {1,0}) so the kernel can discard the send buffer it can no longer
+        # deliver. The peer therefore observes ECONNRESET, not a clean EOF;
+        # both mean the broker dropped us, which is what the tests assert.
+        return ("eof",)
     except Exception as exc:  # noqa: BLE001
         return ("err", repr(exc))
     if not h:
         return ("eof",)
     n, mult = 0, 1
     while True:
-        b = c.recv(1)
+        try:
+            b = c.recv(1)
+        except socket.timeout:
+            return ("timeout",)
+        except ConnectionResetError:
+            return ("eof",)
         if not b:
             return ("eof",)
         b = b[0]
@@ -138,7 +149,13 @@ def read_pkt(c, timeout=1.0):
             break
     data = b""
     while len(data) < n:
-        chunk = c.recv(n - len(data))
+        try:
+            chunk = c.recv(n - len(data))
+        except socket.timeout:
+            # A partially received packet that stalls: the caller's loop retries.
+            return ("timeout",)
+        except ConnectionResetError:
+            return ("eof",)
         if not chunk:
             return ("eof",)
         data += chunk
@@ -152,9 +169,10 @@ def start(extra_env):
     env = dict(os.environ)
     env["MQTT_PORT"] = str(port)
     env["FLOWMQ_STATE_FILE"] = os.path.join(workdir, "state.db")
-    # A stalled write is only dropped after this long; keep it short and uniform
-    # across both cases so the unbuffered drop lands well inside the drain
-    # window, while the buffered case keeps making progress (so it never stalls).
+    # A stalled write is only dropped after this long. The buffered case must
+    # outlast the stall (FLOWMQ_WRITE_BUFFER holds the whole 2MB flood, so it
+    # never stalls at all); the unbuffered case overrides it to stay well under
+    # STALL_S, so the drop lands while the subscriber is still not reading.
     env["FLOWMQ_WRITE_TIMEOUT_MS"] = "4000"
     env.update(extra_env)
     proc = subprocess.Popen([BIN], env=env, cwd=workdir,
@@ -303,28 +321,37 @@ def case_buffered_survives():
 
 def case_unbuffered_drops():
     """Buffering off (default): the same flood stalls the write past the timeout
-    and the broker drops the connection. The subscriber sees EOF before all
-    messages arrive -- the historical behaviour the knob changes."""
-    proc, port, workdir = start({})  # no FLOWMQ_WRITE_BUFFER
+    and the broker drops the connection. The subscriber sees the drop (RST/EOF)
+    before all messages arrive -- the historical behaviour the knob changes."""
+    # The write timeout must fire before the drain starts, or the reader opening
+    # the window resets the stall timer and nothing is ever dropped; STALL_S
+    # (2s) of not reading is the window that guarantees it.
+    proc, port, workdir = start({"FLOWMQ_WRITE_TIMEOUT_MS": "1000"})
     try:
         sub = new_client(port, "wb-sub", clean_start=True,
                          props=recv_max_prop(65535))
-        sub.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+        # A small receive buffer keeps the kernel from autotuning the peer's
+        # window up to megabytes, so the flood actually backpressures the
+        # broker's write instead of disappearing into the socket buffers.
+        sub.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16384)
         sub.sendall(subscribe(1, "wb/#", qos=0))
         r = read_pkt(sub)
         assert r[0] == "pkt" and r[1] & 0xF0 == 0x90, "no SUBACK"
 
-        flood(port)
+        # The flood must exceed the broker's own send buffer (tcp_wmem tops out
+        # at 4MB), or the write never stalls and nothing is dropped. 2MB
+        # (MSG_COUNT * MSG_SIZE) fits in that buffer; a 4MB+ burst does not.
+        flood(port, count=4000, size=20000)
         time.sleep(STALL_S)
 
         # With no write buffer, the broker's blocking write stalls and, past
         # FLOWMQ_WRITE_TIMEOUT_MS, drops the connection. The subscriber should
-        # see EOF well before it can read all MSG_COUNT messages.
+        # see the drop well before it can read all MSG_COUNT messages.
         got, complete, disconnected = drain_expect_all(sub, MSG_COUNT, 18.0)
         sub.close()
 
         assert disconnected, (
-            "expected the unbuffered broker to drop the stalled reader (EOF), "
+            "expected the unbuffered broker to drop the stalled reader (RST/EOF), "
             "but the subscriber received %d/%d messages and stayed connected" %
             (got, MSG_COUNT))
         return "unbuffered broker dropped the stalled reader after %d msgs" % got
