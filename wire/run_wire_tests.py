@@ -72,6 +72,7 @@ PROBES = [
     ("disconnect_will_test", "MQTT-3.1.2-8 / §3.14.2.2.2: a DISCONNECT 0x00 (Normal) deletes the Will, 0x04 (Disconnect with Will Message) still publishes it, and a DISCONNECT raising a zero CONNECT Session Expiry Interval to non-zero is refused with DISCONNECT 0x82"),
     ("publish_property_forward_test", "MQTT-3.3.2-4 / 3.3.2-8: a forwarded PUBLISH carries Response Topic, Correlation Data, Content Type, Payload Format Indicator and User Property unchanged, while a per-connection Topic Alias is not forwarded"),
     ("retain_handling_test", "MQTT 3.8.3-1: SUBSCRIBE Retain Handling 0 sends retained on subscribe, 2 suppresses it entirely, and 1 sends it on a new subscription but not on a re-subscribe of an established one"),
+    ("publish_subscription_id_test", "MQTT-3.3.4-6: a client PUBLISH carrying a Subscription Identifier (a server-to-subscriber property) is refused with DISCONNECT 0x82 (PROTOCOL_ERROR), while a clean PUBLISH is still accepted"),
     ("pubrel_dup_bit_test", "MQTT-3.6.1-1: a PUBREL re-sent after reconnect keeps the reserved bits 0010 (0x62), never a DUP bit (0x6A)"),
     ("receive_maximum_resume_test", "MQTT-4.9.0-2: a resumed session is not sent more than Receive Maximum unacked QoS>0 PUBLISHes, even when buffered offline under the default window"),
     ("env_limit_overflow_test", "config: an out-of-range FLOWMQ_* resource limit (strtoull ERANGE) is rejected at startup instead of silently becoming ULLONG_MAX and removing the cap"),
