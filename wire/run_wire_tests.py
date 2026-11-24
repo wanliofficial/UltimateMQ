@@ -73,6 +73,7 @@ PROBES = [
     ("retained_messages_test", "retained: snapshot-to-new-subscriber with RETAIN=1, live delivery clears RETAIN, empty payload clears, wildcard match"),
     ("mqtt311_test", "MQTT 3.1.1: protocol level 4 round-trip, 0x80 SUBACK refusal, silent QoS 0 drop"),
     ("qos2_exactly_once_test", "QoS 2: full PUBLISH/PUBREC/PUBREL/PUBCOMP handshake delivers exactly once + a DUP retransmit gets PUBREC/SUCCESS (not re-routed)"),
+    ("qos2_unknown_id_test", "MQTT-4.3.3-5: a PUBREL/PUBREC for an identifier that started no QoS 2 flow is answered PUBCOMP/PUBREL 0x92 (PACKET_IDENTIFIER_NOT_FOUND), not silently accepted"),
     ("session_resume_test", "session resume: an unacked QoS 1 message is retransmitted with DUP on reconnect (sessionPresent=1), and a fresh session is not"),
     ("recvmax_window_test", "MQTT-4.9 Receive Maximum window (QoS 2 / QoS 1)"),
     ("websocket_framing_test", "WebSocket framing: cap-before-buffer + no fragmented control frames"),
