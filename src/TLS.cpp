@@ -362,11 +362,36 @@ int SecureTransport::readable(int timeoutMs) {
 }
 
 ssize_t SecureTransport::readSome(uint8_t *buf, size_t max) {
-    if (!ssl_) {
-        // Plain socket read
-        return ::read(fd_, buf, max);
-    }
     for (;;) {
+        if (!ssl_) {
+            // Plain socket read. Normally blocking, so this is a single read().
+            // With FLOWMQ_WRITE_BUFFER the socket is non-blocking instead, and
+            // EAGAIN then means "no data yet", NOT "peer gone": a WebSocket
+            // frame or MQTT packet routinely arrives across several reads, so
+            // the caller must see the rest once it lands. Reporting -1 here made
+            // WebSocketTransport::fillRawBuffer treat a partial frame as a dead
+            // peer and close the connection mid-stream. Wait for the socket and
+            // retry, bounded by the same write-stall timeout as the TLS path.
+            const ssize_t n = ::read(fd_, buf, max);
+            if (n >= 0) {
+                return n; // bytes read, or 0 for an orderly close
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd;
+                pfd.fd = fd_;
+                pfd.events = POLLIN;
+                pfd.revents = 0;
+                const int ready = poll(&pfd, 1, writeTimeoutMs_);
+                if (ready <= 0) {
+                    return -1; // stalled or failed: let the caller drop it
+                }
+                continue;
+            }
+            return -1; // a real socket error
+        }
         // SSL_read can write as well: alerts, renegotiation, and session
         // tickets all go out through the same socket BIO.
         suppressSigPipe();

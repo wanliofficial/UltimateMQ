@@ -20,6 +20,7 @@ set(TEST_SOURCES
     MQTTSNTests.cpp
     ServerTests.cpp
     WebSocketTests.cpp
+    NonBlockingReadTests.cpp
 )
 
 # Create the test executable
