@@ -131,6 +131,8 @@ error rather than a credential that silently never matches.
 Once a users file is loaded every client must send a username and password;
 a missing or wrong credential is answered with CONNACK `0x86` (bad user name
 or password, MQTT 5) / `0x04`-style failure for 3.1.1 and the socket is closed.
+An explicitly configured but empty users file therefore rejects every client;
+leaving the setting unset is the only way to disable password authentication.
 
 #### Access control (`FLOWMQ_ACL_FILE`)
 
@@ -146,10 +148,12 @@ bob,read,#
   messages); `write` controls PUBLISH and Will messages.
 * Topic filters use the normal MQTT wildcard syntax.
 * The special user `*` applies to every client.
-* If an ACL file is loaded, anything not explicitly granted is denied. A
-  denied SUBSCRIBE returns SUBACK `0x87` (MQTT 5) or `0x80` (3.1.1); a denied
-  PUBLISH returns PUBACK/PUBREC `0x87` and the message is not routed; a denied
-  QoS 0 PUBLISH disconnects an MQTT 5 client and is dropped for 3.1.1.
+* If an ACL file is loaded, anything not explicitly granted is denied. An
+  explicitly configured but empty ACL file consequently denies every read and
+  write; leaving the setting unset disables ACL enforcement. A denied SUBSCRIBE
+  returns SUBACK `0x87` (MQTT 5) or `0x80` (3.1.1); a denied PUBLISH returns
+  PUBACK/PUBREC `0x87` and the message is not routed; a denied QoS 0 PUBLISH
+  disconnects an MQTT 5 client and is dropped for 3.1.1.
 * **A subscription is granted when it can reach *some* granted topic**, and each
   delivery is then checked against the concrete topic. With the rules above,
   `alice` subscribing to `sensors/+` receives `sensors/temp` but not
@@ -174,9 +178,9 @@ enhanced authentication method, and it says so instead of pretending otherwise:
 * **Authentication Data** without a Method is a protocol error
   (`PROTOCOL_ERROR`, `0x82`), since MQTT-3.1.2-17 requires the pair to travel
   together;
-* an `AUTH` packet is answered with `AUTH` `0x8C`
-  (`BAD_AUTHENTICATION_METHOD`) and the connection is closed, as MQTT-4.12.1-1
-  requires once no method has been agreed.
+* an unexpected `AUTH` packet is answered with `DISCONNECT` `0x82`
+  (`PROTOCOL_ERROR`) and the connection is closed: no enhanced authentication
+  exchange is in progress (MQTT-4.12.0-7, §4.13.1).
 
 #### Durable state (`FLOWMQ_STATE_FILE`)
 
@@ -193,8 +197,13 @@ With it, the following survive a restart:
 
 The file is written by a background thread at most once per second and again on
 `SIGINT`/`SIGTERM`, always atomically (a temporary file is renamed into place),
-so a crash never leaves a half-written state file behind. A state file with an
-unrecognised header aborts startup instead of silently discarding sessions.
+so a crash never leaves a half-written state file behind. Only a missing file
+means first startup; an empty, truncated, malformed, or duplicate record aborts
+startup instead of silently discarding sessions. New snapshots use the
+`FLOWMQ-STATE-2` header, which adds explicit origin metadata and inflight
+Subscription Identifiers. Version 1 files remain readable; downgrading after a
+version 2 snapshot is unsupported because older binaries cannot preserve those
+fields.
 
 ```bash
 FLOWMQ_STATE_FILE=/var/lib/flowmq/state.dat ./flowmq

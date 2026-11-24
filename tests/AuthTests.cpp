@@ -125,13 +125,17 @@ TEST(AuthTest, Pbkdf2DiffersFromSingleSha256)
 
 TEST(AuthTest, Pbkdf2EntryRejectsBadIterationCount)
 {
-    for (const std::string &bad : {std::string("0"), std::string("abc"), std::string("12x")}) {
+    for (const std::string &bad : {std::string("0"), std::string("abc"), std::string("12x"),
+                                   std::string(" 1000"), std::string("+1000"),
+                                   std::string("-1")}) {
+        const std::string validDigest = Auth::pbkdf2Password("aabb", "password", 1000);
         auto path = writeTemp("users_pbkdf2_bad", "eve:$pbkdf2-sha256$" + bad +
-                                                      "$aabb$00112233\n");
+                                                      "$aabb$" + validDigest + "\n");
         Auth auth;
         std::string error;
         EXPECT_FALSE(auth.loadUsers(path, &error)) << "iterations=" << bad;
-        EXPECT_FALSE(error.empty());
+        EXPECT_NE(error.find("invalid PBKDF2 iteration count"), std::string::npos)
+            << "iterations=" << bad << ": " << error;
         ::remove(path.c_str());
     }
 }
@@ -141,7 +145,8 @@ TEST(AuthTest, MalformedHashHexIsAConfigError)
     // A truncated/odd-length or non-hex digest must fail the load rather than
     // silently decoding to a prefix (which would make the stored credential
     // shorter than it looks).
-    for (const std::string &bad : {std::string("abc"), std::string("zz"), std::string("00zz")}) {
+    for (const std::string &bad : {std::string("abc"), std::string("zz"), std::string("00zz"),
+                                   std::string("00"), std::string(std::string(64, '0') + "00")}) {
         auto path = writeTemp("users_badhex", "frank:$sha256$deadbeef:" + bad + "\n");
         Auth auth;
         std::string error;
@@ -164,6 +169,33 @@ TEST(AuthTest, LegacySha256EntryStillWorks)
     ::remove(path.c_str());
     EXPECT_TRUE(auth.authenticate("gina", "old"));
     EXPECT_FALSE(auth.authenticate("gina", "wrong"));
+}
+
+TEST(AuthTest, ExplicitlyEmptyUsersFileDeniesEveryone)
+{
+    auto path = writeTemp("users_empty", "# no accounts configured\n");
+    Auth auth;
+    std::string error;
+    ASSERT_TRUE(auth.loadUsers(path, &error)) << error;
+    ::remove(path.c_str());
+
+    EXPECT_TRUE(auth.authRequired());
+    EXPECT_FALSE(auth.authenticate("anyone", ""));
+    EXPECT_FALSE(auth.authenticate("", ""));
+}
+
+TEST(AuthTest, ExplicitlyEmptyAclFileDeniesEveryTopic)
+{
+    auto path = writeTemp("acl_empty", "# no grants configured\n");
+    Auth auth;
+    std::string error;
+    ASSERT_TRUE(auth.loadAcl(path, &error)) << error;
+    ::remove(path.c_str());
+
+    EXPECT_TRUE(auth.aclEnabled());
+    EXPECT_TRUE(auth.isForbidden("anyone", "a/b", true));
+    EXPECT_TRUE(auth.isForbidden("anyone", "a/b", false));
+    EXPECT_TRUE(auth.isForbiddenSubscribe("anyone", "#"));
 }
 
 TEST(AuthTest, MissingFileIsReported)

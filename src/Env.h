@@ -30,10 +30,11 @@ public:
                  strcasecmp(value, "no") == 0);
     }
 
-    //! Parse a positive integer limit from an environment value already known to
-    //! be set and non-empty. Returns true and writes \p out on success; returns
-    //! false for a non-numeric value, trailing junk, a leading '-', zero, an
-    //! out-of-range value, or anything above \p max.
+    //! Parse an integer limit from an environment value already known to be set
+    //! and non-empty. The syntax is decimal digits only: leading whitespace,
+    //! signs, trailing junk, negatives and out-of-range values are rejected.
+    //! Zero is rejected unless \p allowZero is true, for settings where zero has
+    //! an explicit meaning such as "disabled" or "unlimited".
     //!
     //! The ERANGE check is the important one: strtoull reports an overflow (a
     //! value larger than it can represent, e.g. a mistyped "effectively
@@ -44,14 +45,14 @@ public:
     //! sees the typo. errno is reset first because strtoull only sets it on
     //! error and a stale ERANGE from an earlier call would misreport success.
     static bool parseLimit(const char *value, unsigned long long max,
-                           unsigned long long &out) {
-        if (!value || !*value) {
+                           unsigned long long &out, bool allowZero = false) {
+        if (!value || *value < '0' || *value > '9') {
             return false;
         }
         errno = 0;
         char *end = nullptr;
         const unsigned long long parsed = std::strtoull(value, &end, 10);
-        if (end == value || *end != '\0' || *value == '-' || parsed == 0 ||
+        if (end == value || *end != '\0' || (parsed == 0 && !allowZero) ||
             errno == ERANGE || parsed > max) {
             return false;
         }

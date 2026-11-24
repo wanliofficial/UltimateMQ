@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <sys/socket.h>
+#include <unistd.h>
 
 namespace MQTT {
 
@@ -58,6 +60,16 @@ public:
     //! historical behaviour (and the buffer stays effectively disabled for it).
     virtual ssize_t writeSome(const uint8_t *buf, size_t len) {
         return writeAll(buf, len) ? static_cast<ssize_t>(len) : -1;
+    }
+    //! Raw bytes retained by the transport after writeSome() reports would-block.
+    //! The connection includes these in its bounded outbound-memory accounting.
+    virtual size_t pendingWriteBytes() const { return 0; }
+    //! Wake a reader blocked in readSome() without destroying protocol state.
+    //! The owning connection thread remains responsible for teardown().
+    virtual void interrupt() {
+        if (fd() >= 0) {
+            ::shutdown(fd(), SHUT_RDWR);
+        }
     }
     //! Send whatever protocol-level goodbye the transport speaks and release
     //! its per-connection state.

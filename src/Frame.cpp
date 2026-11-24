@@ -1,6 +1,7 @@
 
 #include "Frame.h"
 #include "Utf8.h"
+#include "Topic.h"
 #include <set>
 #include <memory>
 #include <iostream>
@@ -382,7 +383,7 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length,
                                 identifiers != nullptr;
         if (propertyId != PropertyID::USER_PROPERTY && !repeatable &&
             !seen.insert(propertyId).second) {
-            throw std::runtime_error("Invalid properties: a property appears more than once");
+            throw ProtocolViolation("Invalid properties: a property appears more than once");
         }
         // Payload Format Indicator, Request Response Information, Request
         // Problem Information, Maximum QoS, Retain Available, Wildcard
@@ -451,7 +452,12 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length,
                 if (offset + 2 > length) {
                     throw std::runtime_error("Invalid properties: insufficient data");  
                 }  
-                responseTopic = parseString(buffer + offset, length - offset);     
+                responseTopic = parseString(buffer + offset, length - offset);
+                // MQTT-3.3.2-14: a Response Topic must be a valid Topic Name,
+                // so it cannot contain wildcard characters.
+                if (!Topic::isValidTopicName(responseTopic)) {
+                    throw ProtocolViolation("Invalid properties: RESPONSE_TOPIC is not a Topic Name");
+                }
                 properties[propertyId] = responseTopic;
                 offset += responseTopic.length() + 2;
                 break;  
@@ -494,7 +500,7 @@ Properties Frame::doParseProperties(const uint8_t *buffer, size_t length,
                     auto [identifier, identifierBytes] =
                         decodeVariableByteInteger(buffer + offset, length - offset);
                     if (identifier == 0) {
-                        throw std::runtime_error("Invalid properties: SUBSCRIPTION_IDENTIFIER of 0");
+                        throw ProtocolViolation("Invalid properties: SUBSCRIPTION_IDENTIFIER of 0");
                     }
                     if (identifiers != nullptr) {
                         // On a PUBLISH every occurrence is kept (MQTT-3.3.4-4).
@@ -876,7 +882,12 @@ void Frame::parseAckReasonAndProperties(const uint8_t *buffer, size_t length, si
     if (offset >= length) {
         return; // Remaining Length 3: Reason Code only, no Property Length
     }
-    properties = parseProperties(buffer + offset, length - offset, nullptr, context).first;
+    auto [parsedProperties, consumed] =
+        parseProperties(buffer + offset, length - offset, nullptr, context);
+    if (offset + consumed != length) {
+        throw std::runtime_error("Malformed ack: trailing bytes after properties");
+    }
+    properties = std::move(parsedProperties);
 }
 
 PubackPacket Frame::parsePuback(const uint8_t *buffer, size_t length) {
@@ -1057,6 +1068,10 @@ AuthPacket Frame::parseAuth(const uint8_t *payload, size_t length) {
     }
     if (offset != length) {
         throw std::runtime_error("Malformed AUTH: trailing bytes after properties");
+    }
+    // §3.15.2.2.2: an AUTH packet is a Protocol Error without Authentication Method.
+    if (auth.properties.find(PropertyID::AUTHENTICATION_METHOD) == auth.properties.end()) {
+        throw ProtocolViolation("AUTH without Authentication Method (MQTT-3.15.2.2.2)");
     }
     return auth;
 }
@@ -1679,6 +1694,9 @@ std::vector<uint8_t> Frame::serializeAuth(const AuthPacket &packet) {
 
 // Helper function to serialize the remaining length field
 std::vector<uint8_t> Frame::encodeRemainingLength(size_t length) {
+    if (length > MAX_LENGTH) {
+        throw std::length_error("MQTT Remaining Length exceeds 268435455");
+    }
     std::vector<uint8_t> encoded;
     do {
         uint8_t encodedByte = length % 128;
@@ -1711,6 +1729,10 @@ std::vector<uint8_t> Frame::serializeProperties(const Properties &properties) {
                 buffer.push_back(arg & 0xFF);
             } else if constexpr (std::is_same_v<T, uint32_t>) {
                 if (id == PropertyID::SUBSCRIPTION_IDENTIFIER) {
+                    // MQTT-3.8.2-16: zero is not a Subscription Identifier.
+                    if (arg == 0) {
+                        throw ProtocolViolation("Subscription Identifier must not be 0");
+                    }
                     // A Variable Byte Integer: no length byte, least significant
                     // 7-bit group first with the continuation bit set (MQTT-1.5.5).
                     buffer.push_back(static_cast<uint8_t>(id));
@@ -1725,21 +1747,27 @@ std::vector<uint8_t> Frame::serializeProperties(const Properties &properties) {
                 buffer.push_back((arg >> 8) & 0xFF);
                 buffer.push_back(arg & 0xFF);
             } else if constexpr (std::is_same_v<T, std::string>) {
+                if (arg.size() > UINT16_MAX) {
+                    throw std::length_error("MQTT UTF-8 property exceeds 65535 bytes");
+                }
                 buffer.push_back(static_cast<uint8_t>(id));
-                uint16_t length = static_cast<uint16_t>(arg.length());
+                const auto length = static_cast<uint16_t>(arg.size());
                 buffer.push_back((length >> 8) & 0xFF);
                 buffer.push_back(length & 0xFF);
                 buffer.insert(buffer.end(), arg.begin(), arg.end());
             } else if constexpr (std::is_same_v<T, UserProperties>) {
                 // Each User Property pair carries its own property id byte.
                 for (const auto& [key, val] : arg) {
+                    if (key.size() > UINT16_MAX || val.size() > UINT16_MAX) {
+                        throw std::length_error("MQTT User Property exceeds 65535 bytes");
+                    }
                     buffer.push_back(static_cast<uint8_t>(id));
-                    uint16_t keyLength = static_cast<uint16_t>(key.length());
+                    const auto keyLength = static_cast<uint16_t>(key.size());
                     buffer.push_back((keyLength >> 8) & 0xFF);
                     buffer.push_back(keyLength & 0xFF);
                     buffer.insert(buffer.end(), key.begin(), key.end());
-                    
-                    uint16_t valLength = static_cast<uint16_t>(val.length());
+
+                    const auto valLength = static_cast<uint16_t>(val.size());
                     buffer.push_back((valLength >> 8) & 0xFF);
                     buffer.push_back(valLength & 0xFF);
                     buffer.insert(buffer.end(), val.begin(), val.end());

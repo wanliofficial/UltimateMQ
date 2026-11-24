@@ -21,6 +21,14 @@ Session::Session(Broker *broker, const std::string &clientId, bool cleanStart)
 Session::~Session() = default;
 
 void Session::connect(const std::shared_ptr<Session> &self, bool persistent) {
+    if (broker) {
+        broker->connectSession(self, nullptr, persistent);
+    } else {
+        connectLocked(self, persistent);
+    }
+}
+
+void Session::connectLocked(const std::shared_ptr<Session> &self, bool persistent) {
     this->persistent = persistent;
     connected = true;
     // A live session never expires: cancel any disconnect-time expiry
@@ -51,6 +59,7 @@ Session::Snapshot Session::snapshot() const {
             snapshot.inflight.emplace_back(entry.first, *entry.second);
         }
     }
+    snapshot.inflightIdentifiers = inflightIdentifiers;
     snapshot.awaitingPubrel = awaitingPubrel;
     snapshot.pendingPubrel = pendingPubrel;
     for (const auto &blocked : blockedDeliveries) {
@@ -73,10 +82,7 @@ void Session::restore(const Snapshot &snapshot) {
         packetId = snapshot.nextPacketId == 0 ? 1 : snapshot.nextPacketId;
         subscriptions = snapshot.subscriptions;
         inflightMessages.clear();
-        // The subscription identifier is not part of the durable snapshot, so a
-        // restored session starts with none recorded; a retransmission after the
-        // next resume simply omits it.
-        inflightIdentifiers.clear();
+        inflightIdentifiers = snapshot.inflightIdentifiers;
         for (const auto &entry : snapshot.inflight) {
             inflightMessages[entry.first] = std::make_shared<Message>(entry.second);
         }
@@ -117,53 +123,45 @@ void Session::notifyMutation() {
     }
 }
 
-void Session::close(const std::shared_ptr<Client> &client) {
-    bool wasBound;
+bool Session::close(const std::shared_ptr<Client> &client, bool endSession) {
+    return broker->closeSession(shared_from_this(), client, endSession);
+}
+
+bool Session::closeLocked(const std::shared_ptr<Client> &client, bool endSession) {
     std::function<void()> notify;
     std::map<std::string, SubscriptionOptions> filters;
+    const bool drop = !persistent || endSession;
     {
         std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
-        wasBound = (this->client == client);
-        if (!wasBound) {
-            // A newer connection has already taken this session over: nothing to do
-            return;
+        if (this->client != client) {
+            return false;
         }
         this->client.reset();
-        if (!persistent) {
-            // A non-persistent session holds nothing worth keeping. Count what is
-            // being thrown away (it is a genuine loss) and clear it, including
-            // any inflight QoS 1/2 -- the normal TCP teardown reaches discard()
-            // instead, but the MQTT-SN gateway closes a non-persistent session
-            // here, and those losses must be observable too.
+        connected = false;
+        if (drop) {
             countHeldDeliveriesLocked();
             pendingDeliveries.clear();
             blockedDeliveries.clear();
             inflightMessages.clear();
+            inflightIdentifiers.clear();
             awaitingPubrel.clear();
             pendingPubrel.clear();
-            // The queues are now empty; reconcile the gauge (the held bytes just
-            // left this session's contribution).
             syncQueuedBytesLocked();
             filters.swap(subscriptions);
         }
-        // A persistent session keeps its subscriptions, its offline message
-        // buffer (pendingDeliveries), its flow-control backlog
-        // (blockedDeliveries) and its unacknowledged inflight messages so that
-        // they can be retransmitted on the next connect
         notify = std::move(onDisconnect);
         onDisconnect = nullptr;
     }
-    connected = false;
-    if (!persistent) {
+    if (drop) {
         removeSubscriptions(filters);
         broker->forgetSession(this);
     }
-    // The durable state changed (session went offline, or was dropped entirely)
     broker->notifyStateChanged();
     logDebug("session closed: %s (persistent=%d)", clientId.c_str(), (int)persistent);
     if (notify) {
         notify();
     }
+    return true;
 }
 
 void Session::removeSubscriptions(const std::map<std::string, SubscriptionOptions> &filters) {
@@ -227,8 +225,14 @@ void Session::syncQueuedBytesLocked() {
     }
 }
 
-void Session::discard() {
+void Session::discard(bool publishWill) {
+    auto finish = broker->discardSession(shared_from_this(), publishWill);
+    finish();
+}
+
+std::function<void()> Session::discardLocked(bool publishWill) {
     logDebug("session discarded: %s", clientId.c_str());
+    std::shared_ptr<Client> previous;
     std::function<void()> notify;
     std::map<std::string, SubscriptionOptions> filters;
     {
@@ -246,12 +250,13 @@ void Session::discard() {
         pendingDeliveries.clear();
         blockedDeliveries.clear();
         inflightMessages.clear();
+        inflightIdentifiers.clear();
         awaitingPubrel.clear();
         pendingPubrel.clear();
         // Everything the session was holding is gone; reconcile the gauge down to
         // this session's (now zero) contribution.
         syncQueuedBytesLocked();
-        client.reset();
+        previous = std::move(client);
         notify = std::move(onDisconnect);
         onDisconnect = nullptr;
     }
@@ -260,9 +265,15 @@ void Session::discard() {
     broker->forgetSession(this);
     // The session is gone: drop it from the durable state as well
     broker->notifyStateChanged();
-    if (notify) {
-        notify();
-    }
+    return [previous = std::move(previous), notify = std::move(notify),
+            publishWill]() mutable {
+        if (previous) {
+            previous->onSuperseded(publishWill);
+        }
+        if (notify) {
+            notify();
+        }
+    };
 }
 
 void Session::armExpiry(std::chrono::seconds seconds) {
@@ -495,13 +506,29 @@ void Session::bindClient(const std::shared_ptr<Client>& client) {
     }
 }
 
-void Session::resume(const std::shared_ptr<Client>& client, Version protocolVersion) {
+bool Session::shouldPublishWillOnTakeover(bool newCleanStart) const {
+    std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
+    return newCleanStart || !persistent || !client || client->willDelayInterval() == 0;
+}
+
+void Session::resume(const std::shared_ptr<Client>& client, bool persistent) {
+    auto finish = broker->resumeSession(shared_from_this(), client, persistent);
+    finish();
+}
+
+std::function<void()> Session::resumeLocked(const std::shared_ptr<Client>& client,
+                                             bool persistent) {
     std::shared_ptr<Client> previous;
+    bool publishWill = false;
     std::vector<uint16_t> awaitingRel;
     std::vector<uint16_t> outgoingRel;
     {
         std::lock_guard<std::recursive_mutex> lock(deliveryMutex);
         previous = std::move(this->client);
+        publishWill = !this->persistent || !previous || previous->willDelayInterval() == 0;
+        // The Will decision belongs to the old connection's Session Expiry.
+        // Apply the new connection's value only after making that decision.
+        this->persistent = persistent;
         this->client = client;
         // The session is live again: it no longer has a pending expiry and it is
         // connected again (a resumed session must count as an active client).
@@ -539,28 +566,19 @@ void Session::resume(const std::shared_ptr<Client>& client, Version protocolVers
             if (idIt != inflightIdentifiers.end()) {
                 identifiers = idIt->second;
             }
-            Delivery retransmit(std::move(outgoing), id, stored->qos, identifiers);
-            // This PUBLISH was already on the wire before the disconnect; the
-            // reconnect re-flow-control must not demote it to the blocked queue.
-            retransmit.retransmit = true;
-            retransmissions.push_back(std::move(retransmit));
+            retransmissions.emplace_back(std::move(outgoing), id, stored->qos, identifiers);
         }
         pendingDeliveries.insert(pendingDeliveries.begin(),
                                  std::make_move_iterator(retransmissions.begin()),
                                  std::make_move_iterator(retransmissions.end()));
         // MQTT-4.9.0-2: now that the client's real Receive Maximum is known, trim
-        // the never-sent offline buffer back to the window before flushing, so a
-        // resumed session is not blasted with more unacknowledged QoS>0 PUBLISHes
-        // than it agreed to. Genuine retransmissions stay in front (§4.6).
+        // the queue back to the window before flushing. Retransmissions still
+        // occupy their original slots and stay ahead of the offline buffer (§4.6);
+        // any excess QoS>0 deliveries, including retransmissions, are demoted.
         reflowToReceiveMaximum();
-        // §4.6 requires the unacked retransmissions to go out before the offline
-        // buffer (their originals were sent first). The container therefore
-        // stays in send order, not sequence order: pendingDeliveries.front() is
-        // the next-to-send (and, for the offline-buffer part, the oldest) entry,
-        // which is exactly what dropOldestQueued() compares against
-        // blockedDeliveries.front() to find the globally oldest message.
-        // Now that the unacked inflight messages have been re-queued (still
-        // occupying their window slots), promote any blocked messages that fit.
+        // The container stays in send order: retransmissions precede the offline
+        // buffer because their originals were sent first. Promote blocked messages
+        // only after the outstanding window has been brought back within its cap.
         releaseBlocked();
         // Inbound QoS 2: the broker sent PUBREC but never got the matching PUBREL
         // before the connection dropped. Remembering only the packet id is
@@ -574,16 +592,19 @@ void Session::resume(const std::shared_ptr<Client>& client, Version protocolVers
         // delivered, so only the PUBREL/PUBCOMP leg is outstanding.
         outgoingRel.assign(pendingPubrel.begin(), pendingPubrel.end());
     }
-    if (previous) {
-        // Tell the connection that lost the session to release it
-        previous->onSuperseded(protocolVersion);
-    }
-    for (uint16_t id : awaitingRel) {
-        client->sendPubrec(id);
-    }
-    for (uint16_t id : outgoingRel) {
-        client->sendPubrel(id);
-    }
+    return [previous = std::move(previous), client, awaitingRel = std::move(awaitingRel),
+            outgoingRel = std::move(outgoingRel), publishWill]() mutable {
+        if (previous) {
+            // Tell the connection that lost the session to release it.
+            previous->onSuperseded(publishWill);
+        }
+        for (uint16_t id : awaitingRel) {
+            client->sendPubrec(id);
+        }
+        for (uint16_t id : outgoingRel) {
+            client->sendPubrel(id);
+        }
+    };
 }
 
 void Session::setDisconnectCallback(std::function<void()> callback) {
@@ -867,14 +888,11 @@ void Session::reflowToReceiveMaximum() {
     // more than Receive Maximum QoS 1 and QoS 2 PUBLISH packets for which it has
     // not received PUBACK/PUBCOMP >= 0x80").
     //
-    // Demote the excess never-sent, non-retransmit entries from pendingDeliveries
-    // back to blockedDeliveries (clearing their packet id so releaseBlocked()
-    // reassigns one when a slot frees). Retransmissions of messages that were
-    // already on the wire before the disconnect are never demoted -- they were
-    // outstanding before the window was renegotiated and must be resent (§4.4,
-    // §4.6). Walking pendingDeliveries from the back demotes the newest first, so
-    // the oldest entries are the ones kept and sent now, preserving global send
-    // order once the demoted ones are released as the client acknowledges.
+    // Demote excess QoS>0 entries from pendingDeliveries back to
+    // blockedDeliveries (clearing their packet id so releaseBlocked() reassigns
+    // one when a slot frees). MQTT-4.9.0-2 applies to retransmissions too. Walking
+    // from the back demotes the newest first, preserving send order once the
+    // demoted messages are released as the client acknowledges.
     if (receiveMaximum == 0) {
         return;
     }
@@ -887,10 +905,9 @@ void Session::reflowToReceiveMaximum() {
             break;
         }
         --it;
-        // Only never-sent, non-retransmit QoS>0 entries are subject to the
-        // window. QoS 0 is never flow-controlled; retransmissions were already
-        // outstanding before the renegotiated window and must go out (§4.4).
-        if (it->retransmit || it->qos == QoS::QOS_0) {
+        // MQTT-4.9.0-2 counts unacknowledged retransmissions too; QoS 0 is
+        // the only delivery class that is never flow-controlled.
+        if (it->qos == QoS::QOS_0) {
             continue;
         }
         // Free the inflight slot this entry held and re-queue it as blocked (no

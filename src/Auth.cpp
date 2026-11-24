@@ -202,7 +202,8 @@ bool Auth::loadUsers(const std::string& path, std::string* error) {
         if (error) *error = "cannot open password file: " + path;
         return false;
     }
-    users_.clear();
+    std::map<std::string, User> loadedUsers;
+    uint32_t dummyIterations = 100000;
     std::string line;
     int lineNo = 0;
     while (std::getline(in, line)) {
@@ -239,11 +240,16 @@ bool Auth::loadUsers(const std::string& path, std::string* error) {
             // Reject an unparseable or zero iteration count rather than falling
             // back to an un-stretched hash: the count is the whole point of using
             // this format.
+            if (iterationText.empty() ||
+                iterationText.find_first_not_of("0123456789") != std::string::npos) {
+                if (error) *error = "password file line " + std::to_string(lineNo) +
+                                    ": invalid PBKDF2 iteration count";
+                return false;
+            }
             char* end = nullptr;
             errno = 0;
             const unsigned long long iterations = std::strtoull(iterationText.c_str(), &end, 10);
-            if (iterationText.empty() || end == iterationText.c_str() || *end != '\0' ||
-                iterations == 0 || iterations > 100000000ull) {
+            if (*end != '\0' || iterations == 0 || iterations > 100000000ull || errno == ERANGE) {
                 if (error) *error = "password file line " + std::to_string(lineNo) +
                                     ": invalid PBKDF2 iteration count";
                 return false;
@@ -254,7 +260,7 @@ bool Auth::loadUsers(const std::string& path, std::string* error) {
             // Validate it is well-formed hex all the same, so a typo cannot turn
             // into a silently different salt.
             std::string ignoredSaltBytes;
-            if (!decodeHexStrict(saltHex, ignoredSaltBytes)) {
+            if (saltHex.empty() || !decodeHexStrict(saltHex, ignoredSaltBytes)) {
                 if (error) *error = "password file line " + std::to_string(lineNo) +
                                     ": malformed hex in $pbkdf2-sha256$ salt";
                 return false;
@@ -263,13 +269,14 @@ bool Auth::loadUsers(const std::string& path, std::string* error) {
             // Keep the digest as canonical lowercase hex so it compares directly
             // against the hex candidate that authenticate() derives.
             std::string rawHash;
-            if (!decodeHexStrict(hashHex, rawHash)) {
+            if (!decodeHexStrict(hashHex, rawHash) || rawHash.size() != 32) {
                 if (error) *error = "password file line " + std::to_string(lineNo) +
                                     ": malformed hex in $pbkdf2-sha256$ hash";
                 return false;
             }
             u.hash = toHex(reinterpret_cast<const uint8_t *>(rawHash.data()), rawHash.size());
             u.iterations = static_cast<uint32_t>(iterations);
+            dummyIterations = std::max(dummyIterations, u.iterations);
             u.kind = User::Kind::PBKDF2;
         } else if (rest.rfind("$sha256$", 0) == 0) {
             std::string body = rest.substr(std::string("$sha256$").size());
@@ -284,7 +291,7 @@ bool Auth::loadUsers(const std::string& path, std::string* error) {
             u.salt = body.substr(0, sep);
             const std::string hashHex = trim(body.substr(sep + 1));
             std::string rawHash;
-            if (!decodeHexStrict(hashHex, rawHash)) {
+            if (!decodeHexStrict(hashHex, rawHash) || rawHash.size() != 32) {
                 if (error) *error = "password file line " + std::to_string(lineNo) +
                                     ": malformed hex in $sha256$ entry";
                 return false;
@@ -298,9 +305,15 @@ bool Auth::loadUsers(const std::string& path, std::string* error) {
             u.hash = rest;
             u.kind = User::Kind::PLAINTEXT;
         }
-        users_[user] = std::move(u);
+        loadedUsers[user] = std::move(u);
     }
-    authRequired_ = !users_.empty();
+    if (in.bad()) {
+        if (error) *error = "cannot read password file: " + path;
+        return false;
+    }
+    users_ = std::move(loadedUsers);
+    dummyIterations_ = dummyIterations;
+    authRequired_ = true;
     return true;
 }
 
@@ -310,7 +323,7 @@ bool Auth::loadAcl(const std::string& path, std::string* error) {
         if (error) *error = "cannot open acl file: " + path;
         return false;
     }
-    acl_.clear();
+    std::map<std::string, std::vector<std::pair<std::string, bool>>> loadedAcl;
     std::string line;
     int lineNo = 0;
     while (std::getline(in, line)) {
@@ -337,9 +350,14 @@ bool Auth::loadAcl(const std::string& path, std::string* error) {
             if (error) *error = "acl file line " + std::to_string(lineNo) + ": empty user or topic";
             return false;
         }
-        acl_[user].emplace_back(topic, write);
+        loadedAcl[user].emplace_back(topic, write);
     }
-    aclEnabled_ = !acl_.empty();
+    if (in.bad()) {
+        if (error) *error = "cannot read acl file: " + path;
+        return false;
+    }
+    acl_ = std::move(loadedAcl);
+    aclEnabled_ = true;
     return true;
 }
 
@@ -350,6 +368,10 @@ bool Auth::authenticate(const std::string& username, const std::string& password
     }
     auto it = users_.find(username);
     if (it == users_.end()) {
+        // Match the cost of the strongest configured PBKDF2 account instead of
+        // returning immediately, so an unknown username is distinguishable by
+        // more than the absence of a map lookup (CWE-208).
+        pbkdf2Sha256(password, "flowmq-unknown-user", dummyIterations_);
         return false;
     }
     const User& u = it->second;

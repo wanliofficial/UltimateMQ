@@ -337,10 +337,10 @@ struct Gateway::Peer : public Client {
         gateway->sendTo(address, encode(MsgType::PUBREL, body));
     }
 
-    void onSuperseded(Version version) override {
+    void onSuperseded(bool publishWill) override {
         // MQTT-SN has no takeover notification: the old UDP endpoint simply
         // stops being served. The session itself is left for the new peer.
-        (void)version;
+        (void)publishWill;
         session.reset();
     }
 
@@ -775,9 +775,11 @@ void Gateway::finishConnect(const std::shared_ptr<Peer> &peer, bool clean) {
     // same UDP endpoint must not create a second binding for the session the
     // peer already holds - but it still has to receive the deliveries it may
     // have missed while away, so the outstanding messages are re-pushed.
-    if (existing && peer->session == existing) {
+    // MQTT-SN §5.3.1 still requires CleanSession=1 to discard the old Session,
+    // even when this is a retransmission from the endpoint that already holds it.
+    if (existing && peer->session == existing && !clean) {
         sendConnack(peer->address, ReturnCode::ACCEPTED);
-        existing->resume(peer, Version::MQTT311);
+        existing->resume(peer, existing->isPersistent());
         peer->session = existing;
         existing->flush();
         return;
@@ -793,7 +795,6 @@ void Gateway::finishConnect(const std::shared_ptr<Peer> &peer, bool clean) {
         resumed ? broker_->findSession(peer->clientId)
                 : std::make_shared<Session>(broker_, peer->clientId, clean);
     sessionToUse->setUsername(peer->username);
-    sessionToUse->setPersistent(!clean);
     peer->session = sessionToUse;
     sendConnack(peer->address, ReturnCode::ACCEPTED);
     if (resumed) {
@@ -801,12 +802,11 @@ void Gateway::finishConnect(const std::shared_ptr<Peer> &peer, bool clean) {
         // unacknowledged QoS>0 messages (asleep PINGREQ path included). The
         // resume first detaches the previous binding - which for a
         // re-PINGREQ awake call is this same peer - so restore it after.
-        sessionToUse->resume(peer, Version::MQTT311);
+        sessionToUse->resume(peer, !clean);
         peer->session = sessionToUse;
         sessionToUse->flush();
     } else {
-        sessionToUse->bindClient(peer);
-        sessionToUse->connect(sessionToUse, /*persistent=*/!clean);
+        broker_->connectSession(sessionToUse, peer, /*persistent=*/!clean);
     }
 }
 
@@ -1061,7 +1061,7 @@ void Gateway::handlePingreq(const sockaddr_in &addr, const Parsed &p) {
         // The re-PINGREQ awake path rebinds this same peer, so keep the
         // session reference restore.
         const auto session = peer->session;
-        session->resume(peer, Version::MQTT311);
+        session->resume(peer, session->isPersistent());
         peer->session = session;
         session->flush();
     }

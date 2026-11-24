@@ -203,7 +203,8 @@ void Connection::run() {
     state = State::DISCONNECTED;
 
     // An abnormal termination publishes the Will message.
-    if (willPending) {
+    const auto ownedSession = currentSession();
+    if (willPending.exchange(false)) {
         // MQTT-3.1.2-8 / §3.1.2.11.3: releasing a Will is triggered by the Will
         // Delay Interval elapsing *or* the Session ending, whichever comes
         // first. A Session ends here only when it is not carried past this
@@ -217,17 +218,14 @@ void Connection::run() {
         // for a Session that no longer exists. `session` is checked because a
         // CONNECT refused before the session is assigned must not turn this
         // teardown into a null dereference.
-        const bool delayWill = willDelay > 0 && session && !sessionEndsAtClose(*session);
-        if (delayWill) {
-            // MQTT-3.1.3.2: the Will Delay Interval is measured from the moment
-            // this Network Connection closes, so arm the Will on the broker now
-            // (at disconnect). The sweeper publishes it once the delay elapses,
-            // unless a reconnect with the same client id cancels it first.
-            broker->armWill(session->getClientId(), willMessage, willMessage.qos,
-                            willMessage.retain, willDelay, willHasExpiry,
-                            willExpiryInterval);
-        } else {
-            publishWill();
+        const bool sessionEnds = !ownedSession || sessionEndsAtClose(*ownedSession);
+        const auto dueWill = broker->settleConnectionWill(
+            ownedSession, shared_from_this(), sessionEnds, willMessage, willDelay,
+            willHasExpiry, willExpiryInterval, authenticatedUsername);
+        if (dueWill) {
+            // MQTT-3.3.2-9: the Will's Message Expiry starts at publication,
+            // after any Will Delay, not at CONNECT or Network Connection close.
+            publishWillMessage(*dueWill, authenticatedUsername);
         }
     }
 
@@ -259,33 +257,14 @@ bool Connection::sessionEndsAtClose(const Session &liveSession) const {
 }
 
 void Connection::releaseSession() {
-    // Connection and Session hold strong references to each other while the
-    // session is bound (Connection::session and Session::client), so somebody
-    // has to break the cycle explicitly. In normal operation this is the end of
-    // run(); detach() calls it too so a Connection driven directly by a test
-    // does not leak itself and its session.
-    if (session) {
-        std::shared_ptr<Session> owned;
-        {
-            std::lock_guard<std::recursive_mutex> lock(writeMutex);
-            owned = session;
-            session.reset();
-        }
-        if (sessionEndsAtClose(*owned)) {
-            // The client asked to end the session (MQTT 3.1.1 Clean Session 1, or
-            // an MQTT 5 Session Expiry Interval of 0): drop it rather than
-            // leaving it resumable.
-            owned->discard();
-        } else {
-            owned->close(shared_from_this());
-            // MQTT 5 only: a kept session must be dropped if it is not resumed
-            // before the Session Expiry Interval elapses (MQTT-3.14.4-2). A
-            // 3.1.x persistent session has no deadline; the sweeper only sees
-            // the ones that were given one.
-            if (frame.getVersion() == Version::MQTT5 && sessionExpirySeconds > 0) {
-                owned->armExpiry(std::chrono::seconds(sessionExpirySeconds));
-            }
-        }
+    auto owned = currentSession();
+    if (!owned) {
+        return;
+    }
+    const bool endSession = sessionEndsAtClose(*owned);
+    if (owned->close(shared_from_this(), endSession) && !endSession &&
+        frame.getVersion() == Version::MQTT5 && sessionExpirySeconds > 0) {
+        owned->armExpiry(std::chrono::seconds(sessionExpirySeconds));
     }
 }
 
@@ -317,10 +296,14 @@ void Connection::runReadLoop() {
         // but never reads: the write buffer would otherwise never be drained and
         // its stall check (in drainWriteBuffer) would never run. A peer that
         // sends keepalives but will not read is too slow, not alive.
-        if (writeBufferActive && !writeBuffer.empty()) {
-            const auto stalledFor = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                       std::chrono::steady_clock::now() - lastWriteProgress)
-                                       .count();
+        const bool writePending = writeBufferActive && writeBufferPending();
+        if (writePending) {
+            int64_t stalledFor;
+            {
+                std::lock_guard<std::recursive_mutex> lock(writeMutex);
+                stalledFor = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - lastWriteProgress).count();
+            }
             if (stalledFor > writeTimeoutMs) {
                 logInfo("connection closed: outbound write stalled %lld ms (slow or dead reader)",
                         (long long)stalledFor);
@@ -328,6 +311,7 @@ void Connection::runReadLoop() {
                 return;
             }
         }
+        int timeout = POLL_SLICE_MS;
         if (readTimeout.count() > 0) {
             auto deadline = lastActivity + readTimeout;
             auto now = std::chrono::steady_clock::now();
@@ -339,14 +323,17 @@ void Connection::runReadLoop() {
                 keepAliveExpired = state == State::CONNECTED;
                 break;
             }
-            int timeout = static_cast<int>(
+            timeout = static_cast<int>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
             timeout = std::min(timeout, POLL_SLICE_MS);
-            // With an active write buffer, poll both directions so a writable
-            // socket drains the buffer even when the peer sends nothing. Without
-            // it, fall back to the transport's own readable() (POLLIN only).
+        }
+        // Keep Alive 0 removes only the inbound deadline, not outbound progress:
+        // a buffered writer must still wake on POLLOUT and enforce its stall bound.
+        // Its socket is non-blocking even while idle, so EAGAIN must wait for
+        // POLLIN rather than being mistaken for a peer close.
+        if (readTimeout.count() > 0 || writeBufferActive) {
             int ready;
-            if (writeBufferActive && !writeBuffer.empty()) {
+            if (writePending && transport->fd() >= 0) {
                 struct pollfd pfd;
                 pfd.fd = transport->fd();
                 pfd.events = POLLIN | POLLOUT;
@@ -428,6 +415,7 @@ bool Connection::isConnected() const {
 }
 
 void Connection::closeSocket() {
+    std::lock_guard<std::recursive_mutex> lock(writeMutex);
     // A write-stall drop must reach the peer as a RST, not a graceful FIN. The
     // kernel send buffer is still full of data the peer refuses to read, so a
     // plain close() would leave that data queued behind the peer's closed
@@ -459,41 +447,50 @@ void Connection::setDisconnectCallback(std::function<void()> callback) {
     disconnectCallback = std::move(callback);
 }
 
-void Connection::onSuperseded(Version version) {
-    // Tell an MQTT 5 client why it is being disconnected (MQTT-3.1.4-3). A 3.1.1
-    // connection has no DISCONNECT reason, so it is simply closed.
-    if (version == Version::MQTT5 && state == State::CONNECTED) {
+void Connection::onSuperseded(bool publishOldWill) {
+    // MQTT-3.1.4-3 requires the old Network Connection to receive DISCONNECT
+    // 0x8E when it speaks MQTT 5, then to be closed. MQTT 3.1.1 has no server
+    // DISCONNECT packet, so that peer observes only the close.
+    disconnectReason = ReasonCode::SESSION_TAKEN_OVER;
+    if (frame.getVersion() == Version::MQTT5 && state == State::CONNECTED) {
         try {
             DisconnectPacket disconnect{ReasonCode::SESSION_TAKEN_OVER};
             sendPacket(disconnect);
         } catch (const std::exception &e) {
-            // The peer may already be gone; the takeover still proceeds.
             logDebug("superseded connection could not be notified: %s", e.what());
         }
     }
-    // Another connection now owns the session: stop touching it and shut down.
-    // The session itself is left intact so it can be resumed by the new client.
-    {
-        std::lock_guard<std::recursive_mutex> lock(writeMutex);
-        session.reset();
-        connected = false;
-    }
-    // The superseded connection must not publish its Will (MQTT-3.1.4-3): the
-    // client has not died, it has moved to a new connection, which carries its
-    // own Will. Publishing here would report a false disconnect to subscribers.
-    willPending = false;
+    storeSession(nullptr);
+    connected = false;
     state = State::DISCONNECTED;
+
+    // MQTT-3.1.4-3 publishes the old Will when the new connection has Clean Start
+    // set, the old Session is not continuing, or its Will Delay is zero. Otherwise
+    // the continuing Session cancels the delayed Will by reconnecting within the
+    // delay interval (MQTT-3.1.3-9 / §3.1.3.2.2); resumeSession() also clears any
+    // Will left pending by the old connection.
+    if (willPending.exchange(false) && publishOldWill) {
+        publishWill();
+    }
+    // The takeover thread never destroys a transport that its owning thread may
+    // still be reading. Wake that thread; run() performs teardown after readSome
+    // has returned (TLS and WebSocket state are not safe to free concurrently).
+    if (transport) {
+        transport->interrupt();
+    }
 }
 
 void Connection::publishWill() {
     willPending = false;
     Message will = willMessage;
-    will.qos = willMessage.qos;
-    will.retain = willMessage.retain;
     armWillExpiry(will);
+    publishWillMessage(will, authenticatedUsername);
+}
+
+void Connection::publishWillMessage(const Message &will,
+                                    const std::string &username) {
     // The Will is published as the client, so the same write ACL applies as
     // for a regular PUBLISH
-    const std::string username = session ? session->getUsername() : std::string();
     if (auth && auth->isForbidden(username, will.topic, /*write=*/true)) {
         logDebug("denied will on %s (acl)", will.topic.c_str());
         return;
@@ -521,7 +518,7 @@ void Connection::handleIncoming(std::shared_ptr<Packet> packet) {
     // sent before the CONNECT was answered with a PINGRESP, which amounts to
     // completing a protocol exchange none of the two packets is allowed to
     // take part in.
-    if (packet->type != PacketType::CONNECT && !session && state != State::CONNECTED) {
+    if (packet->type != PacketType::CONNECT && !currentSession() && state != State::CONNECTED) {
         logInfo("refusing packet type %d before CONNECT (MQTT-3.1.0-1)",
                 static_cast<int>(packet->type));
         // No CONNACK here: it is the answer to a CONNECT, and no CONNECT was
@@ -822,29 +819,6 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
         }
     }
 
-    // Resolve the session for this client id. A clean start discards any session
-    // left behind by an earlier connection; otherwise the existing session is
-    // reused so that its subscriptions and unacknowledged messages survive.
-    auto existing = broker->findSession(connect->clientId);
-    // A session belongs to the user that authenticated for it: never hand the
-    // subscriptions and buffered messages of one user to another, and never let
-    // a different user destroy them. Reject the CONNECT instead of discarding.
-    if (existing && existing->getUsername() != username) {
-        logInfo("rejecting client %s: session belongs to a different user (%s)",
-                connect->clientId.c_str(), existing->getUsername().c_str());
-        ConnackPacket connack{false, ReasonCode::NOT_AUTHORIZED};
-        disconnectReason = ReasonCode::NOT_AUTHORIZED;
-        connackSent = true;
-        sendPacket(connack);
-        state = State::DISCONNECTED;
-        return;
-    }
-    if (existing && connect->cleanStart) {
-        existing->discard();
-        existing.reset();
-    }
-    bool resumed = (existing != nullptr) && !connect->cleanStart;
-
     // Whether the session survives this connection is decided by the Session
     // Expiry Interval, not by Clean Start (MQTT-3.1.2-23): Clean Start only says
     // whether a *previous* session is discarded, while a non-zero Session Expiry
@@ -866,6 +840,8 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
     }
     sessionExpirySeconds = connectSessionExpiry;
     this->connectSessionExpiry = connectSessionExpiry;
+    sessionClientId = connect->clientId;
+    authenticatedUsername = username;
 
     // All validation has passed: now it is safe to arm the Will and cancel any
     // pending delayed Will for this client id. A rejected CONNECT never reaches
@@ -898,19 +874,26 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
             }
         }
     }
-    // MQTT-3.1.4-6: a reconnect within a pending Will's delay window cancels it.
-    broker->cancelWill(connect->clientId);
-
-    auto sessionToUse = resumed ? existing : std::make_shared<Session>(broker, connect->clientId,
-                                                                        connect->cleanStart);
-    sessionToUse->setUsername(username);
-    sessionToUse->setPersistent(persistentSession);
-    // Apply the validated Receive Maximum. When the property is absent the
-    // protocol default is 65535; a resumed session must not keep the previous
-    // connection's smaller window.
-    sessionToUse->setReceiveMaximum(validatedReceiveMaximum);
+    // Authorization, Clean Start replacement and registry installation are one
+    // atomic broker transition. Two simultaneous CONNECTs for one ClientID can
+    // therefore never install distinct live sessions.
+    auto activation = broker->prepareSession(connect->clientId, username,
+                                              connect->cleanStart, persistentSession,
+                                              shared_from_this(), validatedReceiveMaximum);
+    if (activation.rejection != ReasonCode::SUCCESS) {
+        logInfo("rejecting client %s: session belongs to a different user (%s)",
+                connect->clientId.c_str(), username.c_str());
+        ConnackPacket connack{false, activation.rejection};
+        disconnectReason = activation.rejection;
+        connackSent = true;
+        sendPacket(connack);
+        state = State::DISCONNECTED;
+        return;
+    }
+    auto sessionToUse = activation.session;
+    const bool resumed = activation.resumed;
     clientMaxPacketSize = validatedClientMaxPacket;
-    session = sessionToUse;
+    storeSession(sessionToUse);
 
     setDisconnectCallback([weak = weak_from_this()]() {
         if (auto connection = weak.lock()) {
@@ -945,19 +928,38 @@ void Connection::handleConnect(std::shared_ptr<ConnectPacket> connect) {
         }
     }
     connackSent = true;
-    sendPacket(connack);
-
+    bool connackWritten = false;
+    try {
+        connackWritten = sendPacket(connack);
+    } catch (...) {
+        if (activation.finish) {
+            activation.finish();
+        }
+        throw;
+    }
+    if (!connackWritten || state == State::DISCONNECTED) {
+        if (activation.finish) {
+            activation.finish();
+        }
+        state = State::DISCONNECTED;
+        if (transport) {
+            transport->interrupt();
+        }
+        return;
+    }
     {
         std::lock_guard<std::recursive_mutex> lock(writeMutex);
-        connected = true;
-        state = State::CONNECTED;
+        if (state != State::DISCONNECTED) {
+            connected = true;
+            state = State::CONNECTED;
+        }
     }
-    if (resumed) {
-        sessionToUse->resume(shared_from_this(), frame.getVersion());
+    if (activation.finish && currentSession() == sessionToUse &&
+        state == State::CONNECTED) {
+        activation.finish();
+    }
+    if (resumed && currentSession() == sessionToUse && state == State::CONNECTED) {
         sessionToUse->flush();
-    } else {
-        sessionToUse->bindClient(shared_from_this());
-        sessionToUse->connect(sessionToUse, /*persistent=*/persistentSession);
     }
     logInfo("client connected: %s (resumed=%d)", connect->clientId.c_str(), (int)resumed);
 }
@@ -1032,7 +1034,7 @@ bool Connection::resolveTopicAlias(const std::shared_ptr<PublishPacket> &publish
 }
 
 bool Connection::failTopicAlias(ReasonCode reason, const std::string &detail) {
-    logDebug("client %s: %s", session->getClientId().c_str(), detail.c_str());
+    logDebug("client %s: %s", sessionClientId.c_str(), detail.c_str());
     DisconnectPacket disconnect{reason};
     sendPacket(disconnect);
     state = State::DISCONNECTED;
@@ -1040,14 +1042,15 @@ bool Connection::failTopicAlias(ReasonCode reason, const std::string &detail) {
 }
 
 void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
-    if (!session) {
+    auto liveSession = currentSession();
+    if (!liveSession) {
         throw std::runtime_error("PUBLISH before CONNECT");
     }
     // Inbound rate limit: a publisher exceeding its allowance is disconnected
     // (MQTT 5 gets a DISCONNECT QUOTA_EXCEEDED; MQTT 3.1.1 is simply closed).
     if (!allowPublish()) {
         logDebug("client %s: publish rate limit (%zu/s) exceeded",
-                 session->getClientId().c_str(), publishRateLimit);
+                 liveSession->getClientId().c_str(), publishRateLimit);
         // Recorded for $SYS/broker/disconnect/quota: the client was refused for
         // exceeding its publish rate, not for a protocol violation.
         disconnectReason = ReasonCode::QUOTA_EXCEEDED;
@@ -1071,7 +1074,7 @@ void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
     if (frame.getVersion() == Version::MQTT5 &&
         !publish->subscriptionIdentifiers.empty()) {
         logDebug("client %s: inbound PUBLISH carries a Subscription Identifier",
-                 session->getClientId().c_str());
+                 liveSession->getClientId().c_str());
         DisconnectPacket disconnect{ReasonCode::PROTOCOL_ERROR};
         sendPacket(disconnect);
         state = State::DISCONNECTED;
@@ -1089,7 +1092,7 @@ void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
             std::holds_alternative<std::string>(responseTopic->second) &&
             !Topic::isValidTopicName(std::get<std::string>(responseTopic->second))) {
             logDebug("client %s: Response Topic %s is not a valid topic name",
-                     session->getClientId().c_str(),
+                     liveSession->getClientId().c_str(),
                      std::get<std::string>(responseTopic->second).c_str());
             DisconnectPacket disconnect{ReasonCode::PROTOCOL_ERROR};
             sendPacket(disconnect);
@@ -1101,7 +1104,7 @@ void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
     // (MQTT-3.3.2-1). QoS 1/2 get the reason code in the ack; MQTT 5 QoS 0 is
     // reported with a DISCONNECT (MQTT-5.4.1-1), 3.1.1 is simply dropped.
     if (!Topic::isValidTopicName(publish->topicName)) {
-        logDebug("client %s: invalid topic name %s", session->getClientId().c_str(),
+        logDebug("client %s: invalid topic name %s", liveSession->getClientId().c_str(),
                  publish->topicName.c_str());
         if (publish->qos == QoS::QOS_1) {
             PubackPacket puback{publish->packetId, ReasonCode::TOPIC_NAME_INVALID};
@@ -1117,8 +1120,8 @@ void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
         return;
     }
     // Access control: a client may only publish to topics it is allowed to write
-    if (auth && auth->isForbidden(session->getUsername(), publish->topicName, /*write=*/true)) {
-        logDebug("client %s: denied write on %s (acl)", session->getClientId().c_str(),
+    if (auth && auth->isForbidden(liveSession->getUsername(), publish->topicName, /*write=*/true)) {
+        logDebug("client %s: denied write on %s (acl)", liveSession->getClientId().c_str(),
                  publish->topicName.c_str());
         if (publish->qos == QoS::QOS_1) {
             PubackPacket puback{publish->packetId, ReasonCode::NOT_AUTHORIZED};
@@ -1146,7 +1149,7 @@ void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
             std::get<uint8_t>(pfi->second) == 1 &&
             !Utf8::isValid(publish->payload.data(), publish->payload.size())) {
             logDebug("client %s: PUBLISH claims UTF-8 payload but it is malformed",
-                     session->getClientId().c_str());
+                     liveSession->getClientId().c_str());
             if (publish->qos == QoS::QOS_1) {
                 PubackPacket puback{publish->packetId, ReasonCode::PAYLOAD_FORMAT_INVALID};
                 sendPacket(puback);
@@ -1193,7 +1196,7 @@ void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
     // it. With the feature off this is ordinary traffic and is stored/forwarded
     // as before.
     if (broker && broker->sysTopicsOn() && SysTopics::isSysTopic(publish->topicName)) {
-        logDebug("client %s: refused publish to $SYS topic %s", session->getClientId().c_str(),
+        logDebug("client %s: refused publish to $SYS topic %s", liveSession->getClientId().c_str(),
                  publish->topicName.c_str());
         if (publish->qos == QoS::QOS_1) {
             PubackPacket puback{publish->packetId, ReasonCode::NOT_AUTHORIZED};
@@ -1211,7 +1214,7 @@ void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
     if (broker) {
         broker->incrementMessagesReceived();
     }
-    ReasonCode reason = session->publish(publish->packetId, message, publish->dup);
+    ReasonCode reason = liveSession->publish(publish->packetId, message, publish->dup);
     if (publish->qos == QoS::QOS_1) {
         PubackPacket puback{publish->packetId, reason};
         sendPacket(puback);
@@ -1222,23 +1225,25 @@ void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
 }
 
 void Connection::handlePuback(std::shared_ptr<PubackPacket> puback) {
-    if (session) {
-        session->puback(puback->packetId);
+    auto liveSession = currentSession();
+    if (liveSession) {
+        liveSession->puback(puback->packetId);
         // A freed window slot may have released a flow-controlled message
-        session->flush();
+        liveSession->flush();
     }
 }
 
 void Connection::handlePubrec(std::shared_ptr<PubrecPacket> pubrec) {
-    if (!session) {
+    auto liveSession = currentSession();
+    if (!liveSession) {
         return;
     }
-    auto reason = session->pubrec(pubrec->packetId, pubrec->reasonCode);
+    auto reason = liveSession->pubrec(pubrec->packetId, pubrec->reasonCode);
     if (!reason) {
         // The client rejected the PUBLISH (Reason Code >= 0x80). No PUBREL may
         // follow (MQTT-4.3.3) and the message is not retransmitted (MQTT-4.4.0-2);
         // the freed window slot may release a flow-controlled message.
-        session->flush();
+        liveSession->flush();
         return;
     }
     PubrelPacket pubrel{pubrec->packetId, *reason};
@@ -1246,24 +1251,27 @@ void Connection::handlePubrec(std::shared_ptr<PubrecPacket> pubrec) {
 }
 
 void Connection::handlePubrel(std::shared_ptr<PubrelPacket> pubrel) {
-    if (!session) {
+    auto liveSession = currentSession();
+    if (!liveSession) {
         return;
     }
-    ReasonCode reason = session->pubrel(pubrel->packetId);
+    ReasonCode reason = liveSession->pubrel(pubrel->packetId);
     PubcompPacket pubcomp{pubrel->packetId, reason};
     sendPacket(pubcomp);
 }
 
 void Connection::handlePubcomp(std::shared_ptr<PubcompPacket> pubcomp) {
-    if (session) {
-        session->pubcomp(pubcomp->packetId);
+    auto liveSession = currentSession();
+    if (liveSession) {
+        liveSession->pubcomp(pubcomp->packetId);
         // A freed window slot may have released a flow-controlled message
-        session->flush();
+        liveSession->flush();
     }
 }
 
 void Connection::handleSubscribe(std::shared_ptr<SubscribePacket> subscribe) {
-    if (!session) {
+    auto liveSession = currentSession();
+    if (!liveSession) {
         throw std::runtime_error("SUBSCRIBE before CONNECT");
     }
     // Sentinel meaning "this filter was accepted" in the per-filter outcome list.
@@ -1271,7 +1279,7 @@ void Connection::handleSubscribe(std::shared_ptr<SubscribePacket> subscribe) {
     // MQTT-3.8.3-3: the payload must hold at least one filter/options pair. A
     // SUBSCRIBE with an empty payload is a protocol error, not a no-op.
     if (subscribe->subscriptions.empty()) {
-        logInfo("client %s: SUBSCRIBE with no topic filters", session->getClientId().c_str());
+        logInfo("client %s: SUBSCRIBE with no topic filters", liveSession->getClientId().c_str());
         closeWithReason(ReasonCode::PROTOCOL_ERROR);
         return;
     }
@@ -1286,7 +1294,7 @@ void Connection::handleSubscribe(std::shared_ptr<SubscribePacket> subscribe) {
         const bool noLocalOnShared = options.noLocal && Topic::isShared(filter);
         if (badQos || badRetainHandling || noLocalOnShared) {
             logInfo("client %s: invalid subscription options for %s (qos=%d, retainHandling=%d, noLocal=%d)",
-                    session->getClientId().c_str(), filter.c_str(),
+                    liveSession->getClientId().c_str(), filter.c_str(),
                     static_cast<int>(options.maximumQos),
                     static_cast<int>(options.retainHandling), (int)options.noLocal);
             closeWithReason(ReasonCode::PROTOCOL_ERROR);
@@ -1299,11 +1307,11 @@ void Connection::handleSubscribe(std::shared_ptr<SubscribePacket> subscribe) {
     // by subscribing to an unbounded set of filters; filters beyond the limit
     // are reported with QUOTA_EXCEEDED.
     const bool isV5 = frame.getVersion() == Version::MQTT5;
-    const size_t maxSubscriptions = session->getMaxSubscriptions();
-    const size_t maxSharedSubscriptions = session->getMaxSharedSubscriptions();
+    const size_t maxSubscriptions = liveSession->getMaxSubscriptions();
+    const size_t maxSharedSubscriptions = liveSession->getMaxSharedSubscriptions();
     // Shared subscriptions are counted separately: a single "$share/g/f" entry
     // also registers a group member in the broker, so they have their own quota.
-    size_t sharedCount = session->getSharedSubscriptionCount();
+    size_t sharedCount = liveSession->getSharedSubscriptionCount();
     // Per-filter outcome: <0 means accepted (the granted QoS is recorded later),
     // otherwise the reason code reported for a rejected filter.
     std::vector<int> rejected(subscribe->subscriptions.size(), acceptMarker);
@@ -1317,38 +1325,38 @@ void Connection::handleSubscribe(std::shared_ptr<SubscribePacket> subscribe) {
         // An empty filter is rejected before anything else (MQTT-3.8.3-1);
         // a filter that carries a misplaced wildcard is a protocol error.
         if (!Topic::isValid(subscription.first)) {
-            logDebug("client %s: invalid topic filter %s", session->getClientId().c_str(),
+            logDebug("client %s: invalid topic filter %s", liveSession->getClientId().c_str(),
                      subscription.first.c_str());
             rejected[i] = isV5 ? static_cast<int>(ReasonCode::TOPIC_FILTER_INVALID) : 0x80;
             continue;
         }
-        if (auth && auth->isForbiddenSubscribe(session->getUsername(), subscription.first)) {
-            logDebug("client %s: denied subscribe to %s (acl)", session->getClientId().c_str(),
+        if (auth && auth->isForbiddenSubscribe(liveSession->getUsername(), subscription.first)) {
+            logDebug("client %s: denied subscribe to %s (acl)", liveSession->getClientId().c_str(),
                      subscription.first.c_str());
             rejected[i] = isV5 ? static_cast<int>(ReasonCode::NOT_AUTHORIZED) : 0x80;
             continue;
         }
-        const bool isNew = !session->hasSubscription(subscription.first);
+        const bool isNew = !liveSession->hasSubscription(subscription.first);
         acceptedAsNew[i] = isNew;
         if (isNew && Topic::isShared(subscription.first)) {
             if (sharedCount >= maxSharedSubscriptions) {
                 logDebug("client %s: shared subscription quota (%zu) reached, rejecting %s",
-                         session->getClientId().c_str(), maxSharedSubscriptions,
+                         liveSession->getClientId().c_str(), maxSharedSubscriptions,
                          subscription.first.c_str());
                 rejected[i] = isV5 ? static_cast<int>(ReasonCode::QUOTA_EXCEEDED) : 0x80;
                 continue;
             }
             ++sharedCount;
-        } else if (isNew && session->getSubscriptionCount() >= maxSubscriptions) {
+        } else if (isNew && liveSession->getSubscriptionCount() >= maxSubscriptions) {
             // New filter would push the session past its quota; a re-subscribe
             // of an existing filter is still allowed (it only updates options).
             logDebug("client %s: subscription quota (%zu) reached, rejecting %s",
-                     session->getClientId().c_str(), maxSubscriptions,
+                     liveSession->getClientId().c_str(), maxSubscriptions,
                      subscription.first.c_str());
             rejected[i] = isV5 ? static_cast<int>(ReasonCode::QUOTA_EXCEEDED) : 0x80;
             continue;
         }
-        session->subscribe(subscription.first, subscription.second);
+        liveSession->subscribe(subscription.first, subscription.second);
     }
 
     SubackPacket suback{subscribe->packetId};
@@ -1370,21 +1378,22 @@ void Connection::handleSubscribe(std::shared_ptr<SubscribePacket> subscribe) {
         }
         const auto& subscription = subscribe->subscriptions[i];
         if (!Topic::isShared(subscription.first)) {
-            session->deliverRetained(subscription.first, subscription.second,
+            liveSession->deliverRetained(subscription.first, subscription.second,
                                      acceptedAsNew[i]);
         }
     }
     // The queued retained messages are written here, with no lock held
-    session->flush();
+    liveSession->flush();
 }
 
 void Connection::handleUnsubscribe(std::shared_ptr<UnsubscribePacket> unsubscribe) {
-    if (!session) {
+    auto liveSession = currentSession();
+    if (!liveSession) {
         throw std::runtime_error("UNSUBSCRIBE before CONNECT");
     }
     // MQTT-3.10.3-2: an UNSUBSCRIBE with no filters is a protocol error.
     if (unsubscribe->topicFilters.empty()) {
-        logInfo("client %s: UNSUBSCRIBE with no topic filters", session->getClientId().c_str());
+        logInfo("client %s: UNSUBSCRIBE with no topic filters", liveSession->getClientId().c_str());
         closeWithReason(ReasonCode::PROTOCOL_ERROR);
         return;
     }
@@ -1401,7 +1410,7 @@ void Connection::handleUnsubscribe(std::shared_ptr<UnsubscribePacket> unsubscrib
             }
             continue;
         }
-        const bool removed = session->unsubscribe(topic);
+        const bool removed = liveSession->unsubscribe(topic);
         if (frame.getVersion() == Version::MQTT5) {
             unsuback.reasonCodes.push_back(
                 removed ? ReasonCode::SUCCESS : ReasonCode::NO_SUBSCRIPTION_EXISTED);
@@ -1444,7 +1453,7 @@ void Connection::handleDisconnect(std::shared_ptr<DisconnectPacket> disconnect) 
             // DISCONNECT 0x82 (§4.13) instead.
             if (connectSessionExpiry == 0 && interval != 0) {
                 logInfo("client %s: DISCONNECT raised a zero Session Expiry Interval to %u",
-                        session ? session->getClientId().c_str() : "?", interval);
+                        sessionClientId.c_str(), interval);
                 closeWithReason(ReasonCode::PROTOCOL_ERROR);
                 return;
             }
@@ -1466,7 +1475,7 @@ void Connection::handleAuth(std::shared_ptr<AuthPacket> auth) {
     // 0x8C that used to be sent here was itself a protocol violation.
     (void)auth;
     logDebug("client %s: AUTH without an enhanced authentication method",
-             session ? session->getClientId().c_str() : "?");
+             sessionClientId.c_str());
     closeWithReason(ReasonCode::PROTOCOL_ERROR);
 }
 
@@ -1583,20 +1592,27 @@ bool Connection::sendPacket(Packet &packet) {
         return false;
     }
     if (writeBufferActive) {
-        // Buffered path: try to write the whole packet without blocking. If the
-        // socket takes it, done. Otherwise buffer the whole unit (never a partial
-        // TLS record / WebSocket frame) for the read loop to drain on POLLOUT.
-        const ssize_t n = transport->writeSome(data.data(), data.size());
-        if (n < 0) {
-            state = State::DISCONNECTED; // peer gone
-            return false;
+        syncTransportWriteBytesLocked();
+        // Once a unit is queued, every later unit must join the tail. Writing a
+        // new packet directly here would let it overtake the unsent prefix and
+        // corrupt the ordered MQTT byte stream.
+        ssize_t n = 0;
+        if (writeBuffer.empty()) {
+            n = transport->writeSome(data.data(), data.size());
+            syncTransportWriteBytesLocked();
+            if (n < 0) {
+                state = State::DISCONNECTED; // peer gone
+                return false;
+            }
+            if (static_cast<size_t>(n) == data.size()) {
+                return true;
+            }
         }
-        if (static_cast<size_t>(n) == data.size()) {
-            return true;
-        }
-        // Would-block: buffer the remainder. The whole unit is kept so the drain
-        // can re-send it from the front.
-        if (writeBufferBytes + (data.size() - static_cast<size_t>(n)) > writeBufferLimit) {
+        // Would-block, or an earlier unit is still queued: buffer this whole unit
+        // for the read loop to drain from the front on POLLOUT.
+        const size_t remaining = data.size() - static_cast<size_t>(n);
+        if (writeBufferBytes > writeBufferLimit ||
+            remaining > writeBufferLimit - writeBufferBytes) {
             // The buffer is full: this reader is genuinely too slow to ever catch
             // up, not just transiently behind. Drop the connection (the session
             // and its inflight state are torn down in run()).
@@ -1604,13 +1620,17 @@ bool Connection::sendPacket(Packet &packet) {
             state = State::DISCONNECTED;
             return false;
         }
+        const bool firstBuffered = writeBuffer.empty();
         writeBuffer.emplace_back(data.begin() + n, data.end());
+        writePending.store(true, std::memory_order_release);
         const size_t added = data.size() - static_cast<size_t>(n);
         writeBufferBytes += added;
         if (broker) {
             broker->adjustWriteBufferBytes(static_cast<int64_t>(added));
         }
-        lastWriteProgress = std::chrono::steady_clock::now();
+        if (firstBuffered || n > 0) {
+            lastWriteProgress = std::chrono::steady_clock::now();
+        }
         return true;
     }
     if (!transport->writeAll(data.data(), data.size())) {
@@ -1632,7 +1652,8 @@ bool Connection::sendPacket(Packet &packet) {
 }
 
 void Connection::drainWriteBuffer() {
-    std::lock_guard<std::recursive_mutex> lock(writeMutex);
+    std::unique_lock<std::recursive_mutex> lock(writeMutex);
+    syncTransportWriteBytesLocked();
     if (writeBuffer.empty()) {
         return;
     }
@@ -1650,6 +1671,7 @@ void Connection::drainWriteBuffer() {
     while (!writeBuffer.empty()) {
         auto &front = writeBuffer.front();
         const ssize_t n = transport->writeSome(front.data(), front.size());
+        syncTransportWriteBytesLocked();
         if (n < 0) {
             state = State::DISCONNECTED;
             return;
@@ -1660,9 +1682,6 @@ void Connection::drainWriteBuffer() {
             if (n > 0) {
                 front.erase(front.begin(), front.begin() + n);
                 writeBufferBytes -= static_cast<size_t>(n);
-                // Keep the live gauge in lock-step with the local count here, not
-                // in a batch after the loop: an early return on a write error must
-                // not leave bytes counted as buffered that were actually delivered.
                 if (broker) {
                     broker->adjustWriteBufferBytes(-static_cast<int64_t>(n));
                 }
@@ -1678,10 +1697,43 @@ void Connection::drainWriteBuffer() {
         writeBuffer.pop_front();
         lastWriteProgress = std::chrono::steady_clock::now();
     }
-    // Fully drained: let the session push anything it had to hold back.
-    if (writeBuffer.empty() && session) {
-        session->flush();
+    if (writeBuffer.empty()) {
+        writePending.store(false, std::memory_order_release);
     }
+    // Fully drained: let the session push anything it had to hold back. Session
+    // delivery can call back into sendPacket(), so never hold writeMutex across
+    // the Session -> Connection lock direction.
+    if (writeBuffer.empty() && transportWriteBytes == 0) {
+        auto liveSession = currentSession();
+        lock.unlock();
+        if (liveSession) {
+            liveSession->flush();
+        }
+    }
+}
+
+bool Connection::writeBufferPending() const {
+    return writePending.load(std::memory_order_acquire) ||
+           (transport && transport->pendingWriteBytes() > 0);
+}
+
+void Connection::syncTransportWriteBytesLocked() {
+    const size_t actual = transport ? transport->pendingWriteBytes() : 0;
+    if (actual > transportWriteBytes) {
+        const size_t added = actual - transportWriteBytes;
+        writeBufferBytes += added;
+        if (broker) {
+            broker->adjustWriteBufferBytes(static_cast<int64_t>(added));
+        }
+    } else if (actual < transportWriteBytes) {
+        const size_t removed = transportWriteBytes - actual;
+        writeBufferBytes -= removed;
+        if (broker) {
+            broker->adjustWriteBufferBytes(-static_cast<int64_t>(removed));
+        }
+        lastWriteProgress = std::chrono::steady_clock::now();
+    }
+    transportWriteBytes = actual;
 }
 
 } // namespace MQTT

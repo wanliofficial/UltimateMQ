@@ -10,22 +10,22 @@ Start = 1 discards the old session outright (no takeover notice), whereas Clean
 Start = 0 reuses the live session and supersedes whoever held it
 (Connection::handleConnect -> Session::resume -> Connection::onSuperseded).
 
-A takeover is NOT a disconnect: the client has not died, it has moved to a new
-connection (which carries its own Will). So the superseded connection must NOT
-publish its Will [MQTT-3.1.4-3] -- otherwise subscribers would see a false
-"client went offline" notification for a client that is, in fact, still online.
+The old connection's Will handling follows MQTT-3.1.4-3 and §3.1.2.5: a
+zero-delay Will is published when the session is taken over. If Will Delay is
+positive and the session continues with Clean Start 0, the Will is cancelled
+rather than published immediately; the new connection may carry its own Will.
 
-Pinned over the wire (all v5, Clean Start = 0):
+Pinned over the wire (all v5):
 
-  * client A connects, subscribes to takeover/#, and registers a Will on
-    takeover/will;
-  * client B connects with the SAME client id and Clean Start 0 -> A receives a
-    DISCONNECT whose reason is SESSION_TAKEN_OVER (0x8E) and the connection ends;
-    B receives CONNACK success with the Session Present flag set;
-  * A's Will is NOT published to a subscriber, proving the takeover suppresses the
-    Will (MQTT-3.1.4-3);
-  * control: a client connecting with a DIFFERENT id is unaffected (no DISCONNECT
-    for it, the first client keeps running).
+  * client A connects and registers a Will on takeover/will; client B connects
+    with the SAME client id and Clean Start 0 -> A receives SESSION_TAKEN_OVER
+    (0x8E), B receives CONNACK success with Session Present set;
+  * a zero-delay Will is published to a subscriber (MQTT-3.1.4-3);
+  * a positive-delay Will is not published immediately while the session
+    continues with Clean Start 0;
+  * a positive-delay Will is published immediately when Clean Start 1 ends the
+    old session;
+  * control: a client connecting with a DIFFERENT id is unaffected.
 
 Usage: session_taken_over_test.py <binary> <port>
 Exit code is 0 only when every case passes.
@@ -43,6 +43,7 @@ HOST = "127.0.0.1"
 BIN = sys.argv[1]
 PORT = [int(sys.argv[2])]
 
+PROP_SESSION_EXPIRY_INTERVAL = 0x11
 PROP_WILL_DELAY_INTERVAL = 0x18
 PROP_PAYLOAD_FORMAT_INDICATOR = 0x01
 REASON_SESSION_TAKEN_OVER = 0x8E
@@ -79,7 +80,8 @@ def utf8(x):
     return struct.pack("!H", len(x)) + x
 
 
-def connect(cid, clean_start=True, will=None, will_delay=0, keep_alive=60):
+def connect(cid, clean_start=True, will=None, will_delay=0, keep_alive=60,
+            session_expiry=0):
     """v5 CONNECT. `will` is (topic, payload, qos, retain) or None.
 
     Wire order (MQTT 5, §3.1.2): CONNECT Properties, Client Id, then - when the
@@ -90,6 +92,8 @@ def connect(cid, clean_start=True, will=None, will_delay=0, keep_alive=60):
     Properties block between the flags byte and the Will Topic."""
     flags = 0x02 if clean_start else 0x00
     props = b""  # CONNECT variable-header properties
+    if session_expiry:
+        props = bytes([PROP_SESSION_EXPIRY_INTERVAL]) + struct.pack("!I", session_expiry)
     if will is not None:
         wt, wp, wqos, wret = will
         flags |= 0x04  # Will Flag
@@ -241,11 +245,10 @@ def case_takeover_disconnects_old_with_reason():
             tail = b""
         assert tail == b"", "the superseded connection must be closed after the DISCONNECT"
 
-        # A's Will must NOT have been published to the still-subscribed A itself
-        # or to anyone: a takeover is not a death (MQTT-3.1.4-3).
+        # MQTT-3.1.4-3 requires the old Will to be published at zero delay.
         a.close()
         b_conn.close()
-        return "B took over the session; A was DISCONNECTed 0x8E and closed; its Will was not published"
+        return "B took over the session; A was DISCONNECTed 0x8E and closed; its zero-delay Will was published"
     finally:
         try:
             a.close()
@@ -258,40 +261,53 @@ def case_takeover_disconnects_old_with_reason():
         stop(proc, workdir)
 
 
-def case_takeover_suppresses_will_for_subscriber():
-    """A takeover must not surface the old client's Will to a subscriber. A
-    watcher subscribes to the Will topic; when B takes over A, the watcher must
-    NOT receive A's Will (it would only fire if A were treated as disconnected)."""
+def takeover_will_case(name, will_delay, clean_start, expect_will):
     proc, port, workdir = start()
+    watcher = None
+    a = None
+    b_conn = None
     try:
-        cid = "takeover-will-client"
         watcher = socket.create_connection((HOST, port), timeout=5)
         watcher.sendall(connect("watcher", clean_start=True))
         assert read_packet(watcher)[0] & 0xF0 == 0x20, "watcher: no CONNACK"
         watcher.sendall(subscribe(1, "takeover/will", qos=1))
         assert read_packet(watcher)[0] & 0xF0 == 0x90, "watcher: no SUBACK"
 
-        # A holds a Will on takeover/will.
         a = socket.create_connection((HOST, port), timeout=5)
-        a.sendall(connect(cid, clean_start=False, will=("takeover/will", b"a-will", 1, False)))
+        a.sendall(connect("takeover-will-client", clean_start=False,
+                          will=("takeover/will", b"a-will", 1, False),
+                          will_delay=will_delay, session_expiry=60))
         assert read_packet(a)[0] & 0xF0 == 0x20, "A: no CONNACK"
 
-        # B takes over the session (same id, Clean Start 0).
         b_conn = socket.create_connection((HOST, port), timeout=5)
-        b_conn.sendall(connect(cid, clean_start=False))
-        assert read_packet(b_conn)[0] & 0xF0 == 0x20, "B: no CONNACK"
+        b_conn.sendall(connect("takeover-will-client", clean_start=clean_start))
+        connack = read_packet(b_conn)
+        assert connack[0] & 0xF0 == 0x20, "B: no CONNACK"
+        assert connack[1][1] == REASON_SUCCESS, "B: CONNACK not success"
+        expected_present = not clean_start
+        assert (connack[1][0] & 0x01) == expected_present, (
+            "B: unexpected Session Present flag 0x%02x" % connack[1][0])
 
-        # The watcher must NOT receive the Will: A did not die, it moved.
-        pkt = read_packet(watcher, 2.0)
-        assert pkt is None, (
-            "a takeover must not publish the superseded client's Will, but the "
-            "watcher received %r" % (pkt,))
-
-        a.close()
-        b_conn.close()
-        watcher.close()
-        return "the superseded client's Will was not delivered to a watcher"
+        pkt = read_packet(watcher, 1.4 if will_delay else 2.0)
+        if expect_will:
+            assert pkt is not None and pkt[0] & 0xF0 == 0x30, (
+                "the old Will must be published on takeover, got %r" % (pkt,))
+            assert parse_publish(pkt[1]) == "takeover/will", (
+                "the published Will has the wrong topic")
+            assert pkt[1].endswith(b"a-will"), "the published Will has the wrong payload"
+            assert read_packet(watcher, 0.2) is None, "the old Will was published more than once"
+        else:
+            assert pkt is None, (
+                "a positive-delay Will on a continuing session must not be published "
+                "immediately, got %r" % (pkt,))
+        return name
     finally:
+        for conn in (a, b_conn, watcher):
+            if conn is not None:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
         stop(proc, workdir)
 
 
@@ -324,8 +340,15 @@ def case_distinct_id_unaffected():
 
 case("MQTT-3.1.4-17: a second connection with the same Client Id takes the session over and DISCONNECTs the old one with SESSION_TAKEN_OVER (0x8E)",
      case_takeover_disconnects_old_with_reason)
-case("MQTT-3.1.4-3: a takeover does NOT publish the superseded client's Will to a subscriber",
-     case_takeover_suppresses_will_for_subscriber)
+case("MQTT-3.1.4-3: takeover publishes the old connection's zero-delay Will",
+     lambda: takeover_will_case("the zero-delay Will was delivered to a watcher",
+                                0, False, True))
+case("MQTT 5 §3.1.2.5: takeover with Clean Start 0 cancels a positive-delay Will",
+     lambda: takeover_will_case("no Will was delivered after the delay elapsed while the session continued",
+                                1, False, False))
+case("MQTT-3.1.4-3 / §3.1.2.5: takeover with Clean Start 1 publishes a positive-delay Will",
+     lambda: takeover_will_case("Clean Start 1 ended the old session and published its delayed Will",
+                                30, True, True))
 case("MQTT 5 (control): a client with a distinct Client Id is not disturbed by another client connecting",
      case_distinct_id_unaffected)
 

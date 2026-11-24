@@ -37,7 +37,11 @@ public:
         resentPubrels.push_back(packetId);
     }
 
-    void onSuperseded(Version version) override { (void)version; superseded++; }
+    void onSuperseded(bool publishWill) override {
+        std::lock_guard<std::mutex> lock(mutex);
+        superseded++;
+        willPublishedOnSuperseded.push_back(publishWill);
+    }
 
     size_t size() {
         std::lock_guard<std::mutex> lock(mutex);
@@ -57,6 +61,7 @@ public:
     std::vector<SubscriptionIdentifiers> identifiersPerDelivery;
     std::vector<uint16_t> resentPubrecs;
     std::vector<uint16_t> resentPubrels;
+    std::vector<bool> willPublishedOnSuperseded;
     std::atomic<int> superseded{0};
 
 private:

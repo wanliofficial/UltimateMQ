@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "../src/Server.h"
+#include "../src/Env.h"
 
 namespace MQTT {
 
@@ -27,6 +28,27 @@ TEST(ServerTest, AcceptsBoundaryPorts) {
     EXPECT_NO_THROW(Server server(1));
     EXPECT_NO_THROW(Server server(1883));
     EXPECT_NO_THROW(Server server(65535));
+}
+
+TEST(EnvTest, ParseLimitRejectsWhitespaceSignsAndJunk)
+{
+    unsigned long long out = 0;
+    for (const char *value : {" 1", "\t1", "+1", "-1", "1 ", "1x", "", "0"}) {
+        EXPECT_FALSE(Env::parseLimit(value, 100, out)) << "value=[" << value << "]";
+    }
+    EXPECT_TRUE(Env::parseLimit("1", 100, out));
+    EXPECT_EQ(out, 1U);
+    EXPECT_TRUE(Env::parseLimit("100", 100, out));
+    EXPECT_EQ(out, 100U);
+    EXPECT_FALSE(Env::parseLimit("101", 100, out));
+}
+
+TEST(EnvTest, ZeroIsOnlyAcceptedWhenTheSettingAllowsIt)
+{
+    unsigned long long out = 1;
+    EXPECT_FALSE(Env::parseLimit("0", 100, out));
+    EXPECT_TRUE(Env::parseLimit("0", 100, out, true));
+    EXPECT_EQ(out, 0U);
 }
 
 } // namespace MQTT

@@ -90,7 +90,8 @@ public:
     //! Client interface: resend a PUBREL for an outgoing QoS 2 flow awaiting PUBCOMP
     void sendPubrel(uint16_t packetId) override;
     //! Client interface: a newer connection has taken over this session; stop using it
-    void onSuperseded(Version version) override;
+    uint32_t willDelayInterval() const override { return willDelay; }
+    void onSuperseded(bool publishWill) override;
     bool handleDeliver(const Message& message, uint16_t packetId, QoS qos,
                        const SubscriptionIdentifiers& subscriptionIdentifiers);
     //! Serialize and write a packet. Returns false when nothing was written
@@ -120,7 +121,10 @@ private:
     //! session survives this connection (MQTT-3.14.4-2 / 3.1.2-23). Called at
     //! the end of run() and from detach().
     void releaseSession();
+    std::shared_ptr<Session> currentSession() const { return std::atomic_load(&session); }
+    void storeSession(std::shared_ptr<Session> value) { std::atomic_store(&session, std::move(value)); }
     void publishWill();
+    void publishWillMessage(const Message &will, const std::string &username);
     //! Whether the Session ends when this Network Connection closes: always for
     //! a non-persistent session, and for a persistent one when the DISCONNECT
     //! lowered its Session Expiry Interval to 0 (MQTT-3.14.4-2). Single source
@@ -185,8 +189,10 @@ private:
     //! Tokens available to this connection's bucket, capped at one second's worth
     double publishTokens = 0;
     std::chrono::steady_clock::time_point publishBucketStamp;
-    bool willPending = false;
+    std::atomic<bool> willPending{false};
     Message willMessage;
+    std::string sessionClientId;
+    std::string authenticatedUsername;
     //! Parsed Will Delay Interval (seconds) for this connection's Will. 0 means
     //! publish immediately on abnormal disconnect; >0 arms the Will on the
     //! session when the connection closes (so the delay counts from the close,
@@ -233,6 +239,10 @@ private:
     std::deque<std::vector<uint8_t>> writeBuffer;
     size_t writeBufferBytes = 0;
     bool writeBufferActive = false;
+    std::atomic<bool> writePending{false};
+    //! Raw transport-owned bytes (WebSocket frame headers/tails) already included
+    //! in writeBufferBytes and the broker gauge.
+    size_t transportWriteBytes = 0;
     //! Steady-clock time of the last progress draining the write buffer; used to
     //! drop a peer whose buffer never drains (writeTimeoutMs with no progress).
     std::chrono::steady_clock::time_point lastWriteProgress;
@@ -241,6 +251,12 @@ private:
     //! loop on POLLOUT (and the loop also checks the stall deadline every
     //! iteration, so a peer that keeps sending but never reads is still dropped).
     void drainWriteBuffer();
+    //! Lock-free readiness check for the connection thread; writers publish the
+    //! transition through writePending instead of exposing the deque to a race.
+    bool writeBufferPending() const;
+    //! Reconcile transport-owned pending bytes into the bounded buffer accounting.
+    //! Caller holds writeMutex.
+    void syncTransportWriteBytesLocked();
 };
 
 } // namespace MQTT

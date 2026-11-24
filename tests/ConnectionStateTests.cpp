@@ -8,7 +8,10 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <cerrno>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace MQTT {
@@ -118,12 +121,290 @@ struct TCPLoopbackConnection {
     }
 };
 
+class BlockingTransport : public ClientTransport {
+public:
+    std::mutex mutex;
+    std::condition_variable enteredCondition;
+    std::condition_variable releaseCondition;
+    bool entered = false;
+    bool released = false;
+    std::atomic<bool> reading{false};
+    std::atomic<int> interrupts{0};
+    std::atomic<int> teardowns{0};
+
+    int fd() const override { return -1; }
+    bool TLSEnabled() const override { return false; }
+    bool handshake(std::string *) override { return true; }
+    std::string peerIdentity() const override { return {}; }
+    bool peerVerified() const override { return false; }
+    int readable(int) override { return 1; }
+    ssize_t readSome(uint8_t *, size_t) override {
+        std::unique_lock<std::mutex> lock(mutex);
+        reading = true;
+        entered = true;
+        enteredCondition.notify_all();
+        releaseCondition.wait(lock, [&] { return released; });
+        reading = false;
+        return 0;
+    }
+    bool writeAll(const uint8_t *, size_t) override { return true; }
+    void interrupt() override { ++interrupts; }
+    void teardown() override {
+        if (reading) {
+            teardownDuringRead = true;
+        }
+        ++teardowns;
+    }
+    std::atomic<bool> teardownDuringRead{false};
+};
+
+class BarrierTransport : public ClientTransport {
+public:
+    struct Barrier {
+        int writes = 0;
+        std::mutex mutex;
+        std::condition_variable writesReady;
+        std::condition_variable release;
+    };
+
+    explicit BarrierTransport(std::shared_ptr<Barrier> state) : state(std::move(state)) {}
+    std::atomic<bool> timedOut{false};
+
+    int fd() const override { return -1; }
+    bool TLSEnabled() const override { return false; }
+    bool handshake(std::string *) override { return true; }
+    std::string peerIdentity() const override { return {}; }
+    bool peerVerified() const override { return false; }
+    int readable(int) override { return 0; }
+    ssize_t readSome(uint8_t *, size_t) override { return 0; }
+    bool writeAll(const uint8_t *, size_t) override {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        ++state->writes;
+        state->writesReady.notify_all();
+        state->release.wait_for(lock, std::chrono::seconds(2),
+                                [&] { return state->writes >= 2; });
+        if (state->writes < 2) {
+            timedOut = true;
+        }
+        return true;
+    }
+    void teardown() override {}
+
+private:
+private:
+    std::shared_ptr<Barrier> state;
+};
+
 } // namespace
 
 class ConnectionStateTests : public ::testing::Test {
 protected:
     Broker broker;
 };
+
+namespace {
+
+std::shared_ptr<ConnectPacket> connectPacket(const std::string &clientId, Version version,
+                                              bool cleanStart, uint32_t willDelay = 0,
+                                              bool withWill = false) {
+    auto connect = std::make_shared<ConnectPacket>();
+    connect->protocolName = "MQTT";
+    connect->protocolVersion = version;
+    connect->clientId = clientId;
+    connect->cleanStart = cleanStart;
+    connect->keepAlive = 60;
+    connect->willFlag = withWill;
+    if (withWill) {
+        connect->willTopic = "takeover/will";
+        connect->willMsg = std::string("will");
+        connect->willQos = QoS::QOS_0;
+        connect->willRetain = true;
+        connect->willProperties = Properties{};
+        (*connect->willProperties)[PropertyID::WILL_DELAY_INTERVAL] = willDelay;
+    }
+    if (version == Version::MQTT5) {
+        connect->properties[PropertyID::SESSION_EXPIRY_INTERVAL] = uint32_t{60};
+    }
+    return connect;
+}
+
+} // namespace
+
+TEST_F(ConnectionStateTests, TakeoverInterruptsButDoesNotTeardownAReadingTransport)
+{
+    auto transport = std::make_unique<BlockingTransport>();
+    BlockingTransport *observer = transport.get();
+    auto connection = std::make_shared<Connection>(-1, &broker, std::move(transport));
+    std::thread reader([connection]() { connection->run(); });
+    {
+        std::unique_lock<std::mutex> lock(observer->mutex);
+        ASSERT_TRUE(observer->enteredCondition.wait_for(lock, std::chrono::seconds(2),
+                                                       [&] { return observer->entered; }));
+    }
+
+    connection->onSuperseded(false);
+    EXPECT_FALSE(connection->isConnected());
+    EXPECT_EQ(observer->interrupts, 1);
+    EXPECT_FALSE(observer->teardownDuringRead)
+        << "the takeover thread must not destroy transport state used by its reader";
+    EXPECT_EQ(observer->teardowns, 0);
+
+    {
+        std::lock_guard<std::mutex> lock(observer->mutex);
+        observer->released = true;
+    }
+    observer->releaseCondition.notify_all();
+    reader.join();
+    EXPECT_GE(observer->teardowns, 1);
+}
+
+TEST_F(ConnectionStateTests, ConcurrentCleanStartsLeaveExactlyOneLiveConnection)
+{
+    SocketPairConnection original(&broker);
+    original.connection->handleIncoming(connectPacket("concurrent-clean", Version::MQTT5,
+                                                       /*cleanStart=*/false));
+    ASSERT_TRUE(original.connection->isConnected());
+    auto barrier = std::make_shared<BarrierTransport::Barrier>();
+    auto firstTransport = std::make_unique<BarrierTransport>(barrier);
+    auto secondTransport = std::make_unique<BarrierTransport>(barrier);
+    BarrierTransport *firstObserver = firstTransport.get();
+    BarrierTransport *secondObserver = secondTransport.get();
+    auto first = std::make_shared<Connection>(-1, &broker, std::move(firstTransport));
+    auto second = std::make_shared<Connection>(-1, &broker, std::move(secondTransport));
+    auto packet = connectPacket("concurrent-clean", Version::MQTT5, /*cleanStart=*/true);
+
+    std::exception_ptr firstError;
+    std::exception_ptr secondError;
+    std::thread firstConnect([&]() {
+        try { first->handleIncoming(packet); } catch (...) { firstError = std::current_exception(); }
+    });
+    std::thread secondConnect([&]() {
+        try { second->handleIncoming(packet); } catch (...) { secondError = std::current_exception(); }
+    });
+    firstConnect.join();
+    secondConnect.join();
+    if (firstError) {
+        std::rethrow_exception(firstError);
+    }
+    if (secondError) {
+        std::rethrow_exception(secondError);
+    }
+
+    ASSERT_FALSE(firstObserver->timedOut);
+    ASSERT_FALSE(secondObserver->timedOut);
+    EXPECT_FALSE(original.connection->isConnected());
+    EXPECT_NE(first->isConnected(), second->isConnected())
+        << "both Clean Start connections registered distinct sessions for one ClientID";
+    ASSERT_TRUE(broker.findSession("concurrent-clean"));
+    EXPECT_TRUE(broker.findSession("concurrent-clean")->isConnected());
+    first->detach();
+    second->detach();
+}
+
+TEST_F(ConnectionStateTests, TakeoverPublishesWillWhenDelayIsZero)
+{
+    SocketPairConnection first(&broker);
+    first.connection->handleIncoming(connectPacket("takeover-zero", Version::MQTT5,
+                                                   /*cleanStart=*/false, 0, /*withWill=*/true));
+    ASSERT_TRUE(first.connection->isConnected());
+    char buffer[64];
+    ASSERT_GT(first.readPeer(buffer, sizeof(buffer)), 0u);
+
+    SocketPairConnection second(&broker);
+    second.connection->handleIncoming(connectPacket("takeover-zero", Version::MQTT5,
+                                                    /*cleanStart=*/false));
+    ASSERT_TRUE(second.connection->isConnected());
+    EXPECT_FALSE(first.connection->isConnected());
+    EXPECT_EQ(broker.snapshotRetained().count("takeover/will"), 1u);
+}
+
+TEST_F(ConnectionStateTests, CleanStartTakeoverPublishesDelayedWill)
+{
+    SocketPairConnection first(&broker);
+    first.connection->handleIncoming(connectPacket("takeover-clean", Version::MQTT5,
+                                                   /*cleanStart=*/false, 30, /*withWill=*/true));
+    ASSERT_TRUE(first.connection->isConnected());
+    char buffer[64];
+    ASSERT_GT(first.readPeer(buffer, sizeof(buffer)), 0u);
+
+    SocketPairConnection second(&broker);
+    second.connection->handleIncoming(connectPacket("takeover-clean", Version::MQTT5,
+                                                    /*cleanStart=*/true));
+    ASSERT_TRUE(second.connection->isConnected());
+    EXPECT_EQ(broker.snapshotRetained().count("takeover/will"), 1u);
+}
+
+TEST_F(ConnectionStateTests, SupersededSessionCannotSettleTheOldConnectionsWillAgain)
+{
+    SocketPairConnection first(&broker);
+    first.connection->handleIncoming(connectPacket("stale-will", Version::MQTT5,
+                                                   /*cleanStart=*/false, 0, /*withWill=*/true));
+    auto oldSession = broker.findSession("stale-will");
+    ASSERT_TRUE(oldSession);
+
+    SocketPairConnection second(&broker);
+    second.connection->handleIncoming(connectPacket("stale-will", Version::MQTT5,
+                                                    /*cleanStart=*/false));
+    ASSERT_EQ(broker.snapshotRetained().count("takeover/will"), 1u);
+
+    Message staleWill("takeover/will", "duplicate", QoS::QOS_0, true);
+    EXPECT_FALSE(broker.settleConnectionWill(oldSession, first.connection, true,
+                                              staleWill, 0, false, 0, std::nullopt));
+    EXPECT_EQ(broker.snapshotRetained().count("takeover/will"), 1u);
+}
+
+TEST_F(ConnectionStateTests, ResumeUsesOldSessionExpiryForTakeoverWill)
+{
+    SocketPairConnection first(&broker);
+    first.connection->handleIncoming(connectPacket("takeover-expiry", Version::MQTT5,
+                                                   /*cleanStart=*/false, 30, /*withWill=*/true));
+    ASSERT_TRUE(first.connection->isConnected());
+
+    auto secondConnect = connectPacket("takeover-expiry", Version::MQTT5,
+                                       /*cleanStart=*/false);
+    secondConnect->properties[PropertyID::SESSION_EXPIRY_INTERVAL] = uint32_t{0};
+    SocketPairConnection second(&broker);
+    second.connection->handleIncoming(secondConnect);
+
+    ASSERT_TRUE(second.connection->isConnected());
+    EXPECT_FALSE(first.connection->isConnected());
+    EXPECT_EQ(broker.snapshotRetained().count("takeover/will"), 0u);
+    ASSERT_TRUE(broker.findSession("takeover-expiry"));
+    EXPECT_FALSE(broker.findSession("takeover-expiry")->isPersistent());
+}
+
+TEST_F(ConnectionStateTests, ResumeCancelsDelayedTakeoverWill)
+{
+    SocketPairConnection first(&broker);
+    first.connection->handleIncoming(connectPacket("takeover-delay", Version::MQTT5,
+                                                   /*cleanStart=*/false, 30, /*withWill=*/true));
+    ASSERT_TRUE(first.connection->isConnected());
+    char buffer[64];
+    ASSERT_GT(first.readPeer(buffer, sizeof(buffer)), 0u);
+
+    SocketPairConnection second(&broker);
+    second.connection->handleIncoming(connectPacket("takeover-delay", Version::MQTT5,
+                                                    /*cleanStart=*/false));
+    ASSERT_TRUE(second.connection->isConnected());
+    EXPECT_EQ(broker.snapshotRetained().count("takeover/will"), 0u);
+}
+
+TEST_F(ConnectionStateTests, TakeoverUsesTheOldPeersProtocolVersion)
+{
+    SocketPairConnection first(&broker);
+    first.connection->handleIncoming(connectPacket("takeover-version", Version::MQTT311,
+                                                   /*cleanStart=*/false));
+    ASSERT_TRUE(first.connection->isConnected());
+    char buffer[64];
+    ASSERT_GT(first.readPeer(buffer, sizeof(buffer)), 0u);
+
+    SocketPairConnection second(&broker);
+    second.connection->handleIncoming(connectPacket("takeover-version", Version::MQTT5,
+                                                    /*cleanStart=*/false));
+    ASSERT_TRUE(second.connection->isConnected());
+    EXPECT_EQ(first.readPeer(buffer, sizeof(buffer)), 0u)
+        << "an MQTT 3.1.1 peer must be closed without an MQTT 5 DISCONNECT";
+}
 
 TEST_F(ConnectionStateTests, PingreqBeforeConnectIsRefused)
 {
@@ -336,6 +617,24 @@ TEST_F(ConnectionStateTests, BufferedWriteBuffersOverflowAndTracksTheGauge)
     pair.connection->drainWriteBufferForTest();
     EXPECT_LE(sysGetWriteBufferBytes(), buffered)
         << "a failed drain must never inflate the live gauge";
+}
+
+TEST_F(ConnectionStateTests, BufferedWritesCannotOvertakeEarlierPackets)
+{
+    broker.setWriteBufferBytes(256 * 1024);
+    SocketPairConnection pair(&broker);
+    std::vector<uint8_t> payload(128 * 1024, 'x');
+    auto first = std::make_shared<PublishPacket>("fifo/a", payload, QoS::QOS_0);
+    ASSERT_TRUE(pair.connection->sendPacketForTest(*first));
+    ASSERT_GT(pair.connection->writeBufferBytesForTest(), 0u);
+
+    PingreqPacket second;
+    ASSERT_TRUE(pair.connection->sendPacketForTest(second));
+
+    char bytes[16] = {};
+    ASSERT_GE(pair.readPeer(bytes, sizeof(bytes)), 9);
+    EXPECT_EQ(static_cast<uint8_t>(bytes[0]), 0x30)
+        << "a later packet bypassed the buffered earlier packet";
 }
 
 TEST_F(ConnectionStateTests, WriteBufferGaugeReturnsToZeroOnDestruction)

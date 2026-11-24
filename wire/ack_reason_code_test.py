@@ -43,6 +43,7 @@ BIN = sys.argv[1]
 PORT = [int(sys.argv[2])]
 
 REASON_MALFORMED_PACKET = 0x81
+REASON_PROTOCOL_ERROR = 0x82
 
 PUBACK = 0x40
 
@@ -188,6 +189,53 @@ def case_v5_illegal_reason_code():
         stop(proc, workdir)
 
 
+def case_v5_trailing_byte_after_properties():
+    """A zero-length property block must consume the complete PUBACK body."""
+    proc, port, workdir = start()
+    try:
+        c = socket.create_connection((HOST, port), timeout=5)
+        try:
+            c.sendall(connect("ackrc-trailing"))
+            assert read_packet(c)[0] & 0xF0 == 0x20, "no CONNACK"
+            body = struct.pack("!H", 0x1234) + bytes([0x00, 0x00, 0xFF])
+            c.sendall(bytes([PUBACK]) + enc_len(len(body)) + body)
+            pkt = read_packet(c, 2.0)
+            assert pkt is not None, "no DISCONNECT for trailing ACK bytes"
+            h, b = pkt
+            assert h & 0xF0 == 0xE0, "expected DISCONNECT, got 0x%02X" % h
+            assert b and b[0] == REASON_MALFORMED_PACKET, (
+                "trailing ACK bytes must be MALFORMED_PACKET (0x81), got %r" % b)
+            return "v5 PUBACK trailing byte -> DISCONNECT 0x81"
+        finally:
+            c.close()
+    finally:
+        stop(proc, workdir)
+
+
+def case_v5_duplicate_property_is_protocol_error():
+    proc, port, workdir = start()
+    try:
+        c = socket.create_connection((HOST, port), timeout=5)
+        try:
+            c.sendall(connect("ackrc-duplicate"))
+            assert read_packet(c)[0] & 0xF0 == 0x20, "no CONNACK"
+            reason_string = bytes([0x1F, 0x00, 0x01, ord('x')])
+            properties = reason_string + reason_string
+            body = struct.pack("!H", 0x1234) + bytes([0x00, len(properties)]) + properties
+            c.sendall(bytes([PUBACK]) + enc_len(len(body)) + body)
+            pkt = read_packet(c, 2.0)
+            assert pkt is not None, "no DISCONNECT for a duplicate property"
+            h, b = pkt
+            assert h & 0xF0 == 0xE0, "expected DISCONNECT, got 0x%02X" % h
+            assert b and b[0] == REASON_PROTOCOL_ERROR, (
+                "a duplicate property must be PROTOCOL_ERROR (0x82), got %r" % b)
+            return "duplicate Reason String -> DISCONNECT 0x82"
+        finally:
+            c.close()
+    finally:
+        stop(proc, workdir)
+
+
 def case_v311_trailing_byte():
     """A 3.1.1 PUBACK carrying any extra byte beyond the Packet Identifier is
     Malformed. 3.1.1 has no server DISCONNECT, so the connection simply ends."""
@@ -248,6 +296,10 @@ def case_v5_legal_reason_code():
 
 case("MQTT 3.4.2.1: a v5 PUBACK with an out-of-range Reason Code (0x01) is refused DISCONNECT 0x81 (MALFORMED_PACKET)",
      case_v5_illegal_reason_code)
+case("MQTT 5: a v5 PUBACK trailing byte after its properties is refused DISCONNECT 0x81 (MALFORMED_PACKET)",
+     case_v5_trailing_byte_after_properties)
+case("MQTT 5: a repeated non-repeatable property is a Protocol Error -> DISCONNECT 0x82",
+     case_v5_duplicate_property_is_protocol_error)
 case("MQTT-3.4.2-1: a 3.1.1 PUBACK carrying a trailing byte (a reason code) closes the connection (3.1.1 has no DISCONNECT)",
      case_v311_trailing_byte)
 case("MQTT 5 (control): a PUBACK with a legal Reason Code (0x00) is not treated as malformed",

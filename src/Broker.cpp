@@ -181,6 +181,77 @@ std::shared_ptr<Session> Broker::findSession(const std::string &clientId) const 
     return nullptr;
 }
 
+Broker::SessionActivation Broker::prepareSession(const std::string &clientId,
+                                                 const std::string &username,
+                                                 bool cleanStart, bool persistent,
+                                                 const std::shared_ptr<Client> &client,
+                                                 uint16_t receiveMaximum) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    SessionActivation activation;
+    auto existing = sessions.find(clientId);
+    if (existing != sessions.end()) {
+        if (existing->second->getUsername() != username) {
+            activation.rejection = ReasonCode::NOT_AUTHORIZED;
+            return activation;
+        }
+        if (cleanStart) {
+            activation.finish = existing->second->discardLocked(
+                existing->second->shouldPublishWillOnTakeover(true));
+        } else {
+            activation.session = existing->second;
+            activation.resumed = true;
+        }
+    }
+    if (!activation.session) {
+        activation.session = std::make_shared<Session>(this, clientId, cleanStart);
+    }
+    activation.session->setUsername(username);
+    activation.session->setReceiveMaximum(receiveMaximum);
+    if (activation.resumed) {
+        sessions[clientId] = activation.session;
+        cancelWill(clientId);
+        activation.finish = activation.session->resumeLocked(client, persistent);
+    } else {
+        cancelWill(clientId);
+        activation.session->bindClient(client);
+        activation.session->connectLocked(activation.session, persistent);
+    }
+    return activation;
+}
+
+void Broker::connectSession(const std::shared_ptr<Session>& session,
+                            const std::shared_ptr<Client>& client, bool persistent) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    if (client) {
+        session->bindClient(client);
+    }
+    // MQTT-3.1.3-9: a new Network Connection made within Will Delay cancels it.
+    cancelWill(session->getClientId());
+    session->connectLocked(session, persistent);
+}
+
+std::function<void()> Broker::resumeSession(const std::shared_ptr<Session>& session,
+                                            const std::shared_ptr<Client>& client,
+                                            bool persistent) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    sessions[session->getClientId()] = session;
+    // MQTT-3.1.3-9: a new Network Connection made within Will Delay cancels it.
+    cancelWill(session->getClientId());
+    return session->resumeLocked(client, persistent);
+}
+
+bool Broker::closeSession(const std::shared_ptr<Session>& session,
+                          const std::shared_ptr<Client>& client, bool endSession) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    return session->closeLocked(client, endSession);
+}
+
+std::function<void()> Broker::discardSession(const std::shared_ptr<Session>& session,
+                                             bool publishWill) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    return session->discardLocked(publishWill);
+}
+
 void Broker::forgetSession(Session* session) {
     if (session == nullptr) {
         return;
@@ -249,11 +320,20 @@ void Broker::sweepExpiredSessions() {
 
 void Broker::armWill(const std::string &clientId, const Message &will, QoS qos,
                      bool retain, uint32_t delaySeconds, bool hasExpiry,
-                     uint32_t expiryInterval) {
+                     uint32_t expiryInterval,
+                     const std::optional<std::string> &username) {
     if (delaySeconds == 0) {
         return;
     }
     std::lock_guard<std::recursive_mutex> lock(mutex);
+    armWillLocked(clientId, will, qos, retain, delaySeconds, hasExpiry,
+                  expiryInterval, username);
+}
+
+void Broker::armWillLocked(const std::string &clientId, const Message &will, QoS qos,
+                           bool retain, uint32_t delaySeconds, bool hasExpiry,
+                           uint32_t expiryInterval,
+                           const std::optional<std::string> &username) {
     PendingWill pending;
     pending.message = will;
     pending.qos = qos;
@@ -263,11 +343,42 @@ void Broker::armWill(const std::string &clientId, const Message &will, QoS qos,
     pending.expiryInterval = expiryInterval;
     // Capture the username so the write ACL still applies when the Will is
     // published, even if the session has since been torn down.
-    if (auto session = findSession(clientId)) {
+    if (username) {
+        pending.username = *username;
+    } else if (auto session = findSession(clientId)) {
         pending.username = session->getUsername();
     }
     pendingWills[clientId] = std::move(pending);
     notifyStateChanged();
+}
+
+std::optional<Message> Broker::settleConnectionWill(
+    const std::shared_ptr<Session> &session, const std::shared_ptr<Client> &client,
+    bool sessionEnds, const Message &will, uint32_t delaySeconds, bool hasExpiry,
+    uint32_t expiryInterval, const std::optional<std::string> &username) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    // resumeLocked()/discardLocked() install the replacement before notifying the
+    // old connection. Once that happens its read-loop teardown no longer owns the
+    // Will, even if it observed willPending just before the takeover.
+    if (!session) {
+        return std::nullopt;
+    }
+    std::lock_guard<std::recursive_mutex> deliveryLock(session->deliveryMutex);
+    if (session->client.get() != client.get()) {
+        return std::nullopt;
+    }
+    if (!sessionEnds && delaySeconds > 0) {
+        armWillLocked(session->getClientId(), will, will.qos, will.retain,
+                      delaySeconds, hasExpiry, expiryInterval, username);
+        return std::nullopt;
+    }
+    Message due = will;
+    if (hasExpiry) {
+        due.hasExpiry = true;
+        due.expiryDeadline = std::chrono::steady_clock::now() +
+                             std::chrono::seconds(expiryInterval);
+    }
+    return due;
 }
 
 void Broker::cancelWill(const std::string &clientId) {
@@ -657,6 +768,22 @@ void Broker::adjustQueuedBytes(int64_t delta) {
 
 void Broker::adjustConnectedClients(int64_t delta) {
     liveConnectedClients.fetch_add(delta, std::memory_order_relaxed);
+}
+
+bool Broker::tryReserveConnection(size_t maximum) {
+    size_t current = reservedConnections.load(std::memory_order_acquire);
+    while (current < maximum) {
+        if (reservedConnections.compare_exchange_weak(current, current + 1,
+                                                      std::memory_order_acq_rel,
+                                                      std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void Broker::releaseConnectionSlot() {
+    reservedConnections.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 void Broker::recordDisconnect(ReasonCode reason) {

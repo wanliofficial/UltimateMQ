@@ -39,12 +39,15 @@ namespace MQTT {
  *   ACL file (FLOWMQ_ACL_FILE):
  *       user,read,<topic-filter>                 -- may appear multiple times
  *       user,write,<topic-filter>
- *   An empty ACL file (or none at all) grants every authenticated user access
- *   to every topic. A rule with the special user "*" applies to everyone.
+ *   An explicitly configured empty ACL file enables enforcement and grants
+ *   nothing. With no ACL file configured, every authenticated user may access
+ *   every topic. A rule with the special user "*" applies to everyone.
  *
  * If no user file is configured, authentication is disabled and every client
  * is treated as an anonymous super-user (matches the historical open-broker
  * behaviour, so this stays backward compatible unless explicitly configured).
+ * An explicitly configured empty users file enables authentication and accepts
+ * no credentials.
  */
 class Auth {
 public:
@@ -54,9 +57,11 @@ public:
         NotAuthorized
     };
 
-    //! Parse the users file (may be empty/absent to disable authentication)
+    //! Parse the users file. A successfully loaded file enables authentication,
+    //! even when it contains no users (in which case every login is rejected).
     bool loadUsers(const std::string& path, std::string* error = nullptr);
-    //! Parse the ACL file (may be empty/absent to allow everything)
+    //! Parse the ACL file. A successfully loaded file enables enforcement, even
+    //! when it contains no rules (in which case every topic access is denied).
     bool loadAcl(const std::string& path, std::string* error = nullptr);
 
     bool authRequired() const { return authRequired_; }
@@ -107,6 +112,7 @@ private:
 
     bool authRequired_ = false;
     bool aclEnabled_ = false;
+    uint32_t dummyIterations_ = 100000;
     std::map<std::string, User> users_;
     // (user or "*") -> list of (topicFilter, write) grants
     std::map<std::string, std::vector<std::pair<std::string, bool>>> acl_;

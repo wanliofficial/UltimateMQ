@@ -1,7 +1,12 @@
 #include <gtest/gtest.h>
 #include "../src/WebSocket.h"
 #include "../src/TLS.h"
+#include "../src/Broker.h"
+#include "../src/Connection.h"
+#include "../src/SysTopics.h"
+#include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -30,6 +35,7 @@ public:
     std::vector<uint8_t> input;
     //! Everything the parser has written back (CLOSE/PONG frames).
     std::vector<uint8_t> output;
+    size_t writeBudget = std::numeric_limits<size_t>::max();
 
     int fd() const override { return -1; }
     bool handshake(std::string *) override { return true; }
@@ -52,8 +58,10 @@ public:
         return true;
     }
     ssize_t writeSome(const uint8_t *buf, size_t len) override {
-        output.insert(output.end(), buf, buf + len);
-        return static_cast<ssize_t>(len);
+        const size_t take = std::min(len, writeBudget);
+        output.insert(output.end(), buf, buf + take);
+        writeBudget -= take;
+        return static_cast<ssize_t>(take);
     }
     void teardown() override {}
 };
@@ -109,6 +117,61 @@ protected:
         return transport;
     }
 };
+
+TEST_F(WebSocketTest, WouldBlockFrameIsRetriedWithoutDuplicatingItsHeader) {
+    auto transport = makeTransport({});
+    ScriptedTransport *observer = transport.get();
+    observer->writeBudget = 5;
+    WebSocketTransport ws(std::move(transport));
+    std::vector<uint8_t> payload(1000, 0x5A);
+
+    EXPECT_EQ(ws.writeSome(payload.data(), payload.size()), 0);
+    ASSERT_EQ(observer->output.size(), 5u);
+    EXPECT_EQ(ws.pendingWriteBytes(), payload.size() + 4u - 5u);
+    EXPECT_EQ(ws.writeSome(payload.data(), payload.size()), 0);
+    EXPECT_EQ(observer->output.size(), 5u);
+
+    observer->writeBudget = 10000;
+    EXPECT_EQ(ws.writeSome(payload.data(), payload.size()),
+              static_cast<ssize_t>(payload.size()));
+    EXPECT_EQ(ws.pendingWriteBytes(), 0u);
+    ASSERT_EQ(observer->output.size(), payload.size() + 4u);
+    EXPECT_EQ(observer->output[0], 0x80 | OPCODE_BINARY);
+    EXPECT_EQ(observer->output[1], 126);
+    EXPECT_EQ(observer->output[2], 0x03);
+    EXPECT_EQ(observer->output[3], 0xE8);
+    EXPECT_TRUE(std::equal(payload.begin(), payload.end(), observer->output.begin() + 4));
+}
+
+TEST_F(WebSocketTest, ConnectionAccountsForPendingFrameBytesAndDrainsThem) {
+    Broker broker;
+    broker.setWriteBufferBytes(1024);
+    const size_t baseline = sysGetWriteBufferBytes();
+    {
+        auto inner = makeTransport({});
+        ScriptedTransport *observer = inner.get();
+        observer->writeBudget = 1;
+        auto websocket = std::make_unique<WebSocketTransport>(std::move(inner));
+        Connection connection(-1, &broker, std::move(websocket));
+        PingreqPacket packet;
+
+        ASSERT_TRUE(connection.sendPacketForTest(packet));
+        EXPECT_EQ(connection.writeBufferBytesForTest(), 5u)
+            << "both the retained MQTT unit and raw WebSocket tail must be counted";
+        EXPECT_EQ(sysGetWriteBufferBytes(), baseline + 5u);
+
+        observer->writeBudget = 0;
+        connection.drainWriteBufferForTest();
+        EXPECT_EQ(connection.writeBufferBytesForTest(), 5u);
+
+        observer->writeBudget = 100;
+        connection.drainWriteBufferForTest();
+        EXPECT_EQ(connection.writeBufferBytesForTest(), 0u);
+        EXPECT_EQ(sysGetWriteBufferBytes(), baseline);
+        EXPECT_EQ(observer->output.size(), 4u);
+    }
+    EXPECT_EQ(sysGetWriteBufferBytes(), baseline);
+}
 
 TEST_F(WebSocketTest, DeliversAMaskedBinaryFramePayload) {
     auto transport = makeTransport(clientFrame(0x80 | OPCODE_BINARY, {0x10, 0x20, 0x30}));

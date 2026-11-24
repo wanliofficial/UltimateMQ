@@ -8,9 +8,11 @@
 #include <map>
 #include <unordered_map>
 #include <memory>
+#include <optional>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include "Trie.h"
 #include "Message.h"
 #include "Subscription.h"
@@ -21,6 +23,7 @@
 
 namespace MQTT {
 class Session;
+class Client;
 
 //! Backpressure policy for a session's delivery queue
 //! (pendingDeliveries + blockedDeliveries) when it reaches MAX_QUEUED_MESSAGES.
@@ -83,6 +86,12 @@ class Broker {
     std::map<std::string, PendingWill> pendingWills;
     mutable std::recursive_mutex mutex;
 
+    //! Arm a delayed Will while the broker lock is already held.
+    void armWillLocked(const std::string &clientId, const Message &will, QoS qos,
+                       bool retain, uint32_t delaySeconds, bool hasExpiry,
+                       uint32_t expiryInterval,
+                       const std::optional<std::string> &username);
+
     //! Authentication / access control. The Broker does not own the Auth object:
     //! it is owned by the Server and outlives the broker. It is immutable after
     //! load, so queries need no locking here.
@@ -142,6 +151,9 @@ class Broker {
     //! write the socket cannot take immediately is buffered and drained on
     //! POLLOUT, so a transiently slow reader is neither stalled nor dropped.
     size_t writeBufferBytes = 0;
+    //! Admission slots shared by every Server listener. Separate from the
+    //! monitoring gauge because a slot is reserved before Connection exists.
+    std::atomic<size_t> reservedConnections{0};
 
     //! Resolve the target sessions; called with the broker lock held.
     //! Each entry pairs the session with the subscription the delivery comes
@@ -202,6 +214,9 @@ public:
     //! Adjust the live connected-clients gauge by \p delta (+1 on connect,
     //! -1 on disconnect). Backs the connection-count view of the monitoring tree.
     void adjustConnectedClients(int64_t delta);
+    //! Atomically reserve one admission slot across all network transports.
+    bool tryReserveConnection(size_t maximum);
+    void releaseConnectionSlot();
     //! Count one connection ending, classified by \p reason into the
     //! $SYS/broker/disconnect/* categories (keep-alive / protocol / quota /
     //! normal / other). Called once per connection at teardown. Purely
@@ -259,6 +274,32 @@ public:
 
     void insertSession(const std::string &clientId, const std::shared_ptr<Session>& session);
     std::shared_ptr<Session> findSession(const std::string &clientId) const;
+    struct SessionActivation {
+        std::shared_ptr<Session> session;
+        bool resumed = false;
+        ReasonCode rejection = ReasonCode::SUCCESS;
+        //! Superseded-client notification and retransmission work; run only after
+        //! the broker lock has been released.
+        std::function<void()> finish;
+    };
+    //! Resolve, authorize and install a session as one registry transition.
+    //! CONNACK is sent afterwards; finish() must run outside the broker lock.
+    SessionActivation prepareSession(const std::string &clientId,
+                                     const std::string &username,
+                                     bool cleanStart, bool persistent,
+                                     const std::shared_ptr<Client> &client,
+                                     uint16_t receiveMaximum);
+    //! Serialize connection/session ownership transitions with registry updates.
+    //! The returned callbacks must run after the broker lock is released.
+    void connectSession(const std::shared_ptr<Session>& session,
+                        const std::shared_ptr<Client>& client, bool persistent);
+    std::function<void()> resumeSession(const std::shared_ptr<Session>& session,
+                                        const std::shared_ptr<Client>& client,
+                                        bool persistent);
+    bool closeSession(const std::shared_ptr<Session>& session,
+                      const std::shared_ptr<Client>& client, bool endSession);
+    std::function<void()> discardSession(const std::shared_ptr<Session>& session,
+                                         bool publishWill);
     //! Remove and drop every disconnected session whose disconnect-time expiry
     //! deadline has passed. Called periodically by the server's event loop.
     void sweepExpiredSessions();
@@ -267,10 +308,20 @@ public:
     //! cancelWill to drop it before it fires.
     void armWill(const std::string &clientId, const Message &will, QoS qos,
                  bool retain, uint32_t delaySeconds, bool hasExpiry = false,
-                 uint32_t expiryInterval = 0);
+                 uint32_t expiryInterval = 0,
+                 const std::optional<std::string> &username = std::nullopt);
     //! Cancel a pending delayed Will for this client id (a reconnect within the
     //! window cancels it). No-op if none is pending.
     void cancelWill(const std::string &clientId);
+    //! Settle an abnormal-close Will only while \p session is still owned by
+    //! \p client. Delayed Wills are armed under the registry lock; an immediate
+    //! Will is returned for publication after unlock.
+    std::optional<Message> settleConnectionWill(const std::shared_ptr<Session> &session,
+                                                const std::shared_ptr<Client> &client,
+                                                bool sessionEnds, const Message &will,
+                                                uint32_t delaySeconds, bool hasExpiry,
+                                                uint32_t expiryInterval,
+                                                const std::optional<std::string> &username);
     //! Publish every pending delayed Will whose deadline has passed. Called by
     //! the sweeper alongside the session-expiry sweep.
     void publishDueWills();

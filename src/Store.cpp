@@ -1,4 +1,5 @@
 #include "Store.h"
+#include <algorithm>
 #include <type_traits>
 #include "Log.h"
 #include <cerrno>
@@ -14,7 +15,8 @@ namespace MQTT {
 
 namespace {
 
-const char *STATE_HEADER = "FLOWMQ-STATE-1";
+const char *STATE_HEADER = "FLOWMQ-STATE-2";
+const char *LEGACY_STATE_HEADER = "FLOWMQ-STATE-1";
 
 std::string toHex(const std::string &in) {
     static const char *digits = "0123456789abcdef";
@@ -236,6 +238,7 @@ bool propKindFor(PropertyID id, PropKind &kind) {
     case PropertyID::CORRELATION_DATA:
     case PropertyID::REASON_STRING:
     case PropertyID::SERVER_REFERENCE:
+    case PropertyID::RESPONSE_INFORMATION:
     case PropertyID::ASSIGNED_CLIENT_IDENTIFIER:
     case PropertyID::AUTHENTICATION_METHOD:
     case PropertyID::AUTHENTICATION_DATA:
@@ -271,26 +274,42 @@ bool propertyTypeMatches(PropertyID id, const PropertyValue &value) {
     return false;
 }
 
-bool decodeMessageProperties(const std::string &encoded, Properties &out) {
-    if (encoded == "-" || encoded.empty()) {
+bool decodeMessageProperties(const std::string &encoded, Properties &properties) {
+    properties.clear();
+    if (encoded.empty() || encoded == "-") {
         return true;
     }
-    std::stringstream entries(encoded);
-    std::string entry;
-    while (std::getline(entries, entry, ',')) {
-        const auto colon = entry.find(':');
-        if (colon == std::string::npos || colon + 1 >= entry.size()) {
+
+    size_t begin = 0;
+    while (true) {
+        const size_t comma = encoded.find(',', begin);
+        const std::string entry = encoded.substr(begin, comma == std::string::npos
+                                                            ? std::string::npos
+                                                            : comma - begin);
+        const size_t colon = entry.find(':');
+        if (entry.empty() || colon == std::string::npos || colon == 0 ||
+            colon + 1 >= entry.size() || entry.find(':', colon + 1) != std::string::npos) {
             return false;
         }
-        unsigned long long id = 0;
-        if (!parseUnsigned(entry.substr(0, colon), id)) {
+
+        unsigned long long idValue = 0;
+        if (!parseUnsigned(entry.substr(0, colon), idValue) || idValue > 255) {
             return false;
         }
+        const PropertyID id = static_cast<PropertyID>(idValue);
+        if (properties.find(id) != properties.end()) {
+            return false;
+        }
+
         const char kind = entry[colon + 1];
         const std::string body = entry.substr(colon + 2);
+        PropertyValue decoded;
         switch (kind) {
         case 'B':
-            out[static_cast<PropertyID>(id)] = (body == "1");
+            if (body.size() != 1 || (body[0] != '0' && body[0] != '1')) {
+                return false;
+            }
+            decoded = body[0] == '1';
             break;
         case 'b':
         case 'w':
@@ -299,12 +318,18 @@ bool decodeMessageProperties(const std::string &encoded, Properties &out) {
             if (!parseUnsigned(body, value)) {
                 return false;
             }
+            const unsigned long long limit = kind == 'b' ? 255ULL
+                                                : kind == 'w' ? 65535ULL
+                                                              : 4294967295ULL;
+            if (value > limit) {
+                return false;
+            }
             if (kind == 'b') {
-                out[static_cast<PropertyID>(id)] = static_cast<uint8_t>(value);
+                decoded = static_cast<uint8_t>(value);
             } else if (kind == 'w') {
-                out[static_cast<PropertyID>(id)] = static_cast<uint16_t>(value);
+                decoded = static_cast<uint16_t>(value);
             } else {
-                out[static_cast<PropertyID>(id)] = static_cast<uint32_t>(value);
+                decoded = static_cast<uint32_t>(value);
             }
             break;
         }
@@ -313,34 +338,67 @@ bool decodeMessageProperties(const std::string &encoded, Properties &out) {
             if (!fromHex(body, text)) {
                 return false;
             }
-            out[static_cast<PropertyID>(id)] = text;
+            decoded = std::move(text);
             break;
         }
         case 'p': {
+            if (body.empty()) {
+                return false;
+            }
             UserProperties pairs;
-            std::stringstream list(body);
-            std::string pair;
-            while (std::getline(list, pair, '.')) {
-                const auto equals = pair.find('=');
-                if (equals == std::string::npos) {
+            size_t pairBegin = 0;
+            while (true) {
+                const size_t dot = body.find('.', pairBegin);
+                const std::string pair = body.substr(pairBegin, dot == std::string::npos
+                                                                 ? std::string::npos
+                                                                 : dot - pairBegin);
+                const size_t equals = pair.find('=');
+                if (pair.empty() || equals == std::string::npos ||
+                    pair.find('=', equals + 1) != std::string::npos) {
                     return false;
                 }
-                std::string key, value;
-                if (!fromHex(pair.substr(0, equals), key)) return false;
-                if (!fromHex(pair.substr(equals + 1), value)) return false;
-                pairs.emplace_back(key, value);
+                std::string key;
+                std::string item;
+                if (!fromHex(pair.substr(0, equals), key) ||
+                    !fromHex(pair.substr(equals + 1), item)) {
+                    return false;
+                }
+                pairs.emplace_back(key, item);
+                if (dot == std::string::npos) {
+                    break;
+                }
+                pairBegin = dot + 1;
+                if (pairBegin == body.size()) {
+                    return false;
+                }
             }
-            out[static_cast<PropertyID>(id)] = pairs;
+            decoded = std::move(pairs);
             break;
         }
         default:
             return false;
         }
+
         // The tag must agree with the property id's canonical type; a mismatch
         // (e.g. MESSAGE_EXPIRY_INTERVAL stored as a bool) would serialise into a
         // malformed PUBLISH on restore, so reject the corrupt record.
-        auto stored = out.find(static_cast<PropertyID>(id));
-        if (stored == out.end() || !propertyTypeMatches(stored->first, stored->second)) {
+        if (!propertyTypeMatches(id, decoded)) {
+            return false;
+        }
+        if (id == PropertyID::PAYLOAD_FORMAT_INDICATOR && std::get<uint8_t>(decoded) > 1) {
+            return false;
+        }
+        if (id == PropertyID::SUBSCRIPTION_IDENTIFIER &&
+            (std::get<uint32_t>(decoded) == 0 || std::get<uint32_t>(decoded) > 0x0FFFFFFF)) {
+            return false;
+        }
+        properties.emplace(id, std::move(decoded));
+
+        if (comma == std::string::npos) {
+            break;
+        }
+        begin = comma + 1;
+        if (begin == encoded.size()) {
             return false;
         }
     }
@@ -357,6 +415,11 @@ std::string encodeMessageExpiry(const Message &m) {
     const auto left = std::chrono::duration_cast<std::chrono::seconds>(
                           m.expiryDeadline - std::chrono::steady_clock::now()).count();
     return std::to_string(left < 0 ? 0 : left);
+}
+
+bool decodeOptionalMessageOrigin(std::istringstream &in, Message &m) {
+    std::string token;
+    return !(in >> token) || fromHexField(token, m.originClientId);
 }
 
 bool decodeMessageExpiry(const std::string &token, Message &m) {
@@ -444,7 +507,8 @@ bool Store::write(const PersistedState &state) {
         const Message &m = entry.second;
         out += "retained " + toHexField(m.topic) + " " + std::to_string(static_cast<int>(m.qos)) + " " +
                (m.retain ? "1" : "0") + " " + toHexField(m.payload) + " " +
-               encodeMessageProperties(m.properties) + " " + encodeMessageExpiry(m) + "\n";
+               encodeMessageProperties(m.properties) + " " + encodeMessageExpiry(m) + " " +
+               toHexField(m.originClientId) + "\n";
     }
     for (const auto &session : state.sessions) {
         // An empty username must still occupy its column, otherwise the fixed
@@ -468,14 +532,21 @@ bool Store::write(const PersistedState &state) {
             out += "inflight " + std::to_string(inflight.first) + " " + toHexField(m.topic) + " " +
                    std::to_string(static_cast<int>(m.qos)) + " " + (m.retain ? "1" : "0") + " " +
                    toHexField(m.payload) + " " + encodeMessageProperties(m.properties) + " " +
-                   encodeMessageExpiry(m) + "\n";
+                   encodeMessageExpiry(m) + " " + toHexField(m.originClientId) + "\n";
+        }
+        for (const auto &[id, identifiers] : session.inflightIdentifiers) {
+            out += "subid " + std::to_string(id);
+            for (uint32_t identifier : identifiers) {
+                out += "," + std::to_string(identifier);
+            }
+            out += "\n";
         }
         for (const auto &blocked : session.blocked) {
             const Message &m = blocked;
             out += "blocked 0 " + toHexField(m.topic) + " " +
                    std::to_string(static_cast<int>(m.qos)) + " " + (m.retain ? "1" : "0") + " " +
                    toHexField(m.payload) + " " + encodeMessageProperties(m.properties) + " " +
-                   encodeMessageExpiry(m) + "\n";
+                   encodeMessageExpiry(m) + " " + toHexField(m.originClientId) + "\n";
         }
         for (uint16_t id : session.awaitingPubrel) {
             out += "pubrel " + std::to_string(id) + "\n";
@@ -561,30 +632,53 @@ bool Store::write(const PersistedState &state) {
 
 bool Store::load(PersistedState &out, std::string *error) const {
     out = PersistedState{};
+    if (error) {
+        error->clear();
+    }
     if (!enabled()) {
         return true;
     }
+
+    errno = 0;
     std::ifstream in(path);
     if (!in) {
-        // No state yet (first start): not an error
-        return true;
+        if (errno == ENOENT) {
+            return true;
+        }
+        if (error) {
+            *error = "cannot open state file: " + std::string(std::strerror(errno));
+        }
+        return false;
     }
 
     std::string line;
     if (!std::getline(in, line)) {
-        // Empty file: nothing was ever written
-        return true;
+        if (error) {
+            *error = in.bad() ? "failed while reading state file header"
+                              : "empty state file";
+        }
+        return false;
     }
-    if (line != STATE_HEADER) {
+    if (line != STATE_HEADER && line != LEGACY_STATE_HEADER) {
         if (error) *error = "unrecognised state file header";
         return false;
     }
 
+    PersistedState loaded;
     PersistedSession *current = nullptr;
+    bool ended = false;
     int lineNo = 1;
     while (std::getline(in, line)) {
         ++lineNo;
-        if (line.empty() || line == "end") {
+        if (ended) {
+            if (error) *error = "records after final end marker at line " + std::to_string(lineNo);
+            return false;
+        }
+        if (line == "end") {
+            ended = true;
+            continue;
+        }
+        if (line.empty()) {
             continue;
         }
         std::istringstream ss(line);
@@ -618,7 +712,15 @@ bool Store::load(PersistedState &out, std::string *error) const {
                 if (error) *error = "bad expiry in retained record at line " + std::to_string(lineNo);
                 return false;
             }
-            out.retained[m.topic] = m;
+            if (!decodeOptionalMessageOrigin(ss, m)) {
+                if (error) *error = "bad origin in retained record at line " + std::to_string(lineNo);
+                return false;
+            }
+            if (loaded.retained.count(m.topic) != 0) {
+                if (error) *error = "duplicate retained topic at line " + std::to_string(lineNo);
+                return false;
+            }
+            loaded.retained.emplace(m.topic, std::move(m));
         } else if (kind == "session") {
             std::string clientHex, userHex, nextIdToken;
             unsigned nextId = 1;
@@ -666,15 +768,75 @@ bool Store::load(PersistedState &out, std::string *error) const {
                 }
                 session.expiryRemainingSeconds = static_cast<int64_t>(seconds);
             }
-            out.sessions.push_back(std::move(session));
-            current = &out.sessions.back();
+            if (std::any_of(loaded.sessions.begin(), loaded.sessions.end(),
+                            [&](const PersistedSession &existing) {
+                                return existing.clientId == session.clientId;
+                            })) {
+                if (error) *error = "duplicate session at line " + std::to_string(lineNo);
+                return false;
+            }
+            loaded.sessions.push_back(std::move(session));
+            current = &loaded.sessions.back();
         } else if (kind == "sub" || kind == "inflight" || kind == "blocked" || kind == "pubrel" ||
-                   kind == "outpubrel") {
+                   kind == "outpubrel" || kind == "subid") {
             if (current == nullptr) {
                 if (error) *error = "record without a session at line " + std::to_string(lineNo);
                 return false;
             }
-            if (kind == "sub") {
+            if (kind == "subid") {
+                std::string token;
+                if (!(ss >> token)) {
+                    if (error) *error = "bad subid record at line " + std::to_string(lineNo);
+                    return false;
+                }
+                const auto comma = token.find(',');
+                if (comma == std::string::npos || comma + 1 == token.size()) {
+                    if (error) *error = "bad identifier list in subid record at line " +
+                                        std::to_string(lineNo);
+                    return false;
+                }
+                const std::string idToken = token.substr(0, comma);
+                unsigned long long id = 0;
+                if (!parseUnsigned(idToken, id) || id == 0 || id > 65535) {
+                    if (error) *error = "bad packet id in subid record at line " + std::to_string(lineNo);
+                    return false;
+                }
+                const uint16_t packetId = static_cast<uint16_t>(id);
+                if (current->inflightIdentifiers.count(packetId) != 0) {
+                    if (error) *error = "duplicate subid record at line " + std::to_string(lineNo);
+                    return false;
+                }
+                if (std::none_of(current->inflight.begin(), current->inflight.end(),
+                                 [&](const auto &entry) { return entry.first == packetId; })) {
+                    if (error) *error = "subid record without an inflight message at line " +
+                                        std::to_string(lineNo);
+                    return false;
+                }
+                SubscriptionIdentifiers identifiers;
+                size_t begin = comma + 1;
+                while (begin < token.size()) {
+                    const auto end = token.find(',', begin);
+                    const std::string valueToken = token.substr(begin, end == std::string::npos
+                                                                      ? std::string::npos : end - begin);
+                    unsigned long long value = 0;
+                    if (!parseUnsigned(valueToken, value) || value == 0 || value > 268435455ull ||
+                        std::find(identifiers.begin(), identifiers.end(),
+                                  static_cast<uint32_t>(value)) != identifiers.end()) {
+                        if (error) *error = "duplicate or bad identifier in subid record at line " +
+                                            std::to_string(lineNo);
+                        return false;
+                    }
+                    identifiers.push_back(static_cast<uint32_t>(value));
+                    if (end == std::string::npos) {
+                        break;
+                    }
+                    begin = end + 1;
+                    if (begin == token.size()) {
+                        return false;
+                    }
+                }
+                current->inflightIdentifiers[packetId] = std::move(identifiers);
+            } else if (kind == "sub") {
                 std::string filterHex;
                 unsigned long long qos = 0, noLocal = 0, rap = 0, handling = 0;
                 const unsigned long long maxQos = static_cast<unsigned long long>(QoS::QOS_2);
@@ -722,7 +884,11 @@ bool Store::load(PersistedState &out, std::string *error) const {
                 opt.retainAsPublished = rap != 0;
                 opt.retainHandling = static_cast<RetainHandling>(static_cast<uint8_t>(handling));
                 opt.subscriptionIdentifier = subscriptionIdentifier;
-                current->subscriptions[filter] = opt;
+                if (current->subscriptions.count(filter) != 0) {
+                    if (error) *error = "duplicate subscription at line " + std::to_string(lineNo);
+                    return false;
+                }
+                current->subscriptions.emplace(filter, opt);
             } else if (kind == "inflight") {
                 unsigned long long id = 0;
                 std::string topicHex, payloadHex;
@@ -747,6 +913,17 @@ bool Store::load(PersistedState &out, std::string *error) const {
                 std::string expiryToken;
                 if (ss >> expiryToken && !decodeMessageExpiry(expiryToken, m)) {
                     if (error) *error = "bad expiry in inflight record at line " + std::to_string(lineNo);
+                    return false;
+                }
+                if (!decodeOptionalMessageOrigin(ss, m)) {
+                    if (error) *error = "bad origin in inflight record at line " + std::to_string(lineNo);
+                    return false;
+                }
+                if (id == 0 || qos == 0 ||
+                    std::any_of(current->inflight.begin(), current->inflight.end(),
+                                [&](const auto &entry) { return entry.first == id; })) {
+                    if (error) *error = "bad or duplicate inflight record at line " +
+                                        std::to_string(lineNo);
                     return false;
                 }
                 current->inflight.emplace_back(static_cast<uint16_t>(id), std::move(m));
@@ -776,29 +953,54 @@ bool Store::load(PersistedState &out, std::string *error) const {
                     if (error) *error = "bad expiry in blocked record at line " + std::to_string(lineNo);
                     return false;
                 }
+                if (!decodeOptionalMessageOrigin(ss, m)) {
+                    if (error) *error = "bad origin in blocked record at line " + std::to_string(lineNo);
+                    return false;
+                }
+                if (qos == 0) {
+                    if (error) *error = "QoS 0 blocked record at line " + std::to_string(lineNo);
+                    return false;
+                }
                 current->blocked.push_back(std::move(m));
             } else if (kind == "outpubrel") {
                 // Outgoing QoS 2 flow awaiting PUBCOMP; re-sent to the client on
                 // resume (MQTT-4.4.0-1).
                 unsigned long long id = 0;
-                if (!readBounded(ss, 65535, id)) {
-                    if (error) *error = "bad outpubrel record at line " + std::to_string(lineNo);
+                if (!readBounded(ss, 65535, id) || id == 0 ||
+                    !current->pendingPubrel.insert(static_cast<uint16_t>(id)).second) {
+                    if (error) *error = "bad or duplicate outpubrel record at line " +
+                                        std::to_string(lineNo);
                     return false;
                 }
-                current->pendingPubrel.insert(static_cast<uint16_t>(id));
             } else {
                 unsigned long long id = 0;
-                if (!readBounded(ss, 65535, id)) {
-                    if (error) *error = "bad pubrel record at line " + std::to_string(lineNo);
+                if (!readBounded(ss, 65535, id) || id == 0 ||
+                    !current->awaitingPubrel.insert(static_cast<uint16_t>(id)).second) {
+                    if (error) *error = "bad or duplicate pubrel record at line " +
+                                        std::to_string(lineNo);
                     return false;
                 }
-                current->awaitingPubrel.insert(static_cast<uint16_t>(id));
             }
         } else {
             if (error) *error = "unknown record '" + kind + "' at line " + std::to_string(lineNo);
             return false;
         }
+        std::string extra;
+        if (ss >> extra) {
+            if (error) *error = "trailing fields in " + kind + " record at line " +
+                                std::to_string(lineNo);
+            return false;
+        }
     }
+    if (in.bad()) {
+        if (error) *error = "failed while reading state file";
+        return false;
+    }
+    if (!ended) {
+        if (error) *error = "state file is missing its final end marker";
+        return false;
+    }
+    out = std::move(loaded);
     return true;
 }
 

@@ -53,13 +53,14 @@ public:
     //! resume so the client can complete the handshake (MQTT-4.4.0-1).
     virtual void sendPubrel(uint16_t packetId) = 0;
     //! Called when a newer connection takes over this session; the receiver must
-    //! stop using the session and release it. \p version is the MQTT version of
-    //! the session being handed over, so a protocol-aware client can tell its
-    //! peer why it was disconnected.
-    virtual void onSuperseded(Version version) = 0;
+    //! stop using the session and release it. \p publishWill tells it whether the
+    //! old connection's Will is due under MQTT-3.1.4-3.
+    virtual uint32_t willDelayInterval() const { return 0; }
+    virtual void onSuperseded(bool publishWill) = 0;
 };
 
 class Session : public std::enable_shared_from_this<Session> {
+    friend class Broker;
 public:
     //! The durable part of a session, as written to the state file
     using Snapshot = PersistedSession;
@@ -75,8 +76,8 @@ public:
     void connect(const std::shared_ptr<Session>& self, bool persistent = false);
     //! Called when the driving connection is gone; tears the session down unless
     //! it is persistent (and therefore kept alive for a later reconnect)
-    void close(const std::shared_ptr<Client>& client);
-    void discard();
+    bool close(const std::shared_ptr<Client>& client, bool endSession = false);
+    void discard(bool publishWill = false);
     //! \p duplicate is the DUP flag of an inbound QoS 2 PUBLISH. A DUP retransmit
     //! for a flow already awaiting PUBREL must not re-route the message, but the
     //! caller must resend PUBREC with SUCCESS (MQTT-4.3.3-1) rather than report an
@@ -116,12 +117,12 @@ public:
 
     //! Bind the session to the connection that drives it (may be nullptr to detach)
     void bindClient(const std::shared_ptr<Client>& client);
-    //! Rebind a persistent session to a new connection and retransmit the
-    //! unacknowledged QoS>0 messages it still holds
-    //! Bind \p client as the live client, retransmitting anything outstanding.
-    //! \p protocolVersion is the version the new connection negotiated, used to
-    //! tell a superseded connection how to report the takeover.
-    void resume(const std::shared_ptr<Client>& client, Version protocolVersion);
+    //! Bind \p client as the live client with the new connection's persistence,
+    //! retransmitting anything outstanding.
+    void resume(const std::shared_ptr<Client>& client, bool persistent);
+    //! Whether takeover ends the old session or its Will has zero delay
+    //! (MQTT-3.1.4-3 / §3.1.2.5).
+    bool shouldPublishWillOnTakeover(bool newCleanStart) const;
     void setDisconnectCallback(std::function<void()> callback);
 
     //! The username this session authenticated with (empty for anonymous / auth-disabled)
@@ -215,6 +216,11 @@ public:
     }
 
 private:
+    void connectLocked(const std::shared_ptr<Session>& self, bool persistent);
+    std::function<void()> resumeLocked(const std::shared_ptr<Client>& client, bool persistent);
+    bool closeLocked(const std::shared_ptr<Client>& client, bool endSession);
+    std::function<void()> discardLocked(bool publishWill);
+
     struct Delivery {
         Message message;
         uint16_t packetId;
@@ -227,15 +233,6 @@ private:
         //! one queue are split across the two containers (the drop-oldest policy
         //! compares the two fronts). Assigned once when the delivery is created.
         unsigned long long sequence = 0;
-        //! Set on a PUBLISH the broker is retransmitting because it was already
-        //! sent (and still unacknowledged) before the connection dropped. A
-        //! retransmission is re-sent on resume regardless of the Receive Maximum
-        //! window (it was already outstanding), so it must never be demoted back
-        //! to the blocked queue by the reconnect re-flow-control (MQTT-4.4,
-        //! MQTT-4.6). Offline-buffered messages that were never sent are not
-        //! flagged and remain subject to the window.
-        bool retransmit = false;
-
         Delivery(Message message, uint16_t packetId, QoS qos,
                  SubscriptionIdentifiers subscriptionIdentifiers = {},
                  unsigned long long sequence = 0)
@@ -341,10 +338,9 @@ private:
     //! Move blocked QoS>0 messages into the inflight set / send queue while the
     //! outstanding count is below the client's Receive Maximum.
     void releaseBlocked();
-    //! On resume, demote the excess never-sent offline-buffered QoS>0 messages
-    //! (queued under the default Receive Maximum) back to the blocked queue so a
-    //! reconnect with a smaller window is not over-sent (MQTT-4.9.0-2). Retrans-
-    //! missions are left in place. Called with deliveryMutex held.
+    //! On resume, demote excess QoS>0 messages, including retransmissions, back
+    //! to the blocked queue so a smaller Receive Maximum is honoured
+    //! (MQTT-4.9.0-2). Called with deliveryMutex held.
     void reflowToReceiveMaximum();
     //! Forget an inflight QoS>0 message that will never be acknowledged (it was
     //! dropped by flow control/expiry or refused by the client) and release its

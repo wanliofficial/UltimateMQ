@@ -4,6 +4,7 @@
 
 #include "Transport.h"
 #include "TLS.h"
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -53,7 +54,13 @@ public:
     //! Non-blocking write of one whole unit (a complete masked BINARY frame);
     //! see ClientTransport::writeSome.
     ssize_t writeSome(const uint8_t *buf, size_t len) override;
+    //! Unsent raw frame bytes, including framing, retained after a would-block.
+    size_t pendingWriteBytes() const override {
+        return pendingWriteBytes_.load(std::memory_order_relaxed);
+    }
     void teardown() override;
+    //! Wake the owning reader without touching WebSocket assembly state.
+    void interrupt() override { inner_->interrupt(); }
 
     //! The subprotocol negotiated in the handshake (empty when the client
     //! offered none; then no Sec-WebSocket-Protocol header is answered).
@@ -80,6 +87,9 @@ private:
     //! Try to push pendingFrame_ out. Returns 1 = fully flushed, 0 = would-block
     //! with a tail retained, -1 = peer gone.
     int flushPending();
+    void updatePendingWriteBytes() {
+        pendingWriteBytes_.store(pendingFrame_.size(), std::memory_order_relaxed);
+    }
     //! Best-effort CLOSE frame (unless one was already sent).
     void sendClose(uint16_t status);
     //! Best-effort CLOSE frame carrying an explicit body (possibly empty), used
@@ -112,6 +122,7 @@ private:
     //! frame header must not be re-prepended on a retry, a partial send is held
     //! here rather than reported as a short payload count.
     std::vector<uint8_t> pendingFrame_;
+    std::atomic<size_t> pendingWriteBytes_{0};
 };
 
 } // namespace MQTT

@@ -37,6 +37,8 @@ struct PersistedSession {
     int64_t expiryRemainingSeconds = -1;
     std::map<std::string, SubscriptionOptions> subscriptions;
     std::vector<std::pair<uint16_t, Message>> inflight;
+    //! Subscription Identifiers carried by each inflight PUBLISH, keyed by packet id.
+    std::map<uint16_t, SubscriptionIdentifiers> inflightIdentifiers;
     //! QoS>0 messages parked behind the client's Receive Maximum: no packet id
     //! yet (first field is 0), to be promoted once a slot frees up.
     std::vector<Message> blocked;

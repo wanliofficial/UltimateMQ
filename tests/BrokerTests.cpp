@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <fstream>
 #include <algorithm>
+#include <atomic>
+#include <thread>
 
 class BrokerTest : public ::testing::Test
 {
@@ -27,6 +29,33 @@ TEST_F(BrokerTest, MaxPacketSizeIsConfigurable)
 {
     broker->setMaxPacketSize(2 * 1024 * 1024);
     EXPECT_EQ(broker->getMaxPacketSize(), 2u * 1024 * 1024);
+}
+
+TEST_F(BrokerTest, ConnectionAdmissionBudgetIsAtomicAcrossListeners)
+{
+    constexpr size_t limit = 37;
+    std::atomic<size_t> accepted{0};
+    std::vector<std::thread> listeners;
+    for (int i = 0; i < 8; ++i) {
+        listeners.emplace_back([&] {
+            for (int attempt = 0; attempt < 100; ++attempt) {
+                if (broker->tryReserveConnection(limit)) {
+                    accepted.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (auto &listener : listeners) {
+        listener.join();
+    }
+    EXPECT_EQ(accepted.load(), limit);
+    EXPECT_FALSE(broker->tryReserveConnection(limit));
+
+    for (size_t i = 0; i < accepted.load(); ++i) {
+        broker->releaseConnectionSlot();
+    }
+    EXPECT_TRUE(broker->tryReserveConnection(limit));
+    broker->releaseConnectionSlot();
 }
 
 TEST_F(BrokerTest, ConnectClientTest)

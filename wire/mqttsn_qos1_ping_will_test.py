@@ -43,6 +43,8 @@ WILLMSGREQ = 0x08
 WILLMSG = 0x09
 PUBLISH = 0x0C
 PUBACK = 0x0D
+SUBSCRIBE = 0x12
+SUBACK = 0x13
 PINGREQ = 0x16
 PINGRESP = 0x17
 DISCONNECT = 0x18
@@ -50,6 +52,7 @@ DISCONNECT = 0x18
 # Topic Id types (flag bits 1-0, §5.3.1).
 TIDT_NORMAL = 0b00
 TIDT_PREDEFINED = 0b01
+TIDT_NAME = 0b11
 
 # MQTT-SN return codes (§5.3.20).
 RC_ACCEPTED = 0x00
@@ -88,11 +91,16 @@ def sn_type(data):
     return data[1]
 
 
-def sn_connect(client_id, duration, will=False):
-    flags = 0x04  # CleanSession
+def sn_connect(client_id, duration, will=False, clean=True):
+    flags = 0x04 if clean else 0x00
     if will:
         flags |= 0x08  # Will present
     return sn_encode(CONNECT, bytes([flags, 0x01]) + struct.pack("!H", duration) + client_id.encode())
+
+
+def sn_subscribe(msg_id, topic):
+    # QoS 0, Topic Name type. SUBSCRIBE carries MsgId followed by the filter text.
+    return sn_encode(SUBSCRIBE, bytes([TIDT_NAME]) + struct.pack("!H", msg_id) + topic.encode())
 
 
 def sn_will_topic(topic):
@@ -374,12 +382,59 @@ def case_will_published_on_abnormal_disconnect():
         stop(proc, workdir)
 
 
+def case_clean_retransmitted_connect_discards_old_session():
+    proc, workdir = start()
+    topic = "sn/clean/reconnect"
+    try:
+        publisher = socket.create_connection((HOST, TCP_PORT[0]), timeout=5)
+        publisher.sendall(mqtt_connect("sn-clean-publisher"))
+        assert mqtt_read_pkt(publisher)[0] & 0xF0 == 0x20, "no CONNACK for publisher"
+
+        sn = udp_socket()
+        sn.sendto(sn_connect("sn-clean-dev", 30, clean=False), (HOST, SN_PORT[0]))
+        assert sn_type(sn.recv(256)) == CONNACK, "no CONNACK for persistent SN session"
+        sn.sendto(sn_subscribe(1, topic), (HOST, SN_PORT[0]))
+        assert sn_type(sn.recv(256)) == SUBACK, "no SUBACK for persistent SN session"
+
+        # Same endpoint and Client Id, but CleanSession=1: this may be a lost
+        # CONNACK retransmission, and §5.3.1 still requires the old session and
+        # all of its subscriptions to be discarded before the new one starts.
+        sn.sendto(sn_connect("sn-clean-dev", 30, clean=True), (HOST, SN_PORT[0]))
+        assert sn_type(sn.recv(256)) == CONNACK, "no CONNACK for clean reconnect"
+        publisher.sendall(mqtt_publish_qos1(7, topic, b"must-not-arrive"))
+        assert mqtt_puback(publisher), "broker did not acknowledge the first publish"
+        sn.settimeout(0.5)
+        try:
+            stale = sn.recv(256)
+        except socket.timeout:
+            stale = None
+        assert stale is None, "clean reconnect retained the old subscription: %r" % stale
+
+        # The new clean session is usable: subscribing again restores delivery.
+        sn.sendto(sn_subscribe(2, topic), (HOST, SN_PORT[0]))
+        sn.settimeout(3.0)
+        assert sn_type(sn.recv(256)) == SUBACK, "new clean session could not subscribe"
+        publisher.sendall(mqtt_publish_qos1(8, topic, b"new-session"))
+        assert mqtt_puback(publisher), "broker did not acknowledge the second publish"
+        delivered = sn.recv(256)
+        assert sn_type(delivered) == PUBLISH, "new clean session did not receive its publish"
+        assert delivered.endswith(b"new-session"), "wrong payload after clean reconnect"
+
+        sn.close()
+        publisher.close()
+        return "CleanSession=1 on a retransmitted CONNECT removed the old subscription"
+    finally:
+        stop(proc, workdir)
+
+
 case("MQTT-SN QoS 1: a publish by a predefined topic id is bridged and answered with PUBACK/ACCEPTED",
      case_qos1_puback_roundtrip)
 case("MQTT-SN keep-alive: a PINGREQ from a connected peer is answered with an empty PINGRESP",
      case_pingreq_gets_pingresp)
 case("MQTT-SN Will: a peer silent past its keep-alive is reaped and its Will is published",
      case_will_published_on_abnormal_disconnect)
+case("MQTT-SN session: a clean retransmitted CONNECT discards the old session",
+     case_clean_retransmitted_connect_discards_old_session)
 
 failed = [n for n, ok in results if not ok]
 print("\nSUMMARY: %d/%d passed" % (len(results) - len(failed), len(results)))

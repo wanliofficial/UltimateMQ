@@ -7,6 +7,7 @@
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 #include <atomic>
+#include <algorithm>
 #include <cstring>
 #include <thread>
 #include <unistd.h>
@@ -252,11 +253,14 @@ public:
         // QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED is delivered, so the server
         // sends with QUIC_SEND_FLAG_NONE. QUIC_SEND_FLAG_START is wrong here: it
         // attempts an async StreamStart on a stream the peer already started.
-        if (state_->closed.load(std::memory_order_acquire)) {
+        // StreamSend keeps the buffers alive until SEND_COMPLETE, so the
+        // payload is copied and freed in the callback above. Keep the state
+        // mutex held until the send is queued: SHUTDOWN_COMPLETE uses the same
+        // mutex before closing the handle, so it cannot close it under StreamSend.
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (state_->closed.load(std::memory_order_acquire) || !state_->stream) {
             return false;
         }
-        // StreamSend keeps the buffers alive until SEND_COMPLETE, so the
-        // payload is copied and freed in the callback above.
         uint8_t *copy = new uint8_t[len];
         std::memcpy(copy, buf, len);
         QUIC_BUFFER quicBuffer;
@@ -285,12 +289,17 @@ public:
         return writeAll(buf, len) ? static_cast<ssize_t>(len) : -1;
     }
 
+    void interrupt() override {
+        requestShutdown();
+    }
+
     void teardown() override {
         requestShutdown();
     }
 
 private:
     void requestShutdown() {
+        std::lock_guard<std::mutex> lock(state_->mutex);
         if (state_->stream) {
             quicApi()->StreamShutdown(state_->stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL,
                                       0);
@@ -319,6 +328,11 @@ struct QUICListener::Impl {
     size_t maxConnections = 1024;
     std::atomic<bool> stopped{false};
     std::atomic<size_t> activeConnections{0};
+    //! Handles still owned by msquic. stop() snapshots these under the same
+    //! mutex used by NEW_CONNECTION, so no accepted stream can escape shutdown.
+    std::mutex connectionsMutex;
+    std::condition_variable connectionsCondition;
+    std::vector<QUIC_HANDLE *> connections;
     //! Live MQTT-over-QUIC connections, each on its own serving thread (the
     //! same thread-per-client model the TCP listener uses).
     struct Serving {
@@ -376,8 +390,15 @@ void serveConnection(QUICConnectionContext *conn) {
         // only enqueues an asynchronous shutdown (SHUTDOWN_COMPLETE fires later
         // on an msquic worker thread and never re-enters servingMutex), so it is
         // safe to call while the lock is held.
-        quicApi()->ConnectionShutdown(conn->state->connection,
-                                      QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+        HQUIC connectionHandle;
+        {
+            std::lock_guard<std::mutex> lock(conn->state->mutex);
+            connectionHandle = conn->state->connection;
+        }
+        if (connectionHandle) {
+            quicApi()->ConnectionShutdown(connectionHandle,
+                                          QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+        }
         return;
     }
     impl->serving.push_back({std::thread([broker, state = conn->state, finished]() {
@@ -395,11 +416,14 @@ QUIC_STATUS QUIC_API connectionCallback(HQUIC connection, void *context,
     case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED:
         if (!conn->accepted.exchange(true)) {
             // The first client bidirectional stream carries the MQTT session.
-            conn->state->stream = event->PEER_STREAM_STARTED.Stream;
-            conn->state->connection = connection;
-            quicApi()->SetCallbackHandler(event->PEER_STREAM_STARTED.Stream,
-                                          reinterpret_cast<void *>(streamCallback),
-                                          conn->state.get());
+            {
+                std::lock_guard<std::mutex> lock(conn->state->mutex);
+                conn->state->stream = event->PEER_STREAM_STARTED.Stream;
+                conn->state->connection = connection;
+            }
+            quicApi()->SetCallbackHandler(
+                event->PEER_STREAM_STARTED.Stream,
+                reinterpret_cast<void *>(streamCallback), conn->state.get());
             // The stream is already started: msquic delivers PEER_STREAM_STARTED
             // once the peer has started it, and the server may send on a
             // peer-initiated bidirectional stream immediately. Spawn the serving
@@ -420,11 +444,23 @@ QUIC_STATUS QUIC_API connectionCallback(HQUIC connection, void *context,
         }
         break;
     case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE:
-        conn->state->closed.store(true, std::memory_order_release);
-        conn->state->condition.notify_all();
-        // The accept count drops here, on the worker thread, before the
-        // context is freed.
-        conn->accept->impl->activeConnections.fetch_sub(1, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(conn->state->mutex);
+            conn->state->connection = nullptr;
+            conn->state->closed.store(true, std::memory_order_release);
+            conn->state->condition.notify_all();
+        }
+        {
+            std::lock_guard<std::mutex> lock(conn->accept->impl->connectionsMutex);
+            auto &connections = conn->accept->impl->connections;
+            connections.erase(std::remove(connections.begin(), connections.end(), connection),
+                              connections.end());
+            conn->accept->impl->activeConnections.fetch_sub(1, std::memory_order_acq_rel);
+            if (conn->accept->impl->broker) {
+                conn->accept->impl->broker->releaseConnectionSlot();
+            }
+        }
+        conn->accept->impl->connectionsCondition.notify_all();
         // msquic requires the connection handle to be closed from this event;
         // after this the callback context is gone for good.
         quicApi()->ConnectionClose(connection);
@@ -463,8 +499,12 @@ QUIC_STATUS QUIC_API streamCallback(HQUIC stream, void *context,
         delete[] static_cast<uint8_t *>(event->SEND_COMPLETE.ClientContext);
         break;
     case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:
-        state->closed.store(true, std::memory_order_release);
-        state->condition.notify_all();
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->stream = nullptr;
+            state->closed.store(true, std::memory_order_release);
+            state->condition.notify_all();
+        }
         // Same rule as the connection handle: close from the shutdown event.
         quicApi()->StreamClose(stream);
         break;
@@ -484,30 +524,35 @@ QUIC_STATUS QUIC_API listenerCallback(HQUIC /*listener*/, void *context,
     auto *accept = static_cast<QUICAcceptContext *>(context);
     switch (event->Type) {
     case QUIC_LISTENER_EVENT_NEW_CONNECTION: {
-        if (accept->impl->activeConnections.load(std::memory_order_relaxed) >=
-            accept->impl->maxConnections) {
-            logError("too many QUIC connections, refusing client");
-            return QUIC_STATUS_CONNECTION_REFUSED;
-        }
-        // Count the connection from the moment it is accepted, so the decrement
-        // in SHUTDOWN_COMPLETE always has a matching increment. Doing it only on
-        // the success path below let a failed ConnectionSetConfiguration (which
-        // shuts the connection down before the fetch_add) underflow the atomic
-        // and lock out every later client once it passed the cap.
-        accept->impl->activeConnections.fetch_add(1, std::memory_order_relaxed);
-        auto conn = new QUICConnectionContext();
+        auto *impl = accept->impl;
+        bool callbackInstalled = false;
+        bool configured = false;
+        std::unique_ptr<QUICConnectionContext> conn(new QUICConnectionContext());
         conn->state = std::make_shared<QUICStreamState>();
         conn->accept = accept;
-        quicApi()->SetCallbackHandler(event->NEW_CONNECTION.Connection,
-                                      reinterpret_cast<void *>(connectionCallback), conn);
-        QUIC_STATUS setStatus = quicApi()->ConnectionSetConfiguration(
-            event->NEW_CONNECTION.Connection, accept->impl->configuration);
-        if (QUIC_FAILED(setStatus)) {
-            // The shutdown completion fires on the worker thread, closes the
-            // handle and deletes the context installed above; the accept count
-            // is dropped there, matching the increment taken at accept time.
-            quicApi()->ConnectionShutdown(event->NEW_CONNECTION.Connection,
-                                          QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+        {
+            std::lock_guard<std::mutex> lock(impl->connectionsMutex);
+            if (!impl->stopped.load(std::memory_order_acquire) && impl->broker &&
+                impl->broker->tryReserveConnection(impl->maxConnections)) {
+                impl->activeConnections.fetch_add(1, std::memory_order_acq_rel);
+                quicApi()->SetCallbackHandler(event->NEW_CONNECTION.Connection,
+                                              reinterpret_cast<void *>(connectionCallback), conn.get());
+                callbackInstalled = true;
+                conn.release(); // SHUTDOWN_COMPLETE now owns and deletes the context.
+                QUIC_STATUS setStatus = quicApi()->ConnectionSetConfiguration(
+                    event->NEW_CONNECTION.Connection, impl->configuration);
+                if (!QUIC_FAILED(setStatus)) {
+                    impl->connections.push_back(event->NEW_CONNECTION.Connection);
+                    configured = true;
+                }
+            }
+        }
+        if (!configured) {
+            if (callbackInstalled) {
+                // SHUTDOWN_COMPLETE releases the admission slot and context.
+                quicApi()->ConnectionShutdown(event->NEW_CONNECTION.Connection,
+                                              QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+            }
             return QUIC_STATUS_CONNECTION_REFUSED;
         }
         return QUIC_STATUS_SUCCESS;
@@ -642,24 +687,30 @@ void QUICListener::stop() {
     if (!impl || !quicApi()) {
         return;
     }
-    impl->stopped.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(impl->connectionsMutex);
+        impl->stopped.store(true, std::memory_order_release);
+        // Request shutdown while the handles are still registered. An idle MQTT
+        // stream can be blocked in readSome() forever when Keep Alive is zero.
+        for (QUIC_HANDLE *connection : impl->connections) {
+            quicApi()->ConnectionShutdown(connection,
+                                          QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+        }
+    }
     if (impl->listener) {
         quicApi()->ListenerClose(impl->listener);
         impl->listener = nullptr;
     }
-    if (impl->configuration) {
-        quicApi()->ConfigurationClose(impl->configuration);
-        impl->configuration = nullptr;
+    {
+        std::unique_lock<std::mutex> lock(impl->connectionsMutex);
+        impl->connectionsCondition.wait(lock, [&] {
+            return impl->activeConnections.load(std::memory_order_acquire) == 0;
+        });
     }
-    // Join the serving threads first: they own their Connection objects, and
-    // tearing those down requests the connection shutdowns whose completion
-    // callbacks close the last msquic handles before the registration goes.
+    // Every stream is closed and every serving thread can now leave its read
+    // loop. Join them before closing the configuration and registration.
     impl->reapFinished();
     for (;;) {
-        // Snapshot emptiness under the lock, then release it before calling
-        // reapFinished(): reapFinished() locks servingMutex itself, so holding
-        // it here would self-deadlock on the non-recursive mutex the first time
-        // a serving thread is still live.
         bool empty;
         {
             std::lock_guard<std::mutex> lock(impl->servingMutex);
@@ -668,8 +719,12 @@ void QUICListener::stop() {
         if (empty) {
             break;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::this_thread::yield();
         impl->reapFinished();
+    }
+    if (impl->configuration) {
+        quicApi()->ConfigurationClose(impl->configuration);
+        impl->configuration = nullptr;
     }
     if (impl->registration) {
         quicApi()->RegistrationClose(impl->registration);

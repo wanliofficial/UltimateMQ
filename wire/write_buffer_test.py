@@ -20,7 +20,7 @@ This probe launches the real broker over TCP and drives it with one slow
 subscriber and one publisher:
 
   * case_buffered_survives: FLOWMQ_WRITE_BUFFER on. The subscriber advertises a
-    large Receive Maximum, subscribes at QoS 0, then STOPS READING while the
+    large Receive Maximum and Keep Alive 0, subscribes at QoS 0, then STOPS READING while the
     publisher floods enough bytes to overflow the kernel send buffers. The
     broker must keep the connection (buffering the overflow), and once the
     subscriber resumes reading it must receive EVERY message, in order, with no
@@ -88,9 +88,9 @@ def utf8(x):
     return struct.pack("!H", len(x)) + x
 
 
-def connect(cid, clean_start=True, props=b""):
+def connect(cid, clean_start=True, props=b"", keep_alive=60):
     flags = 0x02 if clean_start else 0x00
-    body = utf8("MQTT") + bytes([5, flags]) + struct.pack("!H", 60) + enc_len(len(props)) + props + utf8(cid)
+    body = utf8("MQTT") + bytes([5, flags]) + struct.pack("!H", keep_alive) + enc_len(len(props)) + props + utf8(cid)
     return bytes([0x10]) + enc_len(len(body)) + body
 
 
@@ -200,9 +200,9 @@ def stop(proc, workdir):
     return out or b""
 
 
-def new_client(port, cid, clean_start=True, props=b""):
+def new_client(port, cid, clean_start=True, props=b"", keep_alive=60):
     c = socket.create_connection((HOST, port), timeout=5)
-    c.sendall(connect(cid, clean_start, props))
+    c.sendall(connect(cid, clean_start, props, keep_alive))
     r = read_pkt(c)
     assert r[0] == "pkt" and r[1] & 0xF0 == 0x20, "no CONNACK for %s" % cid
     return c
@@ -281,7 +281,7 @@ def case_buffered_survives():
         # Subscriber: large Receive Maximum so QoS 0 is never the limiter; the
         # only thing that can stall it is the socket write buffer / write buffer.
         sub = new_client(port, "wb-sub", clean_start=True,
-                         props=recv_max_prop(65535))
+                         props=recv_max_prop(65535), keep_alive=0)
         # Cap the send buffer small BEFORE subscribing. macOS auto-tunes socket
         # buffers up to several MB; without this the whole flood fits in the
         # kernel buffer and the write never stalls. A small fixed buffer forces

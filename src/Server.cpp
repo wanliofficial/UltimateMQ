@@ -236,7 +236,8 @@ Server::Server(int port, size_t maxConnections)
     const char* writeBuffer = getenv("FLOWMQ_WRITE_BUFFER");
     if (writeBuffer && *writeBuffer) {
         unsigned long long parsed;
-        if (!Env::parseLimit(writeBuffer, std::numeric_limits<size_t>::max(), parsed)) {
+        if (!Env::parseLimit(writeBuffer, std::numeric_limits<size_t>::max(), parsed,
+                             /*allowZero=*/true)) {
             delete broker;
             broker = nullptr;
             throw std::runtime_error(std::string("invalid FLOWMQ_WRITE_BUFFER: ") +
@@ -251,7 +252,8 @@ Server::Server(int port, size_t maxConnections)
     const char* maxSubscriptions = getenv("FLOWMQ_MAX_SUBSCRIPTIONS");
     if (maxSubscriptions && *maxSubscriptions) {
         unsigned long long parsed;
-        if (!Env::parseLimit(maxSubscriptions, std::numeric_limits<size_t>::max(), parsed)) {
+        if (!Env::parseLimit(maxSubscriptions, std::numeric_limits<size_t>::max(), parsed,
+                             /*allowZero=*/true)) {
             delete broker;
             broker = nullptr;
             throw std::runtime_error(std::string("invalid FLOWMQ_MAX_SUBSCRIPTIONS: ") +
@@ -268,7 +270,8 @@ Server::Server(int port, size_t maxConnections)
     if (maxSharedSubscriptions && *maxSharedSubscriptions) {
         unsigned long long parsed;
         if (!Env::parseLimit(maxSharedSubscriptions,
-                             std::numeric_limits<size_t>::max(), parsed)) {
+                             std::numeric_limits<size_t>::max(), parsed,
+                             /*allowZero=*/true)) {
             delete broker;
             broker = nullptr;
             throw std::runtime_error(
@@ -287,7 +290,8 @@ Server::Server(int port, size_t maxConnections)
     const char* maxRetained = getenv("FLOWMQ_MAX_RETAINED");
     if (maxRetained && *maxRetained) {
         unsigned long long parsed;
-        if (!Env::parseLimit(maxRetained, std::numeric_limits<size_t>::max(), parsed)) {
+        if (!Env::parseLimit(maxRetained, std::numeric_limits<size_t>::max(), parsed,
+                             /*allowZero=*/true)) {
             delete broker;
             broker = nullptr;
             throw std::runtime_error(std::string("invalid FLOWMQ_MAX_RETAINED: ") +
@@ -303,7 +307,8 @@ Server::Server(int port, size_t maxConnections)
     const char* maxPublishRate = getenv("FLOWMQ_MAX_PUBLISH_RATE");
     if (maxPublishRate && *maxPublishRate) {
         unsigned long long parsed;
-        if (!Env::parseLimit(maxPublishRate, std::numeric_limits<size_t>::max(), parsed)) {
+        if (!Env::parseLimit(maxPublishRate, std::numeric_limits<size_t>::max(), parsed,
+                             /*allowZero=*/true)) {
             delete broker;
             broker = nullptr;
             throw std::runtime_error(std::string("invalid FLOWMQ_MAX_PUBLISH_RATE: ") +
@@ -343,7 +348,7 @@ Server::Server(int port, size_t maxConnections)
     const char* serverKeepAlive = getenv("FLOWMQ_SERVER_KEEP_ALIVE");
     if (serverKeepAlive && *serverKeepAlive) {
         unsigned long long parsed;
-        if (!Env::parseLimit(serverKeepAlive, 65535, parsed)) {
+        if (!Env::parseLimit(serverKeepAlive, 65535, parsed, /*allowZero=*/true)) {
             delete broker;
             broker = nullptr;
             throw std::runtime_error(std::string("invalid FLOWMQ_SERVER_KEEP_ALIVE: ") +
@@ -547,15 +552,22 @@ void Server::run() {
         // The descriptor space has room again; stop backing off.
         listenerBackoffUntil_ = std::chrono::steady_clock::time_point{};
 
-        if (getActiveConnections() >= maxConnections) {
+        if (!broker->tryReserveConnection(maxConnections)) {
             logError("too many connections, rejecting client");
             close(clientSocket);
             continue;
         }
 
         // The shared_ptr keeps the connection alive for the lifetime of the
-        // session callbacks, even if the thread itself has already finished
-        auto connection = std::make_shared<Connection>(clientSocket, broker, TLS);
+        // session callbacks, even if the thread itself has already finished.
+        std::shared_ptr<Connection> connection;
+        try {
+            connection = std::make_shared<Connection>(clientSocket, broker, TLS);
+        } catch (...) {
+            close(clientSocket);
+            broker->releaseConnectionSlot();
+            throw;
+        }
         if (!startClientThread(clientSocket, connection)) {
             // Shutdown started between accept() and here: no thread was
             // started. The Connection we constructed still owns the descriptor
@@ -586,20 +598,27 @@ void Server::acceptWebSocket() {
     }
     // The descriptor space has room again; stop backing off.
     websocketBackoffUntil_ = std::chrono::steady_clock::time_point{};
-    if (getActiveConnections() >= maxConnections) {
+    if (!broker->tryReserveConnection(maxConnections)) {
         logError("too many connections, rejecting websocket client");
         close(clientSocket);
         return;
     }
     // The HTTP Upgrade handshake (and any TLS handshake for WSS) runs inside
     // Connection::run() through the transport's handshake() hook.
-    auto websocket = std::make_unique<WebSocketTransport>(
-        std::make_unique<SecureTransport>(
-            clientSocket, TLS,
-            broker ? broker->getWriteTimeoutMs()
-                   : SecureTransport::WRITE_STALL_TIMEOUT_MS));
-    auto connection = std::make_shared<Connection>(clientSocket, broker,
+    std::shared_ptr<Connection> connection;
+    try {
+        auto websocket = std::make_unique<WebSocketTransport>(
+            std::make_unique<SecureTransport>(
+                clientSocket, TLS,
+                broker ? broker->getWriteTimeoutMs()
+                       : SecureTransport::WRITE_STALL_TIMEOUT_MS));
+        connection = std::make_shared<Connection>(clientSocket, broker,
                                                    std::move(websocket));
+    } catch (...) {
+        close(clientSocket);
+        broker->releaseConnectionSlot();
+        throw;
+    }
     if (!startClientThread(clientSocket, connection)) {
         // Shutdown started: no thread was started. The Connection we built still
         // owns the descriptor and closes it in its destructor.
@@ -621,6 +640,7 @@ bool Server::startClientThread(int clientSocket,
     std::shared_ptr<std::atomic<bool>> finished = std::make_shared<std::atomic<bool>>(false);
     std::lock_guard<std::mutex> lock(connectionsMutex);
     if (!running) {
+        broker->releaseConnectionSlot();
         return false;
     }
     connections[clientSocket] = connection;
@@ -643,6 +663,7 @@ void Server::unregisterConnection(int clientSocket,
     if (it != connections.end() && it->second == connection) {
         connections.erase(it);
     }
+    broker->releaseConnectionSlot();
 }
 
 void Server::reapFinishedClientThreads() {
@@ -707,11 +728,6 @@ void Server::stop() {
     if (mqttSnGateway) {
         mqttSnGateway->stop();
     }
-#if defined(FLOWMQ_WITH_QUIC)
-    if (quicListener) {
-        quicListener->stop();
-    }
-#endif
 
     std::map<int, std::shared_ptr<Connection>> open;
     {
@@ -723,6 +739,13 @@ void Server::stop() {
     for (auto& [socket, connection] : open) {
         closeClient(socket);
     }
+#if defined(FLOWMQ_WITH_QUIC)
+    // Close active QUIC streams before waiting for serving threads; an idle
+    // stream with Keep Alive 0 may otherwise wait forever in readSome().
+    if (quicListener) {
+        quicListener->stop();
+    }
+#endif
     // Wait for the serving threads to finish before anything they use (the
     // broker, the store, this object) is torn down. Detaching them would let a
     // thread outlive the server and unlock a mutex that no longer exists.

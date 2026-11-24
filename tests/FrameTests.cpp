@@ -514,17 +514,27 @@ TEST_F(FrameTest, SerializeUserPropertiesEmitIdPerPair)
     EXPECT_EQ(encoded, expected);
 }
 
-TEST_F(FrameTest, ParseAuthPacket) 
+TEST_F(FrameTest, ParseAuthPacket)
 {
     std::vector<uint8_t> payload = {
-        0x18,  // Reason Code (Continue authentication)
-        0x00   // Properties length
+        0x18,                                  // Continue authentication
+        0x08, 0x15, 0x00, 0x05,                // Authentication Method: "SCRAM"
+        'S', 'C', 'R', 'A', 'M'
     };
 
     auto packet = frame->parseAuth(payload.data(), payload.size());
 
     EXPECT_EQ(packet.type, PacketType::AUTH);
     EXPECT_EQ(packet.reasonCode, ReasonCode::CONTINUE_AUTHENTICATION);
+    EXPECT_EQ(std::get<std::string>(packet.properties.at(PropertyID::AUTHENTICATION_METHOD)),
+              "SCRAM");
+}
+
+TEST_F(FrameTest, RejectsAuthWithoutAuthenticationMethod)
+{
+    Frame v5(Version::MQTT5);
+    std::vector<uint8_t> payload = {0x18, 0x00};
+    EXPECT_THROW(v5.parseAuth(payload.data(), payload.size()), Frame::ProtocolViolation);
 }
 
 TEST_F(FrameTest, SerializeConnectPacket) 
@@ -946,6 +956,21 @@ TEST_F(FrameTest, ParsesAckReasonCodeWithoutPropertyLength)
     EXPECT_EQ(packet.reasonCode, ReasonCode::NO_MATCHING_SUBSCRIBERS);
 }
 
+TEST_F(FrameTest, RejectsAckTrailingBytesAfterProperties)
+{
+    Frame v5(Version::MQTT5);
+    const std::vector<std::vector<uint8_t>> payloads = {
+        {0x00, 0x07, 0x00, 0x00, 0xFF},
+        {0x00, 0x08, 0x00, 0x00, 0xFF},
+        {0x00, 0x09, 0x00, 0x00, 0xFF},
+        {0x00, 0x0A, 0x00, 0x00, 0xFF},
+    };
+    EXPECT_THROW(v5.parsePuback(payloads[0].data(), payloads[0].size()), std::runtime_error);
+    EXPECT_THROW(v5.parsePubrec(payloads[1].data(), payloads[1].size()), std::runtime_error);
+    EXPECT_THROW(v5.parsePubrel(payloads[2].data(), payloads[2].size()), std::runtime_error);
+    EXPECT_THROW(v5.parsePubcomp(payloads[3].data(), payloads[3].size()), std::runtime_error);
+}
+
 TEST_F(FrameTest, ParseStringThrowsOnTruncatedLength)
 {
     std::vector<uint8_t> payload = {0x00};
@@ -1230,7 +1255,56 @@ TEST_F(FrameTest, RejectsAPropertyAppearingTwice)
     // parseProperties expects the property length first
     std::vector<uint8_t> section = {0x04, 0x01, 0x00, 0x01, 0x01};
     EXPECT_THROW(mqtt5.parseProperties(section.data(), section.size()),
-                 std::runtime_error);
+                 Frame::ProtocolViolation);
+}
+
+TEST_F(FrameTest, RejectsZeroSubscriptionIdentifierAsProtocolViolation)
+{
+    Frame mqtt5(Version::MQTT5);
+    std::vector<uint8_t> section = {0x02, 0x0B, 0x00};
+    EXPECT_THROW(mqtt5.parseProperties(section.data(), section.size()),
+                 Frame::ProtocolViolation);
+}
+
+TEST_F(FrameTest, RejectsResponseTopicThatIsNotATopicName)
+{
+    Frame mqtt5(Version::MQTT5);
+    for (const std::string &topic : {std::string(), std::string("reply/#"),
+                                     std::string("reply/+")}) {
+        std::vector<uint8_t> section = {
+            static_cast<uint8_t>(topic.size() + 3),
+            static_cast<uint8_t>(PropertyID::RESPONSE_TOPIC),
+            static_cast<uint8_t>(topic.size() >> 8),
+            static_cast<uint8_t>(topic.size() & 0xFF)
+        };
+        section.insert(section.end(), topic.begin(), topic.end());
+        EXPECT_THROW(mqtt5.parseProperties(section.data(), section.size(), nullptr,
+                                           Frame::PropertyContext::PUBLISH),
+                     Frame::ProtocolViolation);
+    }
+}
+
+TEST_F(FrameTest, SerializationRejectsRemainingLengthAboveMqttMaximum)
+{
+    Frame v5(Version::MQTT5);
+    EXPECT_EQ(v5.encodeRemainingLength(Frame::MAX_LENGTH).size(), 4u);
+    EXPECT_THROW(v5.encodeRemainingLength(Frame::MAX_LENGTH + 1), std::length_error);
+}
+
+TEST_F(FrameTest, SerializationRejectsOversizedPropertyStringsAndIdentifiers)
+{
+    Frame v5(Version::MQTT5);
+    Properties content;
+    content[PropertyID::CONTENT_TYPE] = std::string(65536, 'x');
+    EXPECT_THROW(v5.serializeProperties(content), std::length_error);
+
+    Properties user;
+    user[PropertyID::USER_PROPERTY] = UserProperties{{std::string(65536, 'k'), "v"}};
+    EXPECT_THROW(v5.serializeProperties(user), std::length_error);
+
+    Properties identifier;
+    identifier[PropertyID::SUBSCRIPTION_IDENTIFIER] = static_cast<uint32_t>(0);
+    EXPECT_THROW(v5.serializeProperties(identifier), Frame::ProtocolViolation);
 }
 
 TEST_F(FrameTest, AllowsRepeatedUserProperties)

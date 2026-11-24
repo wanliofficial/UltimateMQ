@@ -39,6 +39,7 @@ PersistedState sampleState() {
     PersistedState state;
     state.retained["a/b"] = messageFor("a/b", "kept", QoS::QOS_0, /*retain=*/true);
     state.retained["bin/\x01\x02"] = messageFor("bin/\x01\x02", std::string("\x00\xff", 2), QoS::QOS_1);
+    state.retained["a/b"].originClientId = "client-1";
 
     PersistedSession session;
     session.clientId = "client-1";
@@ -48,6 +49,7 @@ PersistedState sampleState() {
     session.subscriptions["$/shared/g/x"] = SubscriptionOptions{QoS::QOS_1, true, true,
                                                                 RetainHandling::SEND_RETAINED_MESSAGES_AT_SUBSCRIBE_IF_NEW};
     session.inflight.emplace_back(3, messageFor("a/b", std::string("\x00\x01\x02", 3), QoS::QOS_1));
+    session.inflightIdentifiers[3] = {7, 9};
     session.blocked.push_back(messageFor("a/c", std::string("\x10\x11", 2), QoS::QOS_2));
     session.awaitingPubrel.insert(3);
     session.awaitingPubrel.insert(9);
@@ -61,6 +63,20 @@ PersistedState sampleState() {
 void writeRaw(const std::string &path, const std::string &content) {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     out << content;
+}
+
+void expectRejected(const std::string &path, const std::string &content,
+                    const std::string &errorFragment = "") {
+    writeRaw(path, content);
+    Store store(path, std::chrono::milliseconds(10));
+    PersistedState state;
+    std::string error;
+    EXPECT_FALSE(store.load(state, &error));
+    EXPECT_FALSE(error.empty());
+    if (!errorFragment.empty()) {
+        EXPECT_NE(error.find(errorFragment), std::string::npos) << error;
+    }
+    ::remove(path.c_str());
 }
 
 } // namespace
@@ -85,6 +101,7 @@ TEST(StoreTest, RoundTripsTheWholeState)
         EXPECT_EQ(it->second.payload, entry.second.payload);
         EXPECT_EQ(it->second.qos, entry.second.qos);
         EXPECT_EQ(it->second.retain, entry.second.retain);
+        EXPECT_EQ(it->second.originClientId, entry.second.originClientId);
     }
 
     ASSERT_EQ(actual.sessions.size(), 1U);
@@ -109,6 +126,7 @@ TEST(StoreTest, RoundTripsTheWholeState)
     EXPECT_EQ(session.blocked[0].qos, QoS::QOS_2);
     EXPECT_EQ(session.awaitingPubrel, (std::set<uint16_t>{3, 9}));
     EXPECT_EQ(session.pendingPubrel, (std::set<uint16_t>{11, 12}));
+    EXPECT_EQ(session.inflightIdentifiers.at(3), (SubscriptionIdentifiers{7, 9}));
 
     ::remove(path.c_str());
 }
@@ -153,7 +171,29 @@ TEST(StoreTest, MissingFileLoadsAsEmptyState)
     EXPECT_TRUE(state.sessions.empty());
 }
 
-TEST(StoreTest, EmptyFileLoadsAsEmptyState)
+TEST(StoreTest, WritesVersionTwoHeaderAndLoadsVersionOneFiles)
+{
+    auto path = tempPath("header_versions");
+    Store store(path, std::chrono::milliseconds(10));
+    PersistedState empty;
+    std::string error;
+    ASSERT_TRUE(store.flushNow([empty]() { return empty; })) << error;
+    {
+        std::ifstream in(path);
+        std::string header;
+        ASSERT_TRUE(std::getline(in, header));
+        EXPECT_EQ(header, "FLOWMQ-STATE-2");
+    }
+
+    writeRaw(path, "FLOWMQ-STATE-1\nsession 63 - 1 -\nend\n");
+    PersistedState loaded;
+    ASSERT_TRUE(store.load(loaded, &error)) << error;
+    ASSERT_EQ(loaded.sessions.size(), 1u);
+    EXPECT_EQ(loaded.sessions.front().clientId, "c");
+    ::remove(path.c_str());
+}
+
+TEST(StoreTest, EmptyFileIsRejected)
 {
     const std::string path = tempPath("empty.dat");
     writeRaw(path, "");
@@ -161,7 +201,9 @@ TEST(StoreTest, EmptyFileLoadsAsEmptyState)
 
     PersistedState state;
     std::string error;
-    EXPECT_TRUE(store.load(state, &error)) << error;
+    EXPECT_FALSE(store.load(state, &error));
+    EXPECT_FALSE(error.empty());
+    EXPECT_TRUE(state.retained.empty());
     EXPECT_TRUE(state.sessions.empty());
 
     ::remove(path.c_str());
@@ -239,7 +281,8 @@ TEST(StoreTest, AcceptsTheLargestLegalNextPacketId)
     // have wrapped its counter to the maximum).
     const std::string path = tempPath("maxnpid.dat");
     writeRaw(path, "FLOWMQ-STATE-1\n"
-                   "session 63 - 65535 -\n");
+                   "session 63 - 65535 -\n"
+                   "end\n");
     Store store(path, std::chrono::milliseconds(10));
 
     PersistedState state;
@@ -300,7 +343,8 @@ TEST(StoreTest, AcceptsTheLargestLegalSubscriptionIdentifier)
     const std::string path = tempPath("maxsubid.dat");
     writeRaw(path, "FLOWMQ-STATE-1\n"
                    "session 636c 2d 1\n"
-                   "sub 6123 0 0 0 0 268435455\n");
+                   "sub 6123 0 0 0 0 268435455\n"
+                   "end\n");
     Store store(path, std::chrono::milliseconds(10));
 
     PersistedState state;
@@ -396,6 +440,29 @@ TEST(BrokerStoreTest, SnapshotAndRestoreRoundTrip)
     ASSERT_EQ(subscriber->size(), 1U);
     EXPECT_EQ(subscriber->snapshot()[0].topic, "a/b");
     EXPECT_EQ(subscriber->snapshot()[0].payload, std::vector<uint8_t>({'l', 'i', 'v', 'e'}));
+}
+
+TEST(BrokerStoreTest, RestoredRetainedMessageStillHonoursNoLocal)
+{
+    Message retained = messageFor("own/t", "mine", QoS::QOS_0, /*retain=*/true);
+    retained.originClientId = "owner";
+    PersistedState state;
+    state.retained[retained.topic] = retained;
+    PersistedSession persisted;
+    persisted.clientId = "owner";
+    SubscriptionOptions options{QoS::QOS_0, /*noLocal=*/true, false,
+                                RetainHandling::SEND_RETAINED_MESSAGES_AT_SUBSCRIBE};
+    persisted.subscriptions["own/t"] = options;
+    state.sessions.push_back(persisted);
+
+    Broker restored;
+    restored.restoreState(state);
+    auto session = restored.findSession("owner");
+    ASSERT_NE(session, nullptr);
+    auto client = test::attach(*session);
+    session->deliverRetained("own/t", options, /*isNewSubscription=*/true);
+    session->flush();
+    EXPECT_EQ(client->size(), 0u);
 }
 
 TEST(BrokerStoreTest, CleanSessionsAreNotPersisted)
@@ -518,8 +585,11 @@ TEST(StoreTest, RoundTripsForwardedMessageProperties)
     PersistedSession session;
     session.clientId = "prop-client";
     session.nextPacketId = 4;
-    session.inflight.emplace_back(2, retained);
-    session.blocked.push_back(retained);
+    Message pending = retained;
+    pending.qos = QoS::QOS_1;
+    pending.retain = false;
+    session.inflight.emplace_back(2, pending);
+    session.blocked.push_back(pending);
     state.sessions.push_back(session);
 
     ASSERT_TRUE(store.flushNow([&state] { return state; }));
@@ -669,6 +739,127 @@ TEST(StoreTest, RoundTripsSubscriptionIdentifier)
     ASSERT_EQ(loaded.sessions.size(), 1U);
     ASSERT_EQ(loaded.sessions[0].subscriptions.count("s/t"), 1U);
     EXPECT_EQ(loaded.sessions[0].subscriptions.at("s/t").subscriptionIdentifier, 300U);
+
+    ::remove(path.c_str());
+}
+
+TEST(StoreTest, OpenFailuresOtherThanMissingAreRejected)
+{
+    const std::string path = tempPath("directory");
+    ASSERT_EQ(::mkdir(path.c_str(), 0700), 0);
+    Store store(path, std::chrono::milliseconds(10));
+
+    PersistedState state;
+    std::string error;
+    EXPECT_FALSE(store.load(state, &error));
+    EXPECT_FALSE(error.empty());
+
+    ::rmdir(path.c_str());
+}
+
+TEST(StoreTest, RequiresExactlyOneFinalEndMarker)
+{
+    const std::string path = tempPath("endmarker.dat");
+    expectRejected(path, "FLOWMQ-STATE-1\nretained 74 0 1 78\n", "end");
+    expectRejected(path, "FLOWMQ-STATE-1\nend\nretained 74 0 1 78\n", "end");
+    expectRejected(path, "FLOWMQ-STATE-1\nend\nend\n", "end");
+}
+
+TEST(StoreTest, RejectsTrailingFieldsOnEveryRecordKind)
+{
+    const std::string path = tempPath("trailing.dat");
+    const std::string header = "FLOWMQ-STATE-1\nsession 63 - 1 -\ninflight 1 74 1 0 78\n";
+    const std::string records[] = {
+        "retained 74 0 1 78 - - - junk\n",
+        "session 64 - 1 - junk\n",
+        "sub 74 0 0 0 0 0 junk\n",
+        "inflight 2 74 1 0 78 - - - junk\n",
+        "blocked 0 74 1 0 78 - - - junk\n",
+        "pubrel 1 junk\n",
+        "outpubrel 1 junk\n",
+        "subid 1,7 junk\n",
+    };
+    for (const std::string &record : records) {
+        SCOPED_TRACE(record);
+        expectRejected(path, header + record + "end\n", "trailing");
+    }
+}
+
+TEST(StoreTest, RejectsDuplicateRecords)
+{
+    const std::string path = tempPath("duplicates.dat");
+    const std::string header = "FLOWMQ-STATE-1\n";
+    const std::string sessions = "session 63 - 1 -\n";
+    const std::string records[] = {
+        "retained 74 0 1 78\nretained 74 0 1 79\n",
+        sessions + sessions,
+        sessions + "sub 74 0 0 0 0\nsub 74 1 0 0 0\n",
+        sessions + "inflight 1 74 1 0 78\ninflight 1 74 1 0 79\n",
+        sessions + "pubrel 1\npubrel 1\n",
+        sessions + "outpubrel 1\noutpubrel 1\n",
+        sessions + "inflight 1 74 1 0 78\nsubid 1,7\nsubid 1,9\n",
+    };
+    for (const std::string &record : records) {
+        SCOPED_TRACE(record);
+        expectRejected(path, header + record + "end\n", "duplicate");
+    }
+}
+
+TEST(StoreTest, RejectsInvalidPacketIdentifiersAndQoSValues)
+{
+    const std::string path = tempPath("ids.dat");
+    const std::string header = "FLOWMQ-STATE-1\nsession 63 - 1 -\n";
+    const std::string records[] = {
+        "inflight 0 74 1 0 78\n",
+        "inflight 1 74 0 0 78\n",
+        "blocked 0 74 0 0 78\n",
+        "pubrel 0\n",
+        "outpubrel 0\n",
+    };
+    for (const std::string &record : records) {
+        expectRejected(path, header + record + "end\n");
+    }
+}
+
+TEST(StoreTest, RejectsOrphanEmptyOrDuplicateInflightSubscriptionIdentifiers)
+{
+    const std::string path = tempPath("inflightsubids.dat");
+    const std::string header = "FLOWMQ-STATE-1\nsession 63 - 1 -\n";
+    expectRejected(path, header + "subid 1,7\nend\n", "inflight");
+    expectRejected(path, header + "inflight 1 74 1 0 78\nsubid 1\nend\n", "identifier");
+    expectRejected(path, header + "inflight 1 74 1 0 78\nsubid 1,7,7\nend\n", "duplicate");
+}
+
+TEST(StoreTest, RejectsOutOfRangeAndDuplicateMessageProperties)
+{
+    const std::string path = tempPath("propranges.dat");
+    const std::string properties[] = {
+        "23:B2",
+        "1:b2",
+        "1:b256",
+        "33:w65536",
+        "2:u4294967296",
+        "11:u0",
+        "3:736f6d65,3:74657374",
+        "3:736f6d65,",
+    };
+    for (const std::string &encoded : properties) {
+        expectRejected(path, "FLOWMQ-STATE-1\nretained 74 0 1 78 " + encoded +
+                               " - -\nend\n", "properties");
+    }
+}
+
+TEST(StoreTest, FailedLoadDoesNotExposePartialState)
+{
+    const std::string path = tempPath("partial.dat");
+    writeRaw(path, "FLOWMQ-STATE-1\nretained 74 0 1 78\nbogus\nend\n");
+    Store store(path, std::chrono::milliseconds(10));
+
+    PersistedState state;
+    std::string error;
+    EXPECT_FALSE(store.load(state, &error));
+    EXPECT_TRUE(state.retained.empty());
+    EXPECT_TRUE(state.sessions.empty());
 
     ::remove(path.c_str());
 }

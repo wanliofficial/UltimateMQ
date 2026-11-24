@@ -183,6 +183,28 @@ def case_publish_with_subscription_id_disconnects():
         stop(proc, workdir)
 
 
+def case_publish_with_zero_subscription_id_disconnects():
+    """A zero Subscription Identifier is a Protocol Error before applicability."""
+    proc, port, workdir = start()
+    try:
+        c = socket.create_connection((HOST, port), timeout=5)
+        try:
+            c.sendall(connect("sid-zero"))
+            assert read_packet(c)[0] & 0xF0 == 0x20, "no CONNACK"
+            c.sendall(publish(9, "sid/zero", b"data", bytes([PROP_SUBSCRIPTION_IDENTIFIER, 0x00])))
+            pkt = read_packet(c, 2.0)
+            assert pkt is not None, "no DISCONNECT for zero Subscription Identifier"
+            h, b = pkt
+            assert h & 0xF0 == DISCONNECT, "expected DISCONNECT, got 0x%02X" % h
+            assert b and b[0] == REASON_PROTOCOL_ERROR, (
+                "a zero Subscription Identifier must be PROTOCOL_ERROR (0x82), got %r" % b)
+            return "zero Subscription Identifier -> DISCONNECT 0x82"
+        finally:
+            c.close()
+    finally:
+        stop(proc, workdir)
+
+
 def case_publish_without_subscription_id_accepted():
     """Control: the same QoS 1 PUBLISH with an empty property block (no
     Subscription Identifier) is accepted with a normal PUBACK, so the rejection
@@ -211,6 +233,8 @@ def case_publish_without_subscription_id_accepted():
 
 case("MQTT-3.3.4-6: a v5 PUBLISH carrying a Subscription Identifier is refused with DISCONNECT 0x82 (PROTOCOL_ERROR)",
      case_publish_with_subscription_id_disconnects)
+case("MQTT-3.8.2-16: a zero Subscription Identifier is a Protocol Error -> DISCONNECT 0x82",
+     case_publish_with_zero_subscription_id_disconnects)
 case("MQTT 5 (control): a QoS 1 PUBLISH with no Subscription Identifier is still accepted with PUBACK/SUCCESS",
      case_publish_without_subscription_id_accepted)
 

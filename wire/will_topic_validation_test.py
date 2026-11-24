@@ -38,7 +38,9 @@ BIN = sys.argv[1]
 PORT = [int(sys.argv[2])]
 
 PROP_SESSION_EXPIRY_INTERVAL = 0x11
+PROP_RESPONSE_TOPIC = 0x08
 REASON_SUCCESS = 0x00
+REASON_PROTOCOL_ERROR = 0x82
 REASON_TOPIC_NAME_INVALID = 0x90
 
 
@@ -61,7 +63,7 @@ def utf8(x):
 
 
 def connect(cid, version=5, will_topic="will/status", will_msg=b"bye",
-            session_expiry=None):
+            session_expiry=None, will_response_topic=None):
     """MQTT CONNECT with an armed Will (QoS 1). Will QoS bits go in the CONNECT
     flags byte (bits 4-3); the Will Payload is Binary Data (2-byte length)."""
     flags = 0x04 | ((1 & 0x03) << 3)  # Will present, QoS 1
@@ -76,8 +78,11 @@ def connect(cid, version=5, will_topic="will/status", will_msg=b"bye",
         flags |= 0x02  # CleanSession (3.1.1)
         body = utf8("MQTT") + bytes([4, flags]) + struct.pack("!H", 60)
     body += utf8(cid)
-    # Will Properties (empty), Will Topic, Will Payload.
-    body += enc_len(0)
+    will_props = b""
+    if version == 5 and will_response_topic is not None:
+        will_props = bytes([PROP_RESPONSE_TOPIC]) + utf8(will_response_topic)
+    if version == 5:
+        body += enc_len(len(will_props)) + will_props
     body += utf8(will_topic)
     body += struct.pack("!H", len(will_msg)) + will_msg
     return bytes([0x10]) + enc_len(len(body)) + body
@@ -255,6 +260,26 @@ def case_will_accepted_and_armed():
         stop(proc, workdir)
 
 
+def case_will_response_topic_wildcard():
+    """An illegal Will Response Topic makes the CONNECT a Protocol Error."""
+    proc, port, workdir = start()
+    try:
+        c = socket.create_connection((HOST, port), timeout=5)
+        try:
+            c.sendall(connect("wtc-response", will_response_topic="reply/#"))
+            pkt = read_packet(c, 2.0)
+            assert pkt is not None, "no CONNACK for an illegal Will Response Topic"
+            h, b = pkt
+            assert h & 0xF0 == 0x20, "expected a CONNACK, got header 0x%02x" % h
+            assert b[1] == REASON_PROTOCOL_ERROR, (
+                "an illegal Will Response Topic must be CONNACK 0x82, got 0x%02x" % b[1])
+            return "wildcard Will Response Topic -> CONNACK 0x82"
+        finally:
+            c.close()
+    finally:
+        stop(proc, workdir)
+
+
 def case_311_will_wildcard_closes():
     """MQTT 3.1.1: the same `#` Will Topic has no v5 reason code, so the broker
     just closes the connection (no usable CONNACK code) [MQTT-3.1.4-1]."""
@@ -290,6 +315,8 @@ case("MQTT-3.1.2-12: a v5 CONNECT whose Will Topic is empty is CONNACK 0x90 (TOP
      case_will_empty_topic)
 case("MQTT 5 (control): a CONNECT with a legal Will Topic is accepted (CONNACK 0x00)",
      case_will_accepted_and_armed)
+case("MQTT-3.3.2-14: a wildcard Will Response Topic makes the CONNECT a Protocol Error -> CONNACK 0x82",
+     case_will_response_topic_wildcard)
 case("MQTT-3.1.4-1: an MQTT 3.1.1 CONNECT whose Will Topic contains `#` is refused and the connection is closed",
      case_311_will_wildcard_closes)
 
