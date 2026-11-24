@@ -67,6 +67,7 @@ PROBES = [
     ("utf8_invalid_string_test", "MQTT-1.5.4: an ill-formed UTF-8 Encoded String (lone continuation, encoded surrogate, overlong U+0000, truncated sequence) in the Client Id is refused with CONNACK 0x81 (MALFORMED_PACKET), while a well-formed multi-byte string is accepted"),
     ("connect_zero_property_test", "MQTT 3.1.2-10 / 3.1.2-12: a CONNECT whose Receive Maximum or Maximum Packet Size property is 0 is refused with CONNACK 0x82 (PROTOCOL_ERROR), while non-zero values connect normally"),
     ("subscribe_options_unsubscribe_test", "MQTT-3.8.4-1 / MQTT-3.11.3: a v5/3.1.1 SUBSCRIBE with reserved option bits set is malformed (DISCONNECT 0x81 / connection close), and an MQTT 5 UNSUBSCRIBE of a never-subscribed filter gets UNSUBACK 0x11 (NO_SUBSCRIPTION_EXISTED)"),
+    ("publish_invalid_topic_test", "MQTT-3.3.2-1: a PUBLISH whose Topic Name carries a wildcard is refused with TOPIC_NAME_INVALID (0x90) in its PUBACK/PUBREC (or a DISCONNECT at QoS 0), and the message is never routed; a legal topic name is still accepted"),
     ("pubrel_dup_bit_test", "MQTT-3.6.1-1: a PUBREL re-sent after reconnect keeps the reserved bits 0010 (0x62), never a DUP bit (0x6A)"),
     ("receive_maximum_resume_test", "MQTT-4.9.0-2: a resumed session is not sent more than Receive Maximum unacked QoS>0 PUBLISHes, even when buffered offline under the default window"),
     ("env_limit_overflow_test", "config: an out-of-range FLOWMQ_* resource limit (strtoull ERANGE) is rejected at startup instead of silently becoming ULLONG_MAX and removing the cap"),
