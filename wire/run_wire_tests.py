@@ -75,6 +75,7 @@ PROBES = [
     ("publish_subscription_id_test", "MQTT-3.3.4-6: a client PUBLISH carrying a Subscription Identifier (a server-to-subscriber property) is refused with DISCONNECT 0x82 (PROTOCOL_ERROR), while a clean PUBLISH is still accepted"),
     ("keepalive_timeout_test", "MQTT-3.1.2-24 / 3.1.2-20: a client silent past 1.5x Keep Alive is closed with DISCONNECT 0x8D and its Will is published, while a PINGREQ inside every window resets the timer and keeps the connection open"),
     ("subscription_identifier_outbound_test", "MQTT-3.3.4-3 / 3.3.4-4: a subscription's Subscription Identifier (multi-byte VBI) is included on the forwarded PUBLISH, one combined copy carries the identifiers of every matching subscription, and a subscription without one adds none"),
+    ("shared_subscription_roundrobin_test", "MQTT-4.8.2: a shared group delivers each message to exactly one member and spreads the load across members, while two different share names are independent groups each receiving every message once"),
     ("pubrel_dup_bit_test", "MQTT-3.6.1-1: a PUBREL re-sent after reconnect keeps the reserved bits 0010 (0x62), never a DUP bit (0x6A)"),
     ("receive_maximum_resume_test", "MQTT-4.9.0-2: a resumed session is not sent more than Receive Maximum unacked QoS>0 PUBLISHes, even when buffered offline under the default window"),
     ("env_limit_overflow_test", "config: an out-of-range FLOWMQ_* resource limit (strtoull ERANGE) is rejected at startup instead of silently becoming ULLONG_MAX and removing the cap"),
