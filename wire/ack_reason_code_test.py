@@ -202,6 +202,13 @@ def case_v311_trailing_byte():
                 extra = c.recv(16)
             except socket.timeout:
                 extra = b"<timeout>"
+            except ConnectionResetError:
+                # The broker closes a 3.1.1 connection whose ack is malformed. Under
+                # load the close can surface as a TCP RST rather than a clean FIN,
+                # which Python raises as ConnectionResetError. Either way the
+                # connection is gone and no further MQTT bytes arrive -- exactly
+                # what this case asserts -- so treat a reset as an empty read.
+                extra = b""
             assert extra == b"", (
                 "a 3.1.1 PUBACK with a trailing byte must close the connection "
                 "with no further bytes, got %r" % extra)
