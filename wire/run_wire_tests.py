@@ -69,6 +69,7 @@ PROBES = [
     ("env_limit_overflow_test", "config: an out-of-range FLOWMQ_* resource limit (strtoull ERANGE) is rejected at startup instead of silently becoming ULLONG_MAX and removing the cap"),
     ("mqttsn_topicid_exhaustion_test", "MQTT-SN §5.3.9: exhausting a peer's 16-bit topic-id space answers REGISTER with REJECTED_CONGESTION instead of spinning forever in the broker event loop (whole-broker DoS)"),
     ("subscribe_nested_share_test", "MQTT-4.8.2: a deeply nested \\\"$share/a/$share/a/...\\\" SUBSCRIBE filter is answered instead of overflowing the connection thread's stack (remote DoS)"),
+    ("trie_deep_match_test", "MQTT-4.7: Trie::match walks the routing trie per topic level; a ~40 KB topic with 20000 levels overflowed the connection-thread stack and killed the broker on an ordinary SUBSCRIBE+PUBLISH (remote DoS)"),
     ("retained_messages_test", "retained: snapshot-to-new-subscriber with RETAIN=1, live delivery clears RETAIN, empty payload clears, wildcard match"),
     ("mqtt311_test", "MQTT 3.1.1: protocol level 4 round-trip, 0x80 SUBACK refusal, silent QoS 0 drop"),
     ("qos2_exactly_once_test", "QoS 2: full PUBLISH/PUBREC/PUBREL/PUBCOMP handshake delivers exactly once + a DUP retransmit gets PUBREC/SUCCESS (not re-routed)"),
