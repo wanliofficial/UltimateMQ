@@ -419,6 +419,20 @@ bool SecureTransport::writeAll(const uint8_t *buf, size_t len) {
         }
         int err = SSL_get_error(ssl_, n);
         if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+            // On a blocking socket SO_SNDTIMEO already bounded the preceding
+            // write(2): SSL_write only returns WANT_WRITE after that timeout
+            // elapsed with the peer still not reading, so the connection is
+            // stalled and must be dropped. Polling POLLOUT here would wait a
+            // second writeTimeoutMs and double the stall deadline; instead
+            // return at once so the drop lands within a single timeout (matching
+            // the plaintext path, where ::send + SO_SNDTIMEO returns EAGAIN and
+            // writeAll reports failure immediately). A non-blocking socket has no
+            // SO_SNDTIMEO, so it keeps the poll: WANT_WRITE then means "try again
+            // once writable" rather than "timed out".
+            const bool nonBlocking = (::fcntl(fd_, F_GETFL, 0) & O_NONBLOCK) != 0;
+            if (err == SSL_ERROR_WANT_WRITE && !nonBlocking) {
+                return false;
+            }
             struct pollfd pfd;
             pfd.fd = fd_;
             pfd.events = (err == SSL_ERROR_WANT_READ) ? POLLIN : POLLOUT;
@@ -456,11 +470,9 @@ ssize_t SecureTransport::writeSome(const uint8_t *buf, size_t len) {
             return n;
         }
     }
-    // TLS: a single SSL_write emits exactly one record, so a partial record never
-    // reaches the peer (OpenSSL buffers the remainder internally and resumes on
-    // the next SSL_write of the same data). WANT_WRITE therefore means "the
-    // record did not fit yet": report would-block (0) and let the caller retry
-    // the whole unit on POLLOUT.
+    // TLS: a single SSL_write emits exactly one record. WANT_WRITE means the
+    // record did not fit yet: report would-block (0) and let the caller buffer
+    // the unit and retry on POLLOUT.
     suppressSigPipe();
     int n = SSL_write(ssl_, buf, static_cast<int>(len));
     if (n > 0) {

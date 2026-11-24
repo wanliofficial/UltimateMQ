@@ -32,6 +32,11 @@ namespace {
 constexpr int CONNECT_TIMEOUT_SECONDS = 10;
 //! Granularity used to check the keep alive timer while waiting for data
 constexpr int POLL_SLICE_MS = 250;
+//! Ceiling on a default (no FLOWMQ_WRITE_BUFFER) TLS connection's kernel send
+//! buffer. Unbounded, the auto-tuned buffer swallows a slow reader's whole output
+//! so SO_SNDTIMEO never fires; this bounds undeliverable data per connection and
+//! makes a stalled TLS write backpressure and time out predictably.
+constexpr int TLS_DEFAULT_SNDBUF = 16 * 1024;
 
 //! Build a ClientID for a client that sent a zero-length one. The broker must
 //! treat such a client as if it had supplied this value (MQTT-3.1.3-6), so the
@@ -71,7 +76,10 @@ Connection::Connection(int sockfd, Broker* broker,
     // non-blocking so writes that the kernel cannot take immediately return
     // EAGAIN (routed into the buffer) instead of stalling the connection thread.
     // With it disabled (the default) the socket stays blocking and the historical
-    // SO_SNDTIMEO + writeAll path is used unchanged.
+    // SO_SNDTIMEO + writeAll path is used unchanged: a stalled write is bounded
+    // by SO_SNDTIMEO (set on both the plaintext and TLS sockets below), so a peer
+    // that stops reading is dropped after FLOWMQ_WRITE_TIMEOUT_MS rather than
+    // pinning the connection thread forever.
     if (broker && broker->getWriteBufferBytes() > 0) {
         writeBufferLimit = broker->getWriteBufferBytes();
         writeBufferActive = true;
@@ -92,6 +100,20 @@ Connection::Connection(int sockfd, Broker* broker,
         if (sndbuf > 0) {
             ::setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
         }
+    } else if (transport && transport->TLSEnabled()) {
+        // Default (no FLOWMQ_WRITE_BUFFER) TLS path: the socket stays blocking and
+        // writeAll() relies on SO_SNDTIMEO to bound a stalled SSL_write. But the
+        // kernel send buffer auto-tunes to several MB, and an unbounded buffer
+        // silently swallows a slow reader's output: SSL_write keeps succeeding
+        // into the kernel buffer, SO_SNDTIMEO never fires, and a client that
+        // stops reading is never dropped (its stalled write is effectively
+        // unbounded). Capping SO_SNDBUF makes backpressure engage at a predictable
+        // point: the buffer fills, the next SSL_write blocks in write(2), and
+        // SO_SNDTIMEO turns that into EAGAIN -> a dropped connection after
+        // FLOWMQ_WRITE_TIMEOUT_MS. The kernel doubles the value for bookkeeping,
+        // so request half the intended ceiling.
+        const int sndbuf = static_cast<int>(TLS_DEFAULT_SNDBUF / 2);
+        ::setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
     }
     // Cap the packet size before any byte (including the first CONNECT) is read.
     // The version is fixed later, but the limit does not depend on it.
@@ -1576,7 +1598,12 @@ bool Connection::sendPacket(Packet &packet) {
         return true;
     }
     if (!transport->writeAll(data.data(), data.size())) {
-        // The peer is gone; stop the connection on the next loop iteration
+        // The write failed or timed out (a stalled TLS write is bounded by
+        // SO_SNDTIMEO, see SecureTransport's constructor): the peer is gone or
+        // never reads. Stop the connection on the next loop iteration; run()
+        // tears the socket down and publishes the Will.
+        logDebug("outbound write failed; closing connection after %zu-byte packet",
+                 data.size());
         state = State::DISCONNECTED;
         return false;
     }
