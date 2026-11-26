@@ -30,6 +30,7 @@ def free_port():
 
 
 PROBES = [
+    ("amqp_broker_test", "AMQP 0-9-1: handshake, topology, routing, Basic.Return, prefetch, requeue, and reserved-bit rejection"),
     ("mqttsn_qos1_ping_will_test", "MQTT-SN QoS 1 PUBACK round-trip, PINGREQ/PINGRESP, Will published on abnormal keep-alive disconnect"),
     ("retained_messages_test", "retained: snapshot-to-new-subscriber with RETAIN=1, live delivery clears RETAIN, empty payload clears, wildcard match"),
     ("mqtt311_test", "MQTT 3.1.1: protocol level 4 round-trip, 0x80 SUBACK refusal, silent QoS 0 drop"),

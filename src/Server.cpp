@@ -124,6 +124,19 @@ Server::Server(int port, size_t maxConnections)
         store = std::make_unique<Store>(std::string(), std::chrono::milliseconds(1000));
     }
 
+    const char* amqpPort = getenv("FLOWMQ_AMQP_PORT");
+    if (amqpPort && *amqpPort) {
+        char* end = nullptr;
+        errno = 0;
+        long parsed = std::strtol(amqpPort, &end, 10);
+        if (end == amqpPort || *end != '\0' || errno != 0 || parsed <= 0 || parsed > 65535) {
+            throw std::runtime_error(std::string("invalid FLOWMQ_AMQP_PORT: ") + amqpPort);
+        }
+        amqpBroker = std::make_unique<AMQP::Broker>(auth.get());
+        amqpListener = std::make_unique<Listener>(static_cast<int>(parsed));
+        logInfo("AMQP 0-9-1 listener on port %d", static_cast<int>(parsed));
+    }
+
     broker = new Broker(auth.get(), store.get());
 
     // MQTT-SN gateway (opt-in). Without FLOWMQ_MQTT_SN_PORT no UDP socket is
@@ -391,6 +404,9 @@ void Server::start() {
     if (mqttSnGateway) {
         mqttSnGateway->start();
     }
+    if (amqpListener) {
+        amqpListener->start();
+    }
 #if defined(FLOWMQ_WITH_QUIC)
     if (quicListener) {
         quicListener->start();
@@ -427,6 +443,7 @@ void Server::run() {
         // detached, so their resources (and the last reference to their
         // Connection) are only released when they are joined.
         reapFinishedClientThreads();
+        reapFinishedAMQPThreads();
         // Drop any sessions whose disconnect-time expiry has elapsed. Bounding
         // the poll timeout guarantees the loop wakes to run this even when idle.
         if (std::chrono::steady_clock::now() - lastSweep >= sweepInterval) {
@@ -443,39 +460,39 @@ void Server::run() {
         // Wait for either a new client, the periodic wake-up, the shutdown
         // wake-up pipe, or a pending accept-backoff deadline.
         const auto now = std::chrono::steady_clock::now();
-        struct pollfd fds[4];
-        int count = 0;
+        std::vector<struct pollfd> fds;
+        fds.reserve(5);
         // A listener whose accept() failed with EMFILE/ENFILE stays readable
         // (its connection is still queued), so polling it for POLLIN would spin.
         // Drop the POLLIN mask until its backoff deadline and let the timeout
         // below wake the loop to retry once fds may have freed up.
         const bool listenerBackingOff =
             listenerBackoffUntil_.time_since_epoch().count() != 0 && now < listenerBackoffUntil_;
-        fds[count].fd = listener->fd();
-        fds[count].events = listenerBackingOff ? 0 : POLLIN;
-        ++count;
+        fds.push_back({listener->fd(), static_cast<short>(listenerBackingOff ? 0 : POLLIN), 0});
         int websocketFdIndex = -1;
         if (websocketListener) {
-            websocketFdIndex = count;
+            websocketFdIndex = static_cast<int>(fds.size());
             const bool backingOff =
                 websocketBackoffUntil_.time_since_epoch().count() != 0 &&
                 now < websocketBackoffUntil_;
-            fds[count].fd = websocketListener->fd();
-            fds[count].events = backingOff ? 0 : POLLIN;
-            ++count;
+            fds.push_back({websocketListener->fd(), static_cast<short>(backingOff ? 0 : POLLIN), 0});
         }
         int mqttSnFdIndex = -1;
         if (mqttSnGateway) {
-            mqttSnFdIndex = count;
-            fds[count].fd = mqttSnGateway->fd();
-            fds[count].events = POLLIN;
-            ++count;
+            mqttSnFdIndex = static_cast<int>(fds.size());
+            fds.push_back({mqttSnGateway->fd(), POLLIN, 0});
+        }
+        int amqpFdIndex = -1;
+        if (amqpListener) {
+            amqpFdIndex = static_cast<int>(fds.size());
+            const bool backingOff =
+                amqpBackoffUntil_.time_since_epoch().count() != 0 && now < amqpBackoffUntil_;
+            fds.push_back({amqpListener->fd(), static_cast<short>(backingOff ? 0 : POLLIN), 0});
         }
         if (gWakePipe[0] >= 0) {
-            fds[count].fd = gWakePipe[0];
-            fds[count].events = POLLIN;
-            ++count;
+            fds.push_back({gWakePipe[0], POLLIN, 0});
         }
+        const int count = static_cast<int>(fds.size());
         // Wake at most once per sweep interval so an idle loop still sweeps, but
         // no later than the nearest accept-backoff deadline so a throttled
         // listener is retried promptly once fds may have recovered.
@@ -488,13 +505,17 @@ void Server::run() {
             websocketBackoffUntil_ < wakeAt) {
             wakeAt = websocketBackoffUntil_;
         }
+        if (amqpBackoffUntil_.time_since_epoch().count() != 0 &&
+            amqpBackoffUntil_ < wakeAt) {
+            wakeAt = amqpBackoffUntil_;
+        }
         int pollTimeoutMs = static_cast<int>(
             std::chrono::duration_cast<std::chrono::milliseconds>(wakeAt - now).count());
         if (pollTimeoutMs < 0) {
             pollTimeoutMs = 0;
         }
 
-        int ready = ::poll(fds, count, pollTimeoutMs);
+        int ready = ::poll(fds.data(), count, pollTimeoutMs);
         if (ready < 0) {
             if (errno == EINTR) {
                 continue;
@@ -519,6 +540,9 @@ void Server::run() {
         if (mqttSnFdIndex >= 0 && (fds[mqttSnFdIndex].revents & POLLIN) != 0) {
             // Never blocks: drains every queued datagram, then returns.
             mqttSnGateway->handleReadable();
+        }
+        if (amqpFdIndex >= 0 && (fds[amqpFdIndex].revents & POLLIN) != 0) {
+            acceptAMQP();
         }
         if ((fds[0].revents & POLLIN) == 0) {
             continue;
@@ -605,6 +629,81 @@ void Server::acceptWebSocket() {
     }
 }
 
+void Server::acceptAMQP() {
+    int clientSocket = amqpListener->acceptConnection();
+    if (clientSocket < 0) {
+        if (!running) return;
+        if (errno == EMFILE || errno == ENFILE) {
+            logError("AMQP accept failed: %s; pausing accepts briefly", std::strerror(errno));
+            amqpBackoffUntil_ = std::chrono::steady_clock::now() + acceptBackoff;
+            return;
+        }
+        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            logError("failed to accept AMQP connection: %s", std::strerror(errno));
+        }
+        return;
+    }
+    amqpBackoffUntil_ = std::chrono::steady_clock::time_point{};
+    if (getActiveConnections() >= maxConnections) {
+        logError("too many connections, rejecting AMQP client");
+        ::close(clientSocket);
+        return;
+    }
+    auto connection = std::make_shared<AMQP::Connection>(
+        clientSocket, amqpBroker.get(), TLS,
+        broker ? broker->getWriteTimeoutMs() : MQTT::SecureTransport::WRITE_STALL_TIMEOUT_MS,
+        broker ? broker->getMaxPacketSize() : 64 * 1024 * 1024);
+    if (!startAMQPThread(clientSocket, connection)) {
+        connection->close();
+    }
+}
+
+void Server::handleAMQPClient(const std::shared_ptr<AMQP::Connection>& connection) {
+    connection->run();
+}
+
+bool Server::startAMQPThread(int clientSocket,
+                             const std::shared_ptr<AMQP::Connection>& connection) {
+    auto finished = std::make_shared<std::atomic<bool>>(false);
+    std::lock_guard<std::mutex> lock(connectionsMutex);
+    if (!running) return false;
+    amqpConnections[clientSocket] = connection;
+    std::thread thread([this, clientSocket, connection, finished]() {
+        handleAMQPClient(connection);
+        unregisterAMQPConnection(clientSocket, connection);
+        finished->store(true, std::memory_order_release);
+    });
+    amqpThreads.push_back(ClientThread{std::move(thread), std::move(finished)});
+    return true;
+}
+
+void Server::unregisterAMQPConnection(int clientSocket,
+                                      const std::shared_ptr<AMQP::Connection>& connection) {
+    std::lock_guard<std::mutex> lock(connectionsMutex);
+    auto it = amqpConnections.find(clientSocket);
+    if (it != amqpConnections.end() && it->second == connection) {
+        amqpConnections.erase(it);
+    }
+}
+
+void Server::reapFinishedAMQPThreads() {
+    std::vector<ClientThread> finished;
+    {
+        std::lock_guard<std::mutex> lock(connectionsMutex);
+        for (auto it = amqpThreads.begin(); it != amqpThreads.end();) {
+            if (it->finished->load(std::memory_order_acquire)) {
+                finished.push_back(std::move(*it));
+                it = amqpThreads.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (auto& client : finished) {
+        if (client.thread.joinable()) client.thread.join();
+    }
+}
+
 void Server::handleClient(const std::shared_ptr<Connection> &connection) {
     // The connection was kept alive by the shared_ptr captured here; the
     // descriptor is owned by the Connection and closed exactly once by
@@ -671,6 +770,11 @@ void Server::joinClientThreads() {
     {
         std::lock_guard<std::mutex> lock(connectionsMutex);
         remaining.swap(clientThreads);
+        std::vector<ClientThread> amqpRemaining;
+        amqpRemaining.swap(amqpThreads);
+        remaining.insert(remaining.end(),
+                         std::make_move_iterator(amqpRemaining.begin()),
+                         std::make_move_iterator(amqpRemaining.end()));
     }
     for (auto &client : remaining) {
         if (client.thread.joinable()) {
@@ -681,7 +785,7 @@ void Server::joinClientThreads() {
 
 size_t Server::getActiveConnections() const {
     std::lock_guard<std::mutex> lock(connectionsMutex);
-    return connections.size();
+    return connections.size() + amqpConnections.size();
 }
 
 void Server::closeClient(int clientSocket) {
@@ -706,6 +810,9 @@ void Server::stop() {
     if (mqttSnGateway) {
         mqttSnGateway->stop();
     }
+    if (amqpListener) {
+        amqpListener->stop();
+    }
 #if defined(FLOWMQ_WITH_QUIC)
     if (quicListener) {
         quicListener->stop();
@@ -713,13 +820,19 @@ void Server::stop() {
 #endif
 
     std::map<int, std::shared_ptr<Connection>> open;
+    std::map<int, std::shared_ptr<AMQP::Connection>> amqpOpen;
     {
         std::lock_guard<std::mutex> lock(connectionsMutex);
         open = connections;
+        amqpOpen = amqpConnections;
     }
     // Shutting the sockets down makes the client threads leave their read loop;
     // each Connection closes its own descriptor exactly once
     for (auto& [socket, connection] : open) {
+        closeClient(socket);
+    }
+    for (auto& [socket, connection] : amqpOpen) {
+        (void)connection;
         closeClient(socket);
     }
     // Wait for the serving threads to finish before anything they use (the

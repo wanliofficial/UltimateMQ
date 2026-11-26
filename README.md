@@ -51,6 +51,7 @@ All configuration is read from environment variables at startup.
 | `FLOWMQ_TLS_VERIFY_CLIENTS` | unset | When set, a client certificate signed by `FLOWMQ_TLS_CA` is required |
 | `FLOWMQ_TLS_CERT_AS_USERNAME` | unset | With mutual TLS, authorise a client that sends no MQTT username under its certificate CN |
 | `FLOWMQ_WEBSOCKET_PORT` | unset | Additional TCP port serving MQTT over WebSocket (`ws://`, or `wss://` when TLS is configured) |
+| `FLOWMQ_AMQP_PORT` | unset | Additional TCP port serving AMQP 0-9-1 clients (RabbitMQ/Pika-compatible, plaintext or TLS) |
 | `FLOWMQ_WS_REQUIRE_SUBPROTOCOL` | unset | When set, a WebSocket upgrade that does not offer the `mqtt` subprotocol is refused with HTTP 400 (the binding's requirement); otherwise such clients are still accepted |
 | `FLOWMQ_MQTT_SN_PORT` | unset | UDP port serving MQTT-SN 1.2 clients through the built-in gateway |
 | `FLOWMQ_MQTT_SN_PREDEFINED_TOPICS` | unset | Predefined MQTT-SN topic ids, e.g. `1=sensors/temp,2=home/#` |
@@ -64,6 +65,41 @@ HTTP Upgrade handshake offering the `mqtt` subprotocol, then carries ordinary
 MQTT 3.1.1/5 packets in WebSocket binary frames. With a TLS certificate
 configured the same listener speaks WSS. Everything else (sessions, retained
 messages, QoS, ACLs) is shared with plain TCP clients.
+
+#### AMQP 0-9-1 (`FLOWMQ_AMQP_PORT`)
+
+When set, the broker opens an additional TCP listener speaking AMQP 0-9-1. It
+uses the same TLS configuration, user database, ACL file and global connection
+limit as the MQTT listeners. AMQP is off by default and does not change MQTT
+routing or session behavior.
+
+Supported operations include connection/channel negotiation and heartbeat,
+SASL PLAIN, exchange declaration/deletion, queue declaration/binding/purge/
+deletion, direct/fanout/topic routing, `basic.publish`, `basic.get`, consumers,
+QoS prefetch, acknowledgements, rejection, recovery, and mandatory/immediate
+returns. The built-in default exchange routes by queue name; `amq.direct`,
+`amq.fanout`, and `amq.topic` are predeclared. Content properties are preserved,
+and expiration plus `user-id` are validated.
+
+```bash
+FLOWMQ_AMQP_PORT=5672 ./flowmq
+```
+
+A Pika client can connect with `pika.ConnectionParameters(host="127.0.0.1",
+port=5672)`. Without `FLOWMQ_PASSWORD_FILE`, SASL PLAIN credentials are accepted
+without a user lookup. With a user database they must match an entry in that
+file. Over mutual TLS, SASL EXTERNAL uses the verified certificate identity.
+Only virtual host `/` is available.
+
+AMQP ACLs reuse the existing rules: publish `write` permission is checked
+against the routing key, and queue consumption/get/binding `read` permission is
+checked against the queue name. Exchange and queue administration have no
+separate AMQP resource permissions.
+
+Queues, bindings, messages and topology flags are currently **in-memory only**;
+`durable`, `exclusive` and `auto-delete` affect runtime behavior but do not make
+AMQP state survive a restart. Publisher confirms, transactions, headers
+exchanges, and AMQP-to-MQTT bridging are not implemented.
 
 #### MQTT-SN gateway (`FLOWMQ_MQTT_SN_PORT`)
 
