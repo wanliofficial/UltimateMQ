@@ -16,7 +16,7 @@ set(TEST_SOURCES
     StoreTests.cpp
     TLSTests.cpp
     SysTopicsTests.cpp
-    Utf8Tests.cpp
+    UTF8Tests.cpp
     MQTTSNTests.cpp
     ServerTests.cpp
     WebSocketTests.cpp

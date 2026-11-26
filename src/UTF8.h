@@ -21,7 +21,7 @@ namespace MQTT {
 //! A receiver that gets either is required to treat the packet as malformed
 //! ("the server must check, the client should check", OASIS MQTT-216), so the
 //! caller reports MALFORMED_PACKET rather than a topic-specific reason code.
-class Utf8 {
+class UTF8 {
 public:
     //! True when \p data is well-formed UTF-8 and contains no U+0000.
     static bool isValid(const std::string& data) {

@@ -1,6 +1,6 @@
 
 #include "Frame.h"
-#include "Utf8.h"
+#include "UTF8.h"
 #include <set>
 #include <memory>
 #include <iostream>
@@ -305,7 +305,7 @@ std::string Frame::parseString(const uint8_t* buffer, size_t length) {
     // text field of every packet in one place; the value is wrapped in a
     // ProtocolViolation so a malformed CONNECT is answered with CONNACK 0x81.
     const uint8_t *text = buffer + 2;
-    if (!Utf8::isValid(text, strLen)) {
+    if (!UTF8::isValid(text, strLen)) {
         throw MalformedString("a UTF-8 Encoded String is ill-formed or contains U+0000 "
                               "(MQTT-1.5.4)");
     }
