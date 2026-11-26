@@ -37,6 +37,45 @@ def long_string(value):
     return struct.pack("!I", len(value)) + value
 
 
+def field_value(value):
+    if value is None:
+        return b"V"
+    if isinstance(value, bool):
+        return b"t" + bytes([1 if value else 0])
+    if isinstance(value, int):
+        if 0 <= value <= 0xff:
+            return b"B" + bytes([value])
+        if -0x80 <= value < 0:
+            return b"b" + struct.pack("!b", value)
+        if 0 <= value <= 0x7fff:
+            return b"U" + struct.pack("!H", value)
+        if -0x8000 <= value < 0:
+            return b"s" + struct.pack("!h", value)
+        if 0 <= value <= 0x7fffffff:
+            return b"I" + struct.pack("!I", value)
+        if -0x80000000 <= value < 0:
+            return b"i" + struct.pack("!i", value)
+        if value < 0:
+            return b"L" + struct.pack("!q", value)
+        return b"l" + struct.pack("!Q", value)
+    if isinstance(value, str):
+        return b"S" + long_string(value)
+    if isinstance(value, (bytes, bytearray)):
+        return b"x" + long_string(bytes(value))
+    if isinstance(value, list):
+        return b"A" + long_string(b"".join(field_value(item) for item in value))
+    if isinstance(value, dict):
+        return b"F" + table(value)
+    raise TypeError("unsupported AMQP field value: %r" % (value,))
+
+
+def table(value):
+    if value is None:
+        value = {}
+    payload = b"".join(short_string(key) + field_value(item) for key, item in value.items())
+    return long_string(payload)
+
+
 def frame(frame_type, channel, payload):
     return struct.pack("!BHI", frame_type, channel, len(payload)) + payload + bytes([FRAME_END])
 
@@ -141,11 +180,11 @@ class Client:
         self.sock.sendall(method(20, 40, args, channel))
         expect_method(self.sock, 20, 41, channel)
 
-    def declare_exchange(self, name, exchange_type, arguments=None):
+    def declare_exchange(self, name, exchange_type, arguments=None, durable=False):
         args = struct.pack("!H", 0) + short_string(name) + short_string(exchange_type)
-        args += b"\x00" + struct.pack("!I", 0)
+        args += bytes([2 if durable else 0]) + struct.pack("!I", 0)
         if arguments is not None:
-            args = args[:-4] + long_string(arguments)
+            args = args[:-4] + arguments
         self.sock.sendall(method(40, 10, args))
         expect_method(self.sock, 40, 11)
 
@@ -161,11 +200,13 @@ class Client:
         declared = response[1:1 + response[0]].decode()
         return declared
 
-    def bind(self, queue, exchange, routing_key):
+    def bind(self, queue, exchange, routing_key, arguments=None, channel=1):
         args = struct.pack("!H", 0) + short_string(queue) + short_string(exchange)
         args += short_string(routing_key) + b"\x00" + struct.pack("!I", 0)
-        self.sock.sendall(method(50, 20, args))
-        expect_method(self.sock, 50, 21)
+        if arguments is not None:
+            args = args[:-4] + arguments
+        self.sock.sendall(method(50, 20, args, channel))
+        expect_method(self.sock, 50, 21, channel)
 
     def publish(self, exchange, routing_key, body, mandatory=False, immediate=False,
                 channel=1, properties=None):
@@ -179,6 +220,23 @@ class Client:
         for offset in range(0, len(body), self.frame_max - 8):
             self.sock.sendall(frame(FRAME_BODY, channel,
                                     body[offset:offset + self.frame_max - 8]))
+
+    def confirm_select(self, no_wait=False, channel=1):
+        self.sock.sendall(method(85, 10, bytes([1 if no_wait else 0]), channel))
+        if not no_wait:
+            expect_method(self.sock, 85, 11, channel)
+
+    def tx_select(self, channel=1):
+        self.sock.sendall(method(90, 10, b"", channel))
+        expect_method(self.sock, 90, 11, channel)
+
+    def tx_commit(self, channel=1):
+        self.sock.sendall(method(90, 20, b"", channel))
+        expect_method(self.sock, 90, 21, channel)
+
+    def tx_rollback(self, channel=1):
+        self.sock.sendall(method(90, 30, b"", channel))
+        expect_method(self.sock, 90, 31, channel)
 
     def get(self, queue, no_ack=True):
         args = struct.pack("!H", 0) + short_string(queue) + bytes([1 if no_ack else 0])
@@ -203,8 +261,9 @@ class Client:
         redelivered = payload[8] & 1
         return delivery_tag, bool(redelivered), body
 
-    def ack(self, delivery_tag, channel=1):
-        self.sock.sendall(method(60, 80, struct.pack("!Q", delivery_tag) + b"\x00", channel))
+    def ack(self, delivery_tag, channel=1, multiple=False):
+        self.sock.sendall(method(60, 80, struct.pack("!Q", delivery_tag) +
+                                 bytes([1 if multiple else 0]), channel))
 
     def qos(self, prefetch_count, prefetch_size=0, global_qos=False, channel=1):
         self.sock.sendall(method(60, 10, struct.pack("!IHB", prefetch_size,
@@ -252,8 +311,9 @@ def expect_no_frame(client):
     raise AssertionError("unexpected data while delivery should be paused: %r" % data)
 
 
-def start_broker(port=AMQP_PORT, authenticate=False):
-    workdir = tempfile.mkdtemp(prefix="flowmq-amqp-")
+def start_broker(port=AMQP_PORT, authenticate=False, workdir=None):
+    if workdir is None:
+        workdir = tempfile.mkdtemp(prefix="flowmq-amqp-")
     env = dict(os.environ)
     env["MQTT_PORT"] = str(port + 1)
     env["FLOWMQ_AMQP_PORT"] = str(port)
@@ -282,18 +342,21 @@ def start_broker(port=AMQP_PORT, authenticate=False):
                 break
             time.sleep(0.05)
     proc.kill()
+    proc.wait()
     err.close()
-    raise RuntimeError("AMQP listener did not start")
+    with open(os.path.join(workdir, "broker.err"), "rb") as output:
+        details = output.read().decode(errors="replace").strip()
+    raise RuntimeError("AMQP listener did not start" + (": " + details if details else ""))
 
 
 def stop_broker(proc, err):
-    err.close()
     proc.send_signal(signal.SIGTERM)
     try:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+    err.close()
 
 
 def parse_return(arguments, body):
@@ -315,6 +378,12 @@ def delivery_tag(arguments, expected_tag=None):
     if expected_tag is not None:
         assert tag == expected_tag
     return struct.unpack("!Q", arguments[1 + tag_size:9 + tag_size])[0]
+
+
+def expect_confirm(sock, sequence, channel=1):
+    arguments = expect_method(sock, 60, 80, channel)
+    confirmed, multiple = struct.unpack("!QB", arguments)
+    assert (confirmed, multiple) == (sequence, 0), (confirmed, multiple)
 
 
 def run():
@@ -512,6 +581,148 @@ def run():
         stop_broker(proc, err)
 
 
+def run_features():
+    port = AMQP_PORT + 3
+    proc, _workdir, err = start_broker(port)
+    try:
+        client = Client(port)
+        queue = client.declare_queue()
+        client.confirm_select()
+        client.publish("", queue, b"confirmed.one")
+        expect_confirm(client.sock, 1)
+        client.publish("", queue, b"confirmed.two")
+        expect_confirm(client.sock, 2)
+        client.publish("", "wire.missing", b"returned", mandatory=True)
+        _arguments, _properties, body = read_content(client.sock, 60, 50)
+        assert body == b"returned"
+        expect_confirm(client.sock, 3)
+
+        client.open_channel(2)
+        client.confirm_select(no_wait=True, channel=2)
+        client.publish("", queue, b"no-wait", channel=2)
+        expect_confirm(client.sock, 1, channel=2)
+
+        client.open_channel(3)
+        client.confirm_select(channel=3)
+        client.sock.sendall(method(90, 10, b"", 3))
+        assert expect_channel_close(client, 406, 3) == (90, 10)
+        client.close_channel(3)
+        client.close()
+
+        transactional = Client(port)
+        transactional.tx_select()
+        tx_queue = transactional.declare_queue()
+        transactional.publish("", tx_queue, b"rolled.back")
+        assert transactional.get(tx_queue) is None, "transactional publish became visible early"
+        transactional.tx_rollback()
+        assert transactional.get(tx_queue) is None, "rollback did not discard staged publish"
+        transactional.publish("", tx_queue, b"committed")
+        transactional.tx_commit()
+        assert transactional.get(tx_queue)[2] == b"committed"
+
+        transactional.publish("", tx_queue, b"ack.transaction")
+        transactional.tx_commit()
+        delivery = transactional.get(tx_queue, no_ack=False)
+        assert delivery is not None
+        transactional.ack(delivery[0])
+        transactional.tx_rollback()
+        transactional.sock.sendall(method(60, 110, b"\x01"))
+        expect_method(transactional.sock, 60, 111)
+        redelivered = transactional.get(tx_queue, no_ack=False)
+        assert redelivered is not None and redelivered[1], "rollback lost a staged ack"
+        transactional.ack(redelivered[0])
+        transactional.tx_commit()
+        assert transactional.get(tx_queue) is None, "commit did not apply staged ack"
+        transactional.close()
+
+        headers = Client(port)
+        headers.declare_exchange("wire.headers", "headers")
+        all_queue = headers.declare_queue()
+        any_queue = headers.declare_queue()
+        typed_queue = headers.declare_queue()
+        headers.bind(all_queue, "wire.headers", "", table({
+            "x-match": "all", "format": "text", "color": "blue"}))
+        headers.bind(any_queue, "wire.headers", "", table({
+            "x-match": "any", "color": "red"}))
+        headers.bind(typed_queue, "wire.headers", "", table({
+            "x-match": "all", "count": 1}))
+
+        def publish_headers(values):
+            properties = struct.pack("!H", 0x2000) + table(values)
+            headers.publish("wire.headers", "", b"headers", properties=properties)
+
+        publish_headers({"format": "text", "color": "blue"})
+        assert headers.get(all_queue)[2] == b"headers"
+        assert headers.get(any_queue) is None
+        publish_headers({"format": "text", "color": "red"})
+        assert headers.get(all_queue) is None
+        assert headers.get(any_queue)[2] == b"headers"
+        publish_headers({"count": "1"})
+        assert headers.get(typed_queue) is None, "headers exchange ignored field types"
+        publish_headers({"count": 1})
+        assert headers.get(typed_queue)[2] == b"headers"
+        headers.close()
+        print("PASS AMQP publisher confirms, transactions, and headers exchanges")
+    finally:
+        stop_broker(proc, err)
+
+
+def run_persistence():
+    port = AMQP_PORT + 4
+    workdir = tempfile.mkdtemp(prefix="flowmq-amqp-persist-")
+    proc, _workdir, err = start_broker(port, workdir=workdir)
+    try:
+        client = Client(port)
+        client.declare_exchange("durable.exchange", "direct", durable=True)
+        queue = client.declare_queue("durable.queue", durable=True)
+        client.bind(queue, "durable.exchange", "jobs")
+        client.confirm_select()
+        client.publish("durable.exchange", "jobs", b"confirmed.persistent")
+        expect_confirm(client.sock, 1)
+        state_path = os.path.join(workdir, "state.db.amqp")
+        assert os.path.exists(state_path), "confirmed durable publish was not flushed"
+        client.close()
+        proc.kill()
+        proc.wait()
+        err.close()
+
+        proc, _workdir, err = start_broker(port, workdir=workdir)
+        client = Client(port)
+        client.declare_exchange("durable.exchange", "direct", durable=True)
+        assert client.declare_queue("durable.queue", durable=True) == queue
+        assert client.get(queue)[2] == b"confirmed.persistent"
+        client.publish("durable.exchange", "jobs", b"binding.restored")
+        assert client.get(queue)[2] == b"binding.restored"
+
+        client.confirm_select()
+        client.publish("durable.exchange", "jobs", b"unacked")
+        expect_confirm(client.sock, 1)
+        client.publish("durable.exchange", "jobs", b"still.queued")
+        expect_confirm(client.sock, 2)
+        unacked = client.get(queue, no_ack=False)
+        assert unacked is not None and unacked[2] == b"unacked" and not unacked[1]
+        stop_broker(proc, err)
+        proc = None
+
+        proc, _workdir, err = start_broker(port, workdir=workdir)
+        client = Client(port)
+        recovered = client.get(queue, no_ack=False)
+        assert recovered is not None and recovered[1] and recovered[2] == b"unacked", \
+            "unacknowledged durable message was not recovered: %r" % (recovered,)
+        client.ack(recovered[0])
+        queued = client.get(queue, no_ack=False)
+        assert queued is not None and not queued[1] and queued[2] == b"still.queued"
+        client.ack(queued[0])
+        assert client.get(queue) is None
+        client.close()
+        print("PASS AMQP durable topology, confirmed-publish crash recovery, and unacked redelivery")
+    finally:
+        if proc is not None and proc.poll() is None:
+            stop_broker(proc, err)
+        elif err is not None and not err.closed:
+            err.close()
+
+
 def run_auth_acl():
     port = AMQP_PORT + 2
     proc, _workdir, err = start_broker(port, authenticate=True)
@@ -544,4 +755,6 @@ def run_auth_acl():
 if __name__ == "__main__":
     run()
     run_auth_acl()
+    run_features()
+    run_persistence()
     print("PASS AMQP password authentication, ACLs, and channel-scoped refusal")

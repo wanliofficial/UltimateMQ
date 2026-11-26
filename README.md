@@ -35,7 +35,7 @@ All configuration is read from environment variables at startup.
 | `FLOWMQ_DEBUG` | unset | Emit debug traces to stderr |
 | `FLOWMQ_PASSWORD_FILE` | unset | User database; enables authentication when present |
 | `FLOWMQ_ACL_FILE` | unset | Per-user topic access rules; enables ACL enforcement when present |
-| `FLOWMQ_STATE_FILE` | unset | Durable state file; retained messages and persistent sessions survive a restart when set |
+| `FLOWMQ_STATE_FILE` | unset | Durable state file; MQTT retained messages/sessions and, when AMQP is enabled, AMQP durable topology/messages survive a restart (`<path>.amqp` is used for AMQP) |
 | `FLOWMQ_MAX_PACKET_SIZE` | `1048576` (1 MiB) | Largest Remaining Length accepted from a single client, in bytes; also advertised to MQTT 5 clients |
 | `FLOWMQ_WRITE_TIMEOUT_MS` | `5000` (5 s) | How long a single write may make no progress before the connection is dropped (bounds a stalled reader) |
 | `FLOWMQ_MAX_SUBSCRIPTIONS` | `1024` | Maximum number of topic filters a single session may hold; further filters are rejected |
@@ -75,11 +75,12 @@ routing or session behavior.
 
 Supported operations include connection/channel negotiation and heartbeat,
 SASL PLAIN, exchange declaration/deletion, queue declaration/binding/purge/
-deletion, direct/fanout/topic routing, `basic.publish`, `basic.get`, consumers,
-QoS prefetch, acknowledgements, rejection, recovery, and mandatory/immediate
-returns. The built-in default exchange routes by queue name; `amq.direct`,
-`amq.fanout`, and `amq.topic` are predeclared. Content properties are preserved,
-and expiration plus `user-id` are validated.
+deletion, direct/fanout/topic/headers routing, `basic.publish`, `basic.get`,
+consumers, QoS prefetch, acknowledgements, rejection, recovery, publisher
+confirms, transactions, and mandatory/immediate returns. The built-in default
+exchange routes by queue name; `amq.direct`, `amq.fanout`, `amq.topic`, and
+`amq.headers` are predeclared. Content properties are preserved, and expiration
+plus `user-id` are validated.
 
 ```bash
 FLOWMQ_AMQP_PORT=5672 ./flowmq
@@ -96,10 +97,27 @@ against the routing key, and queue consumption/get/binding `read` permission is
 checked against the queue name. Exchange and queue administration have no
 separate AMQP resource permissions.
 
-Queues, bindings, messages and topology flags are currently **in-memory only**;
-`durable`, `exclusive` and `auto-delete` affect runtime behavior but do not make
-AMQP state survive a restart. Publisher confirms, transactions, headers
-exchanges, and AMQP-to-MQTT bridging are not implemented.
+Publisher confirms use monotonically increasing per-channel sequence numbers;
+an unroutable mandatory publish is returned before its confirmation. Headers
+exchanges match binding arguments against `Basic.Properties.headers` using
+`x-match=all` or `x-match=any`, with exact field-type matching.
+
+Transactions batch publications and acknowledgements until `tx.commit`;
+`tx.rollback` discards staged operations without redelivering unacknowledged
+messages. As permitted by AMQP 0-9-1, atomicity is not guaranteed across multiple
+queues, and applications must not rely on `mandatory` or `immediate` behavior
+inside a transaction. Publisher confirms and transactions are mutually
+exclusive on a channel.
+
+Without `FLOWMQ_STATE_FILE`, queues, bindings, messages and topology flags are
+in-memory only. With it, durable exchanges, non-exclusive durable queues,
+bindings between durable topology, and their messages are stored separately in
+`<FLOWMQ_STATE_FILE>.amqp` and restored on restart. Unacknowledged messages are
+restored to their queues with `redelivered=true`. Confirmed durable publishes
+and transaction commits are flushed synchronously before their success reply;
+other durable mutations are checkpointed by the background writer and on
+shutdown. Exclusive queues and bindings involving non-durable topology are not
+restored. AMQP-to-MQTT bridging is not implemented.
 
 #### MQTT-SN gateway (`FLOWMQ_MQTT_SN_PORT`)
 
@@ -226,6 +244,9 @@ With it, the following survive a restart:
 * an inbound QoS 2 flow that is still awaiting its `PUBREL`: on reconnect (or
   after a restart) the broker resends the `PUBREC` so the client can finish the
   handshake with its `PUBREL`, instead of abandoning the flow.
+* when the AMQP listener is enabled, durable AMQP topology and messages in the
+  companion `<state-file>.amqp` store, including unacknowledged deliveries that
+  are requeued as redeliveries after restart.
 
 The file is written by a background thread at most once per second and again on
 `SIGINT`/`SIGTERM`, always atomically (a temporary file is renamed into place),

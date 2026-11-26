@@ -15,6 +15,7 @@
 #include "MQTTSN.h"
 #include "AMQPBroker.h"
 #include "AMQPConnection.h"
+#include "AMQPStore.h"
 #if defined(FLOWMQ_WITH_QUIC)
 #include "QUIC.h"
 #endif
@@ -82,6 +83,7 @@ private:
     std::unique_ptr<Listener> websocketListener;
     //! MQTT-SN gateway (UDP), created only when FLOWMQ_MQTT_SN_PORT is set.
     std::unique_ptr<MQTTSN::Gateway> mqttSnGateway;
+    std::unique_ptr<AMQP::Store> amqpStore;
     std::unique_ptr<AMQP::Broker> amqpBroker;
     std::unique_ptr<Listener> amqpListener;
 #if defined(FLOWMQ_WITH_QUIC)

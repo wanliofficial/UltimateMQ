@@ -62,6 +62,7 @@ std::vector<uint8_t> closeArguments(uint16_t code, const std::string& text,
 
 struct Properties {
     std::string userID;
+    std::shared_ptr<FieldTable> headers;
     std::optional<std::chrono::steady_clock::time_point> expiration;
 };
 
@@ -78,7 +79,7 @@ Properties parseProperties(const std::vector<uint8_t>& bytes) {
     // only headers is a table and timestamp is an eight-octet value.
     if (flags & 0x8000) reader.shortString();
     if (flags & 0x4000) reader.shortString();
-    if (flags & 0x2000) (void)reader.table();
+    if (flags & 0x2000) result.headers = reader.table();
     if (flags & 0x1000) reader.u8();
     if (flags & 0x0800) reader.u8();
     if (flags & 0x0400) reader.shortString();
@@ -192,10 +193,8 @@ void Connection::awaitClose() {
 }
 
 void Connection::finishChannelClose(uint16_t channel) {
-    auto deliveries = allUnacked(channel);
-    if (!deliveries.empty()) {
-        broker->acknowledge(shared_from_this(), channel, deliveries, true, id);
-    }
+    broker->acknowledge(shared_from_this(), channel,
+                        [this, channel]() { return allUnacked(channel); }, true, id);
     broker->removeChannel(shared_from_this(), channel, id);
     std::lock_guard<std::mutex> lock(stateMutex);
     channels.erase(channel);
@@ -231,7 +230,13 @@ bool Connection::handshake() {
     }
     Writer servers;
     servers.u8(0).u8(9);
-    servers.table(nullptr);
+    auto serverProperties = std::make_shared<FieldTable>();
+    auto capabilities = std::make_shared<FieldTable>();
+    capabilities->emplace("publisher_confirms", true);
+    capabilities->emplace("basic.nack", true);
+    serverProperties->emplace("capabilities", capabilities);
+    serverProperties->emplace("product", std::string("FlowMQ"));
+    servers.table(serverProperties);
     servers.longString("PLAIN EXTERNAL");
     servers.longString("en_US");
     if (!sendMethod(CLASS_CONNECTION, 10, servers.data(), 0)) {
@@ -504,6 +509,18 @@ void Connection::handleMethod(const Method& method, uint16_t channel) {
             handleQueue(method, channel);
         } else if (method.classID == CLASS_BASIC) {
             handleBasic(method, channel);
+        } else if (method.classID == CLASS_CONFIRM) {
+            {
+                std::lock_guard<std::mutex> lock(stateMutex);
+                (void)requireChannel(channel, method.classID, method.methodID);
+            }
+            handleConfirm(method, channel);
+        } else if (method.classID == CLASS_TX) {
+            {
+                std::lock_guard<std::mutex> lock(stateMutex);
+                (void)requireChannel(channel, method.classID, method.methodID);
+            }
+            handleTX(method, channel);
         } else {
             throw ChannelError(NOT_IMPLEMENTED, "unsupported method", method.classID,
                                method.methodID);
@@ -534,10 +551,8 @@ void Connection::failChannel(uint16_t channel, const ChannelError& error) {
         closeDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         pendingPublishes.erase(channel);
     }
-    auto deliveries = allUnacked(channel);
-    if (!deliveries.empty()) {
-        broker->acknowledge(shared_from_this(), channel, deliveries, true, id);
-    }
+    broker->acknowledge(shared_from_this(), channel,
+                        [this, channel]() { return allUnacked(channel); }, true, id);
     broker->removeChannel(shared_from_this(), channel, id);
     std::lock_guard<std::mutex> lock(stateMutex);
     channels.erase(channel);
@@ -812,9 +827,9 @@ void Connection::handleQueue(const Method& method, uint16_t channel) {
         std::string exchange = reader.shortString();
         std::string routingKey = reader.shortString();
         bool noWait = bit(reader, "no-wait");
-        (void)reader.table();
+        auto arguments = reader.table();
         reader.requireEnd();
-        broker->bindQueue(queue, exchange, routingKey, id);
+        broker->bindQueue(queue, exchange, routingKey, id, Writer{}.table(arguments).data());
         if (!noWait && !sendMethod(CLASS_QUEUE, 21, {}, channel)) close();
         return;
     }
@@ -844,9 +859,9 @@ void Connection::handleQueue(const Method& method, uint16_t channel) {
         std::string queue = reader.shortString();
         std::string exchange = reader.shortString();
         std::string routingKey = reader.shortString();
-        (void)reader.table();
+        auto arguments = reader.table();
         reader.requireEnd();
-        broker->unbindQueue(queue, exchange, routingKey);
+        broker->unbindQueue(queue, exchange, routingKey, Writer{}.table(arguments).data());
         if (!sendMethod(CLASS_QUEUE, 51, {}, channel)) close();
         return;
     }
@@ -957,14 +972,13 @@ void Connection::handleBasic(const Method& method, uint16_t channel) {
         bool noAck = bit(reader, "no-ack");
         reader.requireEnd();
         checkReadPermission(queue, channel, CLASS_BASIC, method.methodID);
-        std::shared_ptr<Message> message = broker->get(queue, id, noAck);
+        uint64_t deliveryTag = 0;
+        auto message = broker->get(queue, id, noAck, [&](const auto& item) {
+            deliveryTag = reserveDelivery(channel, queue, item, "", !noAck, false);
+            return deliveryTag;
+        });
         if (!message) {
             if (!sendMethod(CLASS_BASIC, 72, Writer{}.shortString("").data(), channel)) close();
-            return;
-        }
-        uint64_t deliveryTag = reserveDelivery(channel, queue, message, "", !noAck, false);
-        if (deliveryTag == 0) {
-            broker->requeue(Delivery{queue, message});
             return;
         }
         Writer response;
@@ -978,26 +992,24 @@ void Connection::handleBasic(const Method& method, uint16_t channel) {
         uint64_t tag = reader.u64();
         bool multiple = bit(reader, "multiple");
         reader.requireEnd();
-        auto deliveries = takeUnacked(channel, tag, multiple);
-        broker->acknowledge(shared_from_this(), channel, deliveries, false, id);
+        handleAcknowledgement(channel, tag, multiple, false);
         return;
     }
     case 90: {
         uint64_t tag = reader.u64();
         bool requeue = bit(reader, "requeue");
         reader.requireEnd();
-        auto deliveries = takeUnacked(channel, tag, false);
-        broker->acknowledge(shared_from_this(), channel, deliveries, requeue, id);
+        handleAcknowledgement(channel, tag, false, requeue);
         return;
     }
     case 110: {
         bool requeue = bit(reader, "requeue");
         reader.requireEnd();
-        auto deliveries = allUnacked(channel);
         // basic.recover-ok: acknowledge the synchronous command before any
         // redeliveries produced by recovery (Errata 28).
         if (!sendMethod(CLASS_BASIC, 111, {}, channel)) close();
-        broker->recover(shared_from_this(), channel, deliveries, requeue, id);
+        broker->recover(shared_from_this(), channel,
+                        [this, channel]() { return allUnacked(channel); }, requeue, id);
         return;
     }
     case 120: {
@@ -1006,8 +1018,7 @@ void Connection::handleBasic(const Method& method, uint16_t channel) {
         bool multiple = flag(flags, 1);
         bool requeue = flag(flags, 0);
         reader.requireEnd();
-        auto deliveries = takeUnacked(channel, tag, multiple);
-        broker->acknowledge(shared_from_this(), channel, deliveries, requeue, id);
+        handleAcknowledgement(channel, tag, multiple, requeue);
         return;
     }
     default:
@@ -1055,6 +1066,7 @@ void Connection::handleHeader(const Frame& frame) {
         pending->second.bodySize = bodySize;
         pending->second.received = 0;
         pending->second.message.properties = std::move(properties);
+        pending->second.message.headers = std::move(parsed.headers);
         pending->second.message.body.reserve(static_cast<size_t>(bodySize));
         pending->second.message.expires = parsed.expiration.has_value();
         if (parsed.expiration) pending->second.message.deadline = *parsed.expiration;
@@ -1105,29 +1117,184 @@ void Connection::completePublish(uint16_t channel, PendingPublish& pending) {
     message.routingKey = pending.routingKey;
     message.publisherConnectionID = id;
     checkWritePermission(message.routingKey, channel, CLASS_BASIC, 40);
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        Channel& state = requireChannel(channel, CLASS_BASIC, 40);
+        if (state.transactional) {
+            state.transactionPublishes.push_back(StagedPublish{std::move(message),
+                                                               pending.mandatory,
+                                                               pending.immediate});
+            return;
+        }
+    }
+    (void)publishNow(channel, message, pending.mandatory, pending.immediate, 0);
+}
+
+bool Connection::sendReturn(uint16_t channel, uint16_t code, const std::string& text,
+                            const Message& message) {
+    Writer arguments;
+    arguments.u16(code).shortString(text).shortString(message.exchange)
+            .shortString(message.routingKey);
+    return sendContent(channel, CLASS_BASIC, 50, arguments.data(), message);
+}
+
+bool Connection::publishNow(uint16_t channel, Message& message, bool mandatory,
+                            bool immediate, uint64_t confirmSequence) {
+    if (confirmSequence == 0) {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        Channel& state = requireChannel(channel, CLASS_BASIC, 40);
+        if (state.confirm) confirmSequence = state.nextPublishSequence++;
+    }
     PublishResult result;
     try {
-        result = broker->publish(message, user, pending.mandatory,
-                                 pending.immediate, id);
+        result = broker->publish(message, user, mandatory, immediate, id,
+                                 confirmSequence != 0);
     } catch (const BrokerError& error) {
         failChannel(channel, ChannelError(error.code, error.what(), CLASS_BASIC, 40));
-        return;
+        return false;
     }
     MQTT::logDebug("AMQP publish channel=%u exchange=%s key=%s bytes=%zu routed=%d",
                    channel, message.exchange.c_str(), message.routingKey.c_str(),
                    message.body.size(), result.routed ? 1 : 0);
     // basic.return and §1.1: mandatory unroutable content uses 312 NO_ROUTE
     // (Errata 17); immediate content without a consumer uses 313 NO_CONSUMERS.
-    if (pending.mandatory && !result.routed) {
-        Writer arguments;
-        arguments.u16(REPLY_NO_ROUTE).shortString("NO_ROUTE").shortString(message.exchange)
-                .shortString(message.routingKey);
-        if (!sendContent(channel, CLASS_BASIC, 50, arguments.data(), message)) close();
-    } else if (pending.immediate && result.immediateDeliveries == 0) {
-        Writer arguments;
-        arguments.u16(REPLY_NO_CONSUMERS).shortString("NO_CONSUMERS").shortString(message.exchange)
-                .shortString(message.routingKey);
-        if (!sendContent(channel, CLASS_BASIC, 50, arguments.data(), message)) close();
+    if (mandatory && !result.routed) {
+        if (!sendReturn(channel, REPLY_NO_ROUTE, "NO_ROUTE", message)) return false;
+    } else if (immediate && result.immediateDeliveries == 0) {
+        if (!sendReturn(channel, REPLY_NO_CONSUMERS, "NO_CONSUMERS", message)) return false;
+    }
+    if (confirmSequence != 0) {
+        Writer acknowledgement;
+        acknowledgement.u64(confirmSequence).bits(0);
+        if (!sendMethod(CLASS_BASIC, 80, acknowledgement.data(), channel)) return false;
+    }
+    return true;
+}
+
+void Connection::handleConfirm(const Method& method, uint16_t channel) {
+    Reader reader(method.arguments);
+    if (method.methodID != 10) {
+        throw ChannelError(NOT_IMPLEMENTED, "unsupported confirm method", CLASS_CONFIRM,
+                           method.methodID);
+    }
+    bool noWait = bit(reader, "no-wait");
+    reader.requireEnd();
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        Channel& state = requireChannel(channel, CLASS_CONFIRM, method.methodID);
+        if (state.confirm || state.transactional) {
+            throw ChannelError(PRECONDITION_FAILED,
+                               "publisher confirms and transactions are mutually exclusive",
+                               CLASS_CONFIRM, method.methodID);
+        }
+        state.confirm = true;
+    }
+    if (!noWait && !sendMethod(CLASS_CONFIRM, 11, {}, channel)) close();
+}
+
+void Connection::handleTX(const Method& method, uint16_t channel) {
+    // tx class: publications and acknowledgements are batched; servers SHOULD
+    // provide single-queue atomicity, while multi-queue atomicity is not guaranteed.
+    Reader reader(method.arguments);
+    switch (method.methodID) {
+    case 10: {
+        reader.requireEnd();
+        {
+            std::lock_guard<std::mutex> lock(stateMutex);
+            Channel& state = requireChannel(channel, CLASS_TX, method.methodID);
+            if (state.transactional || state.confirm) {
+                throw ChannelError(PRECONDITION_FAILED,
+                                   "publisher confirms and transactions are mutually exclusive",
+                                   CLASS_TX, method.methodID);
+            }
+            state.transactional = true;
+        }
+        if (!sendMethod(CLASS_TX, 11, {}, channel)) close();
+        return;
+    }
+    case 20: {
+        reader.requireEnd();
+        std::vector<StagedPublish> publishes;
+        std::vector<TransactionAck> acknowledgements;
+        {
+            std::lock_guard<std::mutex> lock(stateMutex);
+            Channel& state = requireChannel(channel, CLASS_TX, method.methodID);
+            if (!state.transactional) {
+                // tx.commit.transacted: Commit on a non-transacted channel is
+                // a channel precondition failure.
+                throw ChannelError(PRECONDITION_FAILED, "channel is not transacted",
+                                   CLASS_TX, method.methodID);
+            }
+            publishes.swap(state.transactionPublishes);
+            acknowledgements.reserve(state.transactionAcks.size());
+            for (auto& [tag, acknowledgement] : state.transactionAcks) {
+                (void)tag;
+                acknowledgements.push_back(std::move(acknowledgement));
+            }
+            state.transactionAcks.clear();
+        }
+        for (auto& publish : publishes) {
+            if (!publishNow(channel, publish.message, publish.mandatory, publish.immediate, 0)) {
+                return;
+            }
+        }
+        for (const auto& acknowledgement : acknowledgements) {
+            const uint64_t tag = acknowledgement.delivery.deliveryTag;
+            broker->acknowledge(shared_from_this(), channel, [this, channel, tag]() {
+                auto delivery = discardDelivery(channel, tag);
+                return delivery ? std::vector<Delivery>{*delivery} : std::vector<Delivery>{};
+            }, acknowledgement.requeue, id);
+        }
+        if (!broker->flush()) {
+            failChannel(channel, ChannelError(RESOURCE_ERROR, "failed to persist transaction",
+                                              CLASS_TX, method.methodID));
+            return;
+        }
+        if (!sendMethod(CLASS_TX, 21, {}, channel)) close();
+        return;
+    }
+    case 30: {
+        reader.requireEnd();
+        {
+            std::lock_guard<std::mutex> lock(stateMutex);
+            Channel& state = requireChannel(channel, CLASS_TX, method.methodID);
+            if (!state.transactional) {
+                // tx.rollback.transacted: Rollback on a non-transacted channel
+                // is a channel precondition failure.
+                throw ChannelError(PRECONDITION_FAILED, "channel is not transacted",
+                                   CLASS_TX, method.methodID);
+            }
+            // tx.rollback: abandoning an ack does not redeliver its message.
+            state.transactionPublishes.clear();
+            state.transactionAcks.clear();
+        }
+        if (!sendMethod(CLASS_TX, 31, {}, channel)) close();
+        return;
+    }
+    default:
+        throw ChannelError(NOT_IMPLEMENTED, "unsupported tx method", CLASS_TX, method.methodID);
+    }
+}
+
+void Connection::handleAcknowledgement(uint16_t channel, uint64_t tag, bool multiple,
+                                       bool requeue) {
+    bool transactional = false;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        Channel& state = requireChannel(channel, CLASS_BASIC, 80);
+        transactional = state.transactional;
+    }
+    if (!transactional) {
+        broker->acknowledge(shared_from_this(), channel, [this, channel, tag, multiple]() {
+            return takeUnacked(channel, tag, multiple);
+        }, requeue, id);
+        return;
+    }
+    auto deliveries = peekUnacked(channel, tag, multiple);
+    std::lock_guard<std::mutex> lock(stateMutex);
+    Channel& state = requireChannel(channel, CLASS_BASIC, 80);
+    for (const Delivery& delivery : deliveries) {
+        state.transactionAcks[delivery.deliveryTag] = TransactionAck{delivery, requeue};
     }
 }
 
@@ -1180,7 +1347,7 @@ uint64_t Connection::reserveDelivery(uint16_t channel, const std::string& queue,
     }
     uint64_t tag = state.nextDeliveryTag++;
     if (track) {
-        state.unacked[tag] = Delivery{queue, message, consumerTag};
+        state.unacked[tag] = Delivery{queue, message, consumerTag, tag};
         state.unackedBytes += message->body.size();
         if (!consumerTag.empty()) {
             ++state.consumerUnacked[consumerTag];
@@ -1279,6 +1446,39 @@ std::vector<Delivery> Connection::takeUnacked(uint16_t channel, uint64_t tag,
     return result;
 }
 
+std::vector<Delivery> Connection::peekUnacked(uint16_t channel, uint64_t tag,
+                                               bool multiple) const {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    auto channelIt = channels.find(channel);
+    if (channelIt == channels.end()) {
+        throw ChannelError(NOT_FOUND, "unknown channel", CLASS_BASIC, 80);
+    }
+    const Channel& state = channelIt->second;
+    auto exact = state.unacked.find(tag);
+    if (exact == state.unacked.end()) {
+        throw ChannelError(PRECONDITION_FAILED, "unknown delivery tag", CLASS_BASIC, 80);
+    }
+    std::vector<Delivery> result;
+    auto end = multiple ? state.unacked.upper_bound(tag) : std::next(exact);
+    for (auto it = multiple ? state.unacked.begin() : exact; it != end; ++it) {
+        result.push_back(it->second);
+    }
+    return result;
+}
+
+std::vector<Delivery> Connection::snapshotUnacked() const {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    std::vector<Delivery> result;
+    for (const auto& [channelID, state] : channels) {
+        (void)channelID;
+        for (const auto& [tag, delivery] : state.unacked) {
+            (void)tag;
+            result.push_back(delivery);
+        }
+    }
+    return result;
+}
+
 std::vector<Delivery> Connection::allUnacked(uint16_t channel) {
     std::lock_guard<std::mutex> lock(stateMutex);
     auto it = channels.find(channel);
@@ -1307,11 +1507,9 @@ std::vector<Delivery> Connection::allUnacked() {
 
 void Connection::cleanup() {
     if (cleaned.exchange(true)) return;
-    auto deliveries = allUnacked();
     if (broker && id != 0) {
-        if (!deliveries.empty()) {
-            broker->acknowledge(shared_from_this(), 0, deliveries, true, id);
-        }
+        broker->acknowledge(shared_from_this(), 0, [this]() { return allUnacked(); },
+                            true, id);
         std::vector<uint16_t> channelIDs;
         {
             std::lock_guard<std::mutex> lock(stateMutex);

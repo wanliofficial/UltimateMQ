@@ -1,9 +1,11 @@
 #include "AMQPBroker.h"
 #include "AMQPConnection.h"
+#include "AMQPStore.h"
 #include <algorithm>
 #include <charconv>
 #include <functional>
 #include <limits>
+#include <type_traits>
 
 namespace AMQP {
 namespace {
@@ -11,16 +13,29 @@ constexpr uint16_t ACCESS_REFUSED = 403;
 constexpr uint16_t NOT_FOUND = 404;
 constexpr uint16_t RESOURCE_LOCKED = 405;
 constexpr uint16_t PRECONDITION_FAILED = 406;
+constexpr uint16_t RESOURCE_ERROR = 506;
 constexpr uint16_t NOT_IMPLEMENTED = 540;
+
+bool emptyArguments(const std::vector<uint8_t>& arguments) {
+    return arguments.empty() ||
+           (arguments.size() == 4 && std::all_of(arguments.begin(), arguments.end(),
+                                                   [](uint8_t byte) { return byte == 0; }));
+}
 } // namespace
 
 Broker::Broker(MQTT::Auth* authHandle, size_t maxQueuesValue,
-               size_t maxMessageBytesValue)
-    : auth(authHandle), maxQueues(maxQueuesValue), maxMessageBytes(maxMessageBytesValue) {
+               size_t maxMessageBytesValue, Store* persistence)
+    : auth(authHandle), store(persistence), maxQueues(maxQueuesValue),
+      maxMessageBytes(maxMessageBytesValue) {
     exchanges.emplace("", Exchange{"", "direct", true, false, false, false});
     exchanges.emplace("amq.direct", Exchange{"amq.direct", "direct", true, false, false, false});
     exchanges.emplace("amq.fanout", Exchange{"amq.fanout", "fanout", true, false, false, false});
     exchanges.emplace("amq.topic", Exchange{"amq.topic", "topic", true, false, false, false});
+    exchanges.emplace("amq.headers", Exchange{"amq.headers", "headers", true, false, false, false});
+}
+
+void Broker::markDirtyLocked() {
+    if (store) store->markDirty();
 }
 
 bool Broker::authenticate(const std::string& username, const std::string& password) const {
@@ -77,6 +92,7 @@ void Broker::unregisterConnection(uint64_t connectionID) {
         }
     }
     maybeAutoDeleteExchangesLocked();
+    markDirtyLocked();
 }
 
 void Broker::declareExchange(const std::string& name, const std::string& type,
@@ -90,7 +106,8 @@ void Broker::declareExchange(const std::string& name, const std::string& type,
         }
         if (!passive && (builtin->second.type != type || builtin->second.durable != durable ||
                          builtin->second.internal != internal ||
-                         builtin->second.arguments != arguments)) {
+                         !emptyArguments(builtin->second.arguments) ||
+                         !emptyArguments(arguments))) {
             throw BrokerError(PRECONDITION_FAILED, "built-in exchange declaration mismatch");
         }
         return;
@@ -116,7 +133,7 @@ void Broker::declareExchange(const std::string& name, const std::string& type,
     if (type.empty()) {
         throw BrokerError(PRECONDITION_FAILED, "exchange type is empty");
     }
-    if (type != "direct" && type != "fanout" && type != "topic") {
+    if (type != "direct" && type != "fanout" && type != "topic" && type != "headers") {
         throw BrokerError(NOT_IMPLEMENTED, "unsupported exchange type");
     }
     if (exchanges.size() >= maxQueues) {
@@ -124,6 +141,7 @@ void Broker::declareExchange(const std::string& name, const std::string& type,
     }
     exchanges.emplace(name, Exchange{name, type, durable, autoDelete, internal, false,
                                      arguments});
+    markDirtyLocked();
 }
 
 void Broker::deleteExchange(const std::string& name, bool ifUnused, uint64_t) {
@@ -144,6 +162,7 @@ void Broker::deleteExchange(const std::string& name, bool ifUnused, uint64_t) {
                                   [&](const Binding& binding) { return binding.exchange == name; }),
                    bindings.end());
     exchanges.erase(it);
+    markDirtyLocked();
 }
 
 std::string Broker::declareQueue(const std::string& requestedName, bool passive,
@@ -182,11 +201,13 @@ std::string Broker::declareQueue(const std::string& requestedName, bool passive,
     }
     queues.emplace(name, Queue{name, durable, autoDelete, exclusive, connectionID,
                                false, 0, {}, arguments});
+    markDirtyLocked();
     return name;
 }
 
 void Broker::bindQueue(const std::string& queueName, const std::string& exchangeName,
-                       const std::string& routingKey, uint64_t connectionID) {
+                       const std::string& routingKey, uint64_t connectionID,
+                       const std::vector<uint8_t>& arguments) {
     std::lock_guard<std::mutex> lock(mutex);
     authorizeQueueReadLocked(queueName, connectionID);
     auto queue = queues.find(queueName);
@@ -200,26 +221,43 @@ void Broker::bindQueue(const std::string& queueName, const std::string& exchange
     if (queue->second.exclusive && queue->second.ownerConnectionID != connectionID) {
         throw BrokerError(RESOURCE_LOCKED, "exclusive queue belongs to another connection");
     }
-    Binding binding{exchangeName, queueName, routingKey};
+    auto table = std::make_shared<FieldTable>();
+    if (!arguments.empty()) {
+        Reader reader(arguments);
+        table = reader.table();
+        reader.requireEnd();
+    }
+    // RabbitMQ headers-exchange extension: x-match is "all" or "any"; other
+    // keys are matched against the Basic.Properties headers table.
+    if (exchange->second.type == "headers") {
+        auto match = table->find("x-match");
+        if (match == table->end() || !std::holds_alternative<std::string>(match->second) ||
+            (std::get<std::string>(match->second) != "all" &&
+             std::get<std::string>(match->second) != "any")) {
+            throw BrokerError(PRECONDITION_FAILED, "headers binding requires x-match all or any");
+        }
+    }
+    Binding binding{exchangeName, queueName, routingKey, arguments, std::move(table)};
     if (std::find(bindings.begin(), bindings.end(), binding) == bindings.end()) {
         bindings.push_back(std::move(binding));
         exchange->second.wasBound = true;
+        markDirtyLocked();
     }
 }
 
 void Broker::unbindQueue(const std::string& queue, const std::string& exchange,
-                         const std::string& routingKey) {
+                         const std::string& routingKey,
+                         const std::vector<uint8_t>& arguments) {
     std::lock_guard<std::mutex> lock(mutex);
     if (queues.find(queue) == queues.end() || exchanges.find(exchange) == exchanges.end()) {
         throw BrokerError(NOT_FOUND, "queue or exchange not found");
     }
-    Binding binding{exchange, queue, routingKey};
+    Binding binding{exchange, queue, routingKey, arguments, nullptr};
+    size_t before = bindings.size();
     bindings.erase(std::remove_if(bindings.begin(), bindings.end(),
-                                  [&](const Binding& item) { return item.exchange == binding.exchange &&
-                                                                   item.queue == binding.queue &&
-                                                                   item.routingKey == binding.routingKey; }),
+                                  [&](const Binding& item) { return item == binding; }),
                    bindings.end());
-    auto exchangeIt = exchanges.find(exchange);
+    if (bindings.size() != before) markDirtyLocked();
     maybeAutoDeleteExchangesLocked();
 }
 
@@ -234,6 +272,7 @@ size_t Broker::purgeQueue(const std::string& name, uint64_t connectionID) {
     }
     size_t count = it->second.messages.size();
     it->second.messages.clear();
+    markDirtyLocked();
     return count;
 }
 
@@ -292,6 +331,7 @@ size_t Broker::deleteQueue(const std::string& name, bool ifUnused, bool ifEmpty,
     eraseConsumersLocked(name);
     maybeAutoDeleteExchangesLocked();
     queues.erase(it);
+    markDirtyLocked();
     return count;
 }
 
@@ -359,6 +399,41 @@ void Broker::removeChannel(const std::shared_ptr<Connection>& connection,
     }
 }
 
+bool Broker::fieldValueEquals(const FieldValue& left, const FieldValue& right) {
+    if (left.index() != right.index()) return false;
+    if (std::holds_alternative<std::monostate>(left)) return true;
+    if (std::holds_alternative<std::shared_ptr<FieldArray>>(left)) {
+        const auto& leftArray = std::get<std::shared_ptr<FieldArray>>(left);
+        const auto& rightArray = std::get<std::shared_ptr<FieldArray>>(right);
+        if (!leftArray || !rightArray) return leftArray == rightArray;
+        if (leftArray->size() != rightArray->size()) return false;
+        for (size_t index = 0; index < leftArray->size(); ++index) {
+            if (!fieldValueEquals((*leftArray)[index], (*rightArray)[index])) return false;
+        }
+        return true;
+    }
+    if (std::holds_alternative<std::shared_ptr<FieldTable>>(left)) {
+        const auto& leftTable = std::get<std::shared_ptr<FieldTable>>(left);
+        const auto& rightTable = std::get<std::shared_ptr<FieldTable>>(right);
+        if (!leftTable || !rightTable) return leftTable == rightTable;
+        if (leftTable->size() != rightTable->size()) return false;
+        for (const auto& [key, value] : *leftTable) {
+            auto other = rightTable->find(key);
+            if (other == rightTable->end() || !fieldValueEquals(value, other->second)) return false;
+        }
+        return true;
+    }
+    return std::visit([](const auto& leftValue, const auto& rightValue) {
+        using Left = std::decay_t<decltype(leftValue)>;
+        using Right = std::decay_t<decltype(rightValue)>;
+        if constexpr (std::is_same_v<Left, Right>) {
+            return leftValue == rightValue;
+        } else {
+            return false;
+        }
+    }, left, right);
+}
+
 bool Broker::matches(const Exchange& exchange, const Binding& binding,
                      const Message& message) {
     if (exchange.type == "fanout") {
@@ -366,6 +441,35 @@ bool Broker::matches(const Exchange& exchange, const Binding& binding,
     }
     if (exchange.type == "direct") {
         return binding.routingKey == message.routingKey;
+    }
+    if (exchange.type == "headers") {
+        if (!binding.headerArguments) return false;
+        auto match = binding.headerArguments->find("x-match");
+        if (match == binding.headerArguments->end() ||
+            !std::holds_alternative<std::string>(match->second)) {
+            return false;
+        }
+        bool any = std::get<std::string>(match->second) == "any";
+        bool matched = false;
+        for (const auto& [key, expected] : *binding.headerArguments) {
+            if (key == "x-match") continue;
+            if (!message.headers) {
+                if (!any) return false;
+                continue;
+            }
+            auto actual = message.headers->find(key);
+            if (actual == message.headers->end()) {
+                if (!any) return false;
+                continue;
+            }
+            if (fieldValueEquals(expected, actual->second)) {
+                matched = true;
+                if (any) return true;
+            } else if (!any) {
+                return false;
+            }
+        }
+        return any ? matched : true;
     }
     return exchange.type == "topic" && topicMatches(binding.routingKey, message.routingKey);
 }
@@ -433,7 +537,7 @@ void Broker::requeueLocked(const Delivery& delivery) {
 
 PublishResult Broker::publish(const Message& input, const std::string& username,
                               bool mandatory, bool immediate,
-                              uint64_t connectionID) {
+                              uint64_t connectionID, bool synchronize) {
     (void)mandatory;
     if (input.body.size() > maxMessageBytes) {
         throw BrokerError(RESOURCE_LOCKED, "message exceeds broker limit");
@@ -453,21 +557,33 @@ PublishResult Broker::publish(const Message& input, const std::string& username,
     auto message = std::make_shared<Message>(input);
     PublishResult result;
     std::set<std::string> routed;
+    bool durableRouted = false;
     if (input.exchange.empty()) {
         auto queue = queues.find(input.routingKey);
         if (queue != queues.end()) {
             queue->second.messages.push_back(message);
             routed.insert(queue->first);
+            durableRouted = queue->second.durable;
         }
     } else {
         for (const auto& binding : bindings) {
             if (binding.exchange == input.exchange &&
                 matches(exchangeIt->second, binding, *message) &&
                 queues.count(binding.queue)) {
-                queues.at(binding.queue).messages.push_back(message);
+                auto& queue = queues.at(binding.queue);
+                queue.messages.push_back(message);
                 routed.insert(binding.queue);
+                durableRouted = durableRouted || queue.durable;
             }
         }
+    }
+    if (!routed.empty()) markDirtyLocked();
+    if (synchronize && durableRouted) {
+        lock.unlock();
+        if (!flush()) {
+            throw BrokerError(RESOURCE_ERROR, "failed to persist published message");
+        }
+        lock.lock();
     }
     result.routed = !routed.empty();
     std::vector<Task> tasks;
@@ -554,8 +670,9 @@ void Broker::dispatch() {
     sendTasks(tasks);
 }
 
-std::shared_ptr<Message> Broker::get(const std::string& queueName,
-                                     uint64_t connectionID, bool) {
+std::shared_ptr<Message> Broker::get(
+    const std::string& queueName, uint64_t connectionID, bool noAck,
+    const std::function<uint64_t(const std::shared_ptr<Message>&)>& reserve) {
     std::lock_guard<std::mutex> lock(mutex);
     auto it = queues.find(queueName);
     if (it == queues.end()) {
@@ -567,27 +684,35 @@ std::shared_ptr<Message> Broker::get(const std::string& queueName,
     }
     while (!it->second.messages.empty()) {
         auto message = it->second.messages.front();
-        it->second.messages.pop_front();
-        if (!expired(message)) {
-            return message;
+        if (expired(message)) {
+            it->second.messages.pop_front();
+            continue;
         }
+        if (reserve && reserve(message) == 0) return nullptr;
+        it->second.messages.pop_front();
+        markDirtyLocked();
+        return message;
     }
     return nullptr;
 }
 
 void Broker::acknowledge(const std::shared_ptr<Connection>& connection,
-                         uint16_t channel, const std::vector<Delivery>& deliveries,
+                         uint16_t channel,
+                         const std::function<std::vector<Delivery>()>& extractDeliveries,
                          bool requeue, uint64_t connectionID) {
     (void)connection;
     (void)channel;
     (void)connectionID;
     std::unique_lock<std::mutex> dispatch(dispatchMutex);
     std::unique_lock<std::mutex> lock(mutex);
+    const auto deliveries = extractDeliveries();
+    if (deliveries.empty()) return;
     for (const auto& delivery : deliveries) {
         if (requeue) {
             requeueLocked(delivery);
         }
     }
+    markDirtyLocked();
     auto tasks = dispatchLocked();
     lock.unlock();
     dispatch.unlock();
@@ -595,16 +720,19 @@ void Broker::acknowledge(const std::shared_ptr<Connection>& connection,
 }
 
 void Broker::recover(const std::shared_ptr<Connection>& connection,
-                     uint16_t channel, const std::vector<Delivery>& deliveries,
+                     uint16_t channel,
+                     const std::function<std::vector<Delivery>()>& extractDeliveries,
                      bool requeue, uint64_t connectionID) {
     (void)channel;
     if (requeue) {
-        acknowledge(connection, 0, deliveries, true, connectionID);
+        acknowledge(connection, 0, extractDeliveries, true, connectionID);
         return;
     }
     std::unique_lock<std::mutex> dispatch(dispatchMutex);
     std::unique_lock<std::mutex> lock(mutex);
+    const auto deliveries = extractDeliveries();
     std::vector<Task> tasks;
+    if (!deliveries.empty()) markDirtyLocked();
     for (const auto& delivery : deliveries) {
         bool redelivered = false;
         for (const auto& entry : consumers) {
@@ -638,6 +766,134 @@ void Broker::recover(const std::shared_ptr<Connection>& connection,
 void Broker::requeue(const Delivery& delivery) {
     std::lock_guard<std::mutex> lock(mutex);
     requeueLocked(delivery);
+    markDirtyLocked();
+}
+
+void Broker::requeueFailedDelivery(const std::shared_ptr<Connection>& connection,
+                                   uint16_t channel, uint64_t deliveryTag) {
+    std::lock_guard<std::mutex> lock(mutex);
+    auto delivery = connection->discardDelivery(channel, deliveryTag);
+    if (!delivery) return;
+    requeueLocked(*delivery);
+    markDirtyLocked();
+}
+
+bool Broker::flush() {
+    return !store || store->flushNow([this]() { return snapshotState(); });
+}
+
+PersistedState Broker::snapshotState() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    PersistedState state;
+    state.nextQueueID = nextQueueID.load();
+    for (const auto& [name, exchange] : exchanges) {
+        if (!exchange.durable || name.empty() || name.rfind("amq.", 0) == 0) continue;
+        state.exchanges.push_back(PersistedExchange{name, exchange.type, exchange.durable,
+                                                    exchange.autoDelete, exchange.internal,
+                                                    exchange.arguments});
+    }
+    std::map<std::string, std::vector<Delivery>> unacked;
+    for (const auto& [connectionID, weak] : connections) {
+        (void)connectionID;
+        auto connection = weak.lock();
+        if (!connection) continue;
+        for (const Delivery& delivery : connection->snapshotUnacked()) {
+            unacked[delivery.queue].push_back(delivery);
+        }
+    }
+    auto remaining = [](const std::shared_ptr<Message>& message) -> int64_t {
+        if (!message->expires) return -1;
+        auto left = message->deadline - std::chrono::steady_clock::now();
+        if (left <= std::chrono::steady_clock::duration::zero()) return 0;
+        auto seconds = std::chrono::duration_cast<std::chrono::seconds>(left);
+        if (seconds < left) ++seconds;
+        return seconds.count();
+    };
+    for (const auto& [name, queue] : queues) {
+        if (!queue.durable || queue.exclusive) continue;
+        PersistedQueue stored{name, queue.durable, queue.autoDelete, queue.arguments, {}};
+        for (const Delivery& delivery : unacked[name]) {
+            if (!expired(delivery.message)) {
+                stored.messages.push_back(PersistedMessage{*delivery.message,
+                                                           remaining(delivery.message), true});
+            }
+        }
+        for (const auto& message : queue.messages) {
+            if (!expired(message)) {
+                stored.messages.push_back(PersistedMessage{*message, remaining(message), false});
+            }
+        }
+        state.queues.push_back(std::move(stored));
+    }
+    for (const auto& binding : bindings) {
+        auto queue = queues.find(binding.queue);
+        auto exchange = exchanges.find(binding.exchange);
+        if (queue == queues.end() || exchange == exchanges.end() || !queue->second.durable ||
+            queue->second.exclusive || !exchange->second.durable) {
+            continue;
+        }
+        state.bindings.push_back(PersistedBinding{binding.exchange, binding.queue,
+                                                  binding.routingKey, binding.arguments});
+    }
+    return state;
+}
+
+void Broker::restoreState(const PersistedState& state) {
+    std::lock_guard<std::mutex> lock(mutex);
+    exchanges.clear();
+    exchanges.emplace("", Exchange{"", "direct", true, false, false, false});
+    exchanges.emplace("amq.direct", Exchange{"amq.direct", "direct", true, false, false, false});
+    exchanges.emplace("amq.fanout", Exchange{"amq.fanout", "fanout", true, false, false, false});
+    exchanges.emplace("amq.topic", Exchange{"amq.topic", "topic", true, false, false, false});
+    exchanges.emplace("amq.headers", Exchange{"amq.headers", "headers", true, false, false, false});
+    queues.clear();
+    bindings.clear();
+    for (const auto& stored : state.exchanges) {
+        if (!stored.durable || stored.name.empty() || stored.name.rfind("amq.", 0) == 0) continue;
+        if (stored.type != "direct" && stored.type != "fanout" && stored.type != "topic" &&
+            stored.type != "headers") {
+            throw std::runtime_error("invalid persisted AMQP exchange type");
+        }
+        exchanges.emplace(stored.name,
+                          Exchange{stored.name, stored.type, stored.durable, stored.autoDelete,
+                                   stored.internal, false, stored.arguments});
+    }
+    auto now = std::chrono::steady_clock::now();
+    for (const auto& stored : state.queues) {
+        if (!stored.durable) continue;
+        Queue queue{stored.name, stored.durable, stored.autoDelete, false, 0,
+                    false, 0, {}, stored.arguments};
+        for (const auto& item : stored.messages) {
+            auto message = std::make_shared<Message>(item.message);
+            message->publisherConnectionID = 0;
+            if (item.unacked) message->redelivered = true;
+            if (message->expires) {
+                if (item.expiryRemainingSeconds < 0) {
+                    throw std::runtime_error("invalid persisted AMQP message expiration");
+                }
+                message->deadline = now + std::chrono::seconds(item.expiryRemainingSeconds);
+            }
+            queue.messages.push_back(std::move(message));
+        }
+        queues.emplace(stored.name, std::move(queue));
+    }
+    for (const auto& stored : state.bindings) {
+        auto queue = queues.find(stored.queue);
+        auto exchange = exchanges.find(stored.exchange);
+        if (queue == queues.end() || exchange == exchanges.end()) {
+            throw std::runtime_error("invalid persisted AMQP binding reference");
+        }
+        auto table = std::make_shared<FieldTable>();
+        if (!stored.arguments.empty()) {
+            Reader reader(stored.arguments);
+            table = reader.table();
+            reader.requireEnd();
+        }
+        bindings.push_back(Binding{stored.exchange, stored.queue, stored.routingKey,
+                                   stored.arguments, std::move(table)});
+        exchange->second.wasBound = true;
+    }
+    nextQueueID.store(std::max<uint64_t>(state.nextQueueID, 1));
 }
 
 std::vector<Broker::Task> Broker::dispatchLocked() {
@@ -685,6 +941,7 @@ std::vector<Broker::Task> Broker::dispatchLocked() {
                 queue.messages.pop_front();
                 tasks.push_back(Task{connection, selected.channel, selected.tag,
                                      item, tag, selected.noAck});
+                markDirtyLocked();
                 progress = true;
             }
         }
@@ -697,9 +954,7 @@ void Broker::sendTasks(const std::vector<Task>& tasks) {
         if (!task.connection->sendDelivery(task.channel, task.consumerTag,
                                            task.message, task.deliveryTag,
                                            CLASS_BASIC, 60)) {
-            auto delivery = task.connection->discardDelivery(task.channel,
-                                                              task.deliveryTag);
-            if (delivery) requeue(*delivery);
+            requeueFailedDelivery(task.connection, task.channel, task.deliveryTag);
         }
     }
 }

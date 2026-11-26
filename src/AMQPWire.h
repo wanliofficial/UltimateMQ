@@ -22,6 +22,8 @@ constexpr uint16_t CLASS_CHANNEL = 20;
 constexpr uint16_t CLASS_EXCHANGE = 40;
 constexpr uint16_t CLASS_QUEUE = 50;
 constexpr uint16_t CLASS_BASIC = 60;
+constexpr uint16_t CLASS_CONFIRM = 85;
+constexpr uint16_t CLASS_TX = 90;
 constexpr size_t MIN_FRAME_MAX = 4096;
 constexpr uint32_t DEFAULT_FRAME_MAX = 131072;
 

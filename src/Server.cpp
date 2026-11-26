@@ -132,7 +132,15 @@ Server::Server(int port, size_t maxConnections)
         if (end == amqpPort || *end != '\0' || errno != 0 || parsed <= 0 || parsed > 65535) {
             throw std::runtime_error(std::string("invalid FLOWMQ_AMQP_PORT: ") + amqpPort);
         }
-        amqpBroker = std::make_unique<AMQP::Broker>(auth.get());
+        std::string amqpStateFile;
+        if (store->enabled()) {
+            amqpStateFile = std::string(stateFile) + ".amqp";
+            amqpStore = std::make_unique<AMQP::Store>(amqpStateFile,
+                                                      std::chrono::milliseconds(1000));
+            logInfo("AMQP state file: %s", amqpStateFile.c_str());
+        }
+        amqpBroker = std::make_unique<AMQP::Broker>(auth.get(), 4096,
+                                                    64 * 1024 * 1024, amqpStore.get());
         amqpListener = std::make_unique<Listener>(static_cast<int>(parsed));
         logInfo("AMQP 0-9-1 listener on port %d", static_cast<int>(parsed));
     }
@@ -387,6 +395,16 @@ Server::Server(int port, size_t maxConnections)
         }
         broker->restoreState(persisted);
     }
+    if (amqpStore && amqpStore->enabled()) {
+        AMQP::PersistedState persisted;
+        std::string loadError;
+        if (!amqpStore->load(persisted, &loadError)) {
+            delete broker;
+            broker = nullptr;
+            throw std::runtime_error("failed to load AMQP state file: " + loadError);
+        }
+        amqpBroker->restoreState(persisted);
+    }
 }
 
 Server::~Server() {
@@ -414,6 +432,9 @@ void Server::start() {
 #endif
     // Start the background writer only once the state has been restored
     store->start([this]() { return broker->snapshotState(); });
+    if (amqpStore) {
+        amqpStore->start([this]() { return amqpBroker->snapshotState(); });
+    }
     running = true;
     logInfo("MQTT server started (max connections: %zu)", getMaxConnections());
     run();
@@ -852,6 +873,12 @@ void Server::shutdownPersistence() {
     if (store->enabled() && broker && broker->getStore()) {
         if (store->flushNow()) {
             logInfo("state flushed");
+        }
+    }
+    if (amqpStore) {
+        amqpStore->stop();
+        if (amqpStore->enabled() && amqpBroker && amqpStore->flushNow()) {
+            logInfo("AMQP state flushed");
         }
     }
     if (gWakePipe[0] >= 0) {

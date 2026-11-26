@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -22,6 +23,7 @@ class TLSContext;
 namespace AMQP {
 
 class Connection;
+class Store;
 
 struct BrokerError : std::runtime_error {
     uint16_t code;
@@ -34,6 +36,7 @@ struct Message {
     std::string routingKey;
     std::vector<uint8_t> properties;
     std::vector<uint8_t> body;
+    std::shared_ptr<FieldTable> headers;
     uint64_t publisherConnectionID = 0;
     bool redelivered = false;
     std::chrono::steady_clock::time_point deadline;
@@ -44,6 +47,7 @@ struct Delivery {
     std::string queue;
     std::shared_ptr<Message> message;
     std::string consumerTag;
+    uint64_t deliveryTag = 0;
 };
 
 struct PublishResult {
@@ -77,10 +81,49 @@ struct Binding {
     std::string exchange;
     std::string queue;
     std::string routingKey;
+    std::vector<uint8_t> arguments;
+    std::shared_ptr<FieldTable> headerArguments;
     bool operator==(const Binding& other) const {
         return exchange == other.exchange && queue == other.queue &&
-               routingKey == other.routingKey;
+               routingKey == other.routingKey && arguments == other.arguments;
     }
+};
+
+struct PersistedMessage {
+    Message message;
+    int64_t expiryRemainingSeconds = -1;
+    bool unacked = false;
+};
+
+struct PersistedExchange {
+    std::string name;
+    std::string type;
+    bool durable = false;
+    bool autoDelete = false;
+    bool internal = false;
+    std::vector<uint8_t> arguments;
+};
+
+struct PersistedQueue {
+    std::string name;
+    bool durable = false;
+    bool autoDelete = false;
+    std::vector<uint8_t> arguments;
+    std::vector<PersistedMessage> messages;
+};
+
+struct PersistedBinding {
+    std::string exchange;
+    std::string queue;
+    std::string routingKey;
+    std::vector<uint8_t> arguments;
+};
+
+struct PersistedState {
+    std::vector<PersistedExchange> exchanges;
+    std::vector<PersistedQueue> queues;
+    std::vector<PersistedBinding> bindings;
+    uint64_t nextQueueID = 1;
 };
 
 struct Consumer {
@@ -97,7 +140,8 @@ class Broker {
 public:
     explicit Broker(MQTT::Auth* auth = nullptr,
                     size_t maxQueues = 4096,
-                    size_t maxMessageBytes = 64 * 1024 * 1024);
+                    size_t maxMessageBytes = 64 * 1024 * 1024,
+                    Store* persistence = nullptr);
     ~Broker() = default;
 
     bool authenticate(const std::string& username, const std::string& password) const;
@@ -117,9 +161,11 @@ public:
                              bool exclusive, bool autoDelete, uint64_t connectionID,
                              const std::vector<uint8_t>& arguments = {});
     void bindQueue(const std::string& queue, const std::string& exchange,
-                   const std::string& routingKey, uint64_t connectionID);
+                   const std::string& routingKey, uint64_t connectionID,
+                   const std::vector<uint8_t>& arguments = {});
     void unbindQueue(const std::string& queue, const std::string& exchange,
-                     const std::string& routingKey);
+                     const std::string& routingKey,
+                     const std::vector<uint8_t>& arguments = {});
     size_t purgeQueue(const std::string& queue, uint64_t connectionID);
     size_t deleteQueue(const std::string& queue, bool ifUnused, bool ifEmpty,
                        uint64_t connectionID);
@@ -136,17 +182,25 @@ public:
                        uint16_t channel, uint64_t connectionID);
 
     PublishResult publish(const Message& message, const std::string& username,
-                          bool mandatory, bool immediate, uint64_t connectionID);
+                          bool mandatory, bool immediate, uint64_t connectionID,
+                          bool synchronize = false);
     void dispatch();
+    bool flush();
+    PersistedState snapshotState() const;
+    void restoreState(const PersistedState& state);
     std::shared_ptr<Message> get(const std::string& queue, uint64_t connectionID,
-                                 bool noAck = false);
+                                 bool noAck = false,
+                                 const std::function<uint64_t(const std::shared_ptr<Message>&)>&
+                                     reserve = {});
     void acknowledge(const std::shared_ptr<Connection>& connection, uint16_t channel,
-                     const std::vector<Delivery>& deliveries, bool requeue,
-                     uint64_t connectionID);
+                     const std::function<std::vector<Delivery>()>& extractDeliveries,
+                     bool requeue, uint64_t connectionID);
     void recover(const std::shared_ptr<Connection>& connection, uint16_t channel,
-                 const std::vector<Delivery>& deliveries, bool requeue,
-                 uint64_t connectionID);
+                 const std::function<std::vector<Delivery>()>& extractDeliveries,
+                 bool requeue, uint64_t connectionID);
     void requeue(const Delivery& delivery);
+    void requeueFailedDelivery(const std::shared_ptr<Connection>& connection,
+                               uint16_t channel, uint64_t deliveryTag);
 
     static bool topicMatches(const std::string& pattern, const std::string& key);
 
@@ -161,6 +215,7 @@ private:
     };
 
     MQTT::Auth* auth;
+    Store* store;
     size_t maxQueues;
     size_t maxMessageBytes;
     mutable std::mutex mutex;
@@ -179,7 +234,9 @@ private:
     bool canDeliverLocked(const Consumer& consumer, size_t bytes) const;
     static bool matches(const Exchange& exchange, const Binding& binding,
                         const Message& message);
+    static bool fieldValueEquals(const FieldValue& left, const FieldValue& right);
     static bool expired(const std::shared_ptr<Message>& message);
+    void markDirtyLocked();
     void requeueLocked(const Delivery& delivery);
     void removeBindingsLocked(const std::string& queue);
     void eraseConsumersLocked(const std::string& queue);

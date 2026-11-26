@@ -1,7 +1,10 @@
 #include "AMQPBroker.h"
+#include "AMQPStore.h"
 #include "AMQPWire.h"
 #include <gtest/gtest.h>
+#include <cstdio>
 #include <memory>
+#include <unistd.h>
 
 using namespace AMQP;
 
@@ -61,6 +64,7 @@ TEST(AMQPWireTests, FieldTableRoundTrip) {
     table->emplace("count", uint32_t{42});
     table->emplace("ratio", 1.5);
     table->emplace("payload", std::vector<uint8_t>{0, 1, 255});
+    table->emplace("long", std::string(300, 'z'));
 
     Writer writer;
     writer.table(table);
@@ -75,6 +79,7 @@ TEST(AMQPWireTests, FieldTableRoundTrip) {
     EXPECT_DOUBLE_EQ(std::get<double>(decoded->at("ratio")), 1.5);
     EXPECT_EQ(std::get<std::vector<uint8_t>>(decoded->at("payload")),
               (std::vector<uint8_t>{0, 1, 255}));
+    EXPECT_EQ(std::get<std::string>(decoded->at("long")), std::string(300, 'z'));
     const auto decodedNestedValue = decoded->at("nested");
     ASSERT_EQ(decodedNestedValue.index(), 16u);
     ASSERT_TRUE(std::holds_alternative<std::shared_ptr<FieldTable>>(decodedNestedValue));
@@ -210,4 +215,133 @@ TEST(AMQPBrokerTests, AutoDeleteExchangeIsRemovedAfterLastBinding) {
     broker.unbindQueue("queue.auto", "auto.exchange", "key");
     EXPECT_THROW(broker.declareExchange("auto.exchange", "direct", true, false, true,
                                         false, 1), BrokerError);
+}
+
+TEST(AMQPBrokerTests, BuiltInExchangeAcceptsEncodedEmptyArguments) {
+    Broker broker;
+    Writer arguments;
+    arguments.table(std::make_shared<FieldTable>());
+    EXPECT_NO_THROW(broker.declareExchange("amq.direct", "direct", false, true, false,
+                                           false, 1, arguments.data()));
+    auto table = std::make_shared<FieldTable>();
+    table->emplace("alternate-exchange", std::string("other"));
+    Writer nonEmpty;
+    nonEmpty.table(table);
+    EXPECT_THROW(broker.declareExchange("amq.direct", "direct", false, true, false,
+                                        false, 1, nonEmpty.data()), BrokerError);
+}
+
+TEST(AMQPBrokerTests, HeadersExchangeMatchesAllAnyAndFieldTypes) {
+    Broker broker;
+    broker.declareExchange("headers.test", "headers", false, false, false, false, 1);
+    for (const std::string& name : {"queue.all", "queue.any", "queue.typed"}) {
+        broker.declareQueue(name, false, false, false, false, 1);
+    }
+    auto bind = [&](const std::string& queue, const std::string& match,
+                    const FieldValue& second, bool includeFormat = true) {
+        auto table = std::make_shared<FieldTable>();
+        table->emplace("x-match", match);
+        if (includeFormat) table->emplace("format", std::string("text"));
+        table->emplace("color", second);
+        Writer writer;
+        writer.table(table);
+        broker.bindQueue(queue, "headers.test", "", 1, writer.data());
+    };
+    bind("queue.all", "all", std::string("blue"));
+    bind("queue.any", "any", std::string("red"), false);
+    bind("queue.typed", "all", uint32_t{1});
+
+    Message message;
+    message.exchange = "headers.test";
+    message.headers = std::make_shared<FieldTable>();
+    message.body = {'x'};
+    message.headers->emplace("format", std::string("text"));
+    message.headers->emplace("color", std::string("blue"));
+    EXPECT_TRUE(broker.publish(message, "", false, false, 1).routed);
+    EXPECT_EQ(broker.queueMessageCount("queue.all"), 1u);
+    EXPECT_EQ(broker.queueMessageCount("queue.any"), 0u);
+
+    message.headers->at("color") = std::string("red");
+    broker.publish(message, "", false, false, 1);
+    EXPECT_EQ(broker.queueMessageCount("queue.all"), 1u);
+    EXPECT_EQ(broker.queueMessageCount("queue.any"), 1u);
+
+    message.headers->at("color") = uint32_t{1};
+    broker.publish(message, "", false, false, 1);
+    EXPECT_EQ(broker.queueMessageCount("queue.typed"), 1u);
+    message.headers->at("color") = std::string("1");
+    broker.publish(message, "", false, false, 1);
+    EXPECT_EQ(broker.queueMessageCount("queue.typed"), 1u);
+}
+
+TEST(AMQPBrokerTests, HeadersBindingRequiresValidMatchArgument) {
+    Broker broker;
+    broker.declareExchange("headers.invalid", "headers", false, false, false, false, 1);
+    broker.declareQueue("queue.headers", false, false, false, false, 1);
+    Writer missing;
+    missing.table(std::make_shared<FieldTable>());
+    EXPECT_THROW(broker.bindQueue("queue.headers", "headers.invalid", "", 1, missing.data()),
+                 BrokerError);
+    auto table = std::make_shared<FieldTable>();
+    table->emplace("x-match", std::string("some"));
+    Writer invalid;
+    invalid.table(table);
+    EXPECT_THROW(broker.bindQueue("queue.headers", "headers.invalid", "", 1, invalid.data()),
+                 BrokerError);
+}
+
+TEST(AMQPStoreTests, DurableTopologyBindingsAndMessagesSurviveRestart) {
+    const std::string path = "/tmp/flowmq_amqp_store_" + std::to_string(::getpid());
+    std::remove(path.c_str());
+    std::remove((path + ".tmp").c_str());
+    {
+        Store store(path, std::chrono::milliseconds(1000));
+        Broker broker(nullptr, 4096, 1024 * 1024, &store);
+        broker.declareExchange("durable.exchange", "direct", false, true, false, false, 1);
+        broker.declareQueue("durable.queue", false, true, false, false, 1);
+        broker.declareQueue("volatile.queue", false, false, false, false, 1);
+        broker.bindQueue("durable.queue", "durable.exchange", "jobs", 1);
+        Message message;
+        message.exchange = "durable.exchange";
+        message.routingKey = "jobs";
+        message.properties = {0x90, 0x00, 4, 't', 'e', 'x', 't'};
+        message.body = {'p', 'e', 'r', 's', 'i', 's', 't'};
+        ASSERT_TRUE(broker.publish(message, "", false, false, 1, true).routed);
+        ASSERT_TRUE(broker.flush());
+
+        PersistedState loaded;
+        std::string error;
+        ASSERT_TRUE(store.load(loaded, &error)) << error;
+        Broker restored(nullptr, 4096, 1024 * 1024, &store);
+        restored.restoreState(loaded);
+        EXPECT_EQ(restored.queueMessageCount("durable.queue"), 1u);
+        EXPECT_THROW(restored.queueMessageCount("volatile.queue"), BrokerError);
+        EXPECT_NO_THROW(restored.declareExchange("durable.exchange", "direct", false, true,
+                                                 false, false, 1));
+        auto delivery = restored.get("durable.queue", 1);
+        ASSERT_TRUE(delivery);
+        EXPECT_EQ(delivery->body, message.body);
+        EXPECT_EQ(delivery->properties, message.properties);
+        restored.publish(message, "", false, false, 1);
+        EXPECT_EQ(restored.queueMessageCount("durable.queue"), 1u);
+    }
+    std::remove(path.c_str());
+    std::remove((path + ".tmp").c_str());
+}
+
+TEST(AMQPStoreTests, RejectsMalformedState) {
+    const std::string path = "/tmp/flowmq_amqp_bad_store_" + std::to_string(::getpid());
+    Store store(path, std::chrono::milliseconds(1000));
+    for (const std::string& contents : {
+             std::string("FLOWMQ-AMQP-STATE-1\nqueue zz 1 0 -\nend\n"),
+             std::string("FLOWMQ-AMQP-STATE-1\nend\nqueue zz 1 0 -\n")}) {
+        std::FILE* file = std::fopen(path.c_str(), "wb");
+        ASSERT_NE(file, nullptr);
+        std::fputs(contents.c_str(), file);
+        std::fclose(file);
+        PersistedState state;
+        std::string error;
+        EXPECT_FALSE(store.load(state, &error));
+    }
+    std::remove(path.c_str());
 }

@@ -127,7 +127,8 @@ FieldValue Reader::fieldValue(unsigned depth) {
         return decimal;
     }
     case 's': return shortString();
-    case 'S': {
+    case 'S': return longString();
+    case 'x': {
         uint32_t length = u32();
         require(length);
         std::vector<uint8_t> value(data_ + offset_, data_ + offset_ + length);
@@ -258,9 +259,9 @@ Writer& Writer::fieldValue(const FieldValue& value) {
     } else if (auto v = std::get_if<Decimal>(&value)) {
         u8('D'); u8(v->scale); u32(v->value);
     } else if (auto v = std::get_if<std::string>(&value)) {
-        u8('s'); shortString(*v);
+        u8('S'); longString(*v);
     } else if (auto v = std::get_if<std::vector<uint8_t>>(&value)) {
-        u8('S'); u32(static_cast<uint32_t>(v->size()));
+        u8('x'); u32(static_cast<uint32_t>(v->size()));
         data_.insert(data_.end(), v->begin(), v->end());
     } else if (auto v = std::get_if<std::shared_ptr<FieldArray>>(&value)) {
         u8('A');

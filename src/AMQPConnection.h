@@ -56,9 +56,19 @@ public:
                       uint16_t methodID);
     void discardQueue(const std::string& queue);
     std::optional<Delivery> discardDelivery(uint16_t channel, uint64_t deliveryTag);
+    std::vector<Delivery> snapshotUnacked() const;
 
 private:
     enum class Phase { PROTOCOL, START, TUNE, OPEN, CLOSED };
+    struct StagedPublish {
+        Message message;
+        bool mandatory = false;
+        bool immediate = false;
+    };
+    struct TransactionAck {
+        Delivery delivery;
+        bool requeue = false;
+    };
     struct Channel {
         bool open = false;
         bool closing = false;
@@ -72,6 +82,11 @@ private:
         std::map<std::string, size_t> consumerUnackedBytes;
         std::map<std::string, std::string> consumerQueues;
         std::map<uint64_t, Delivery> unacked;
+        bool confirm = false;
+        bool transactional = false;
+        uint64_t nextPublishSequence = 1;
+        std::vector<StagedPublish> transactionPublishes;
+        std::map<uint64_t, TransactionAck> transactionAcks;
     };
     struct PendingPublish {
         uint16_t channel = 0;
@@ -133,6 +148,14 @@ private:
     void handleHeader(const Frame& frame);
     void handleBody(const Frame& frame);
     void completePublish(uint16_t channel, PendingPublish& pending);
+    bool publishNow(uint16_t channel, Message& message, bool mandatory, bool immediate,
+                    uint64_t confirmSequence);
+    bool sendReturn(uint16_t channel, uint16_t code, const std::string& text,
+                    const Message& message);
+    void handleConfirm(const Method& method, uint16_t channel);
+    void handleTX(const Method& method, uint16_t channel);
+    void handleAcknowledgement(uint16_t channel, uint64_t tag, bool multiple,
+                               bool requeue);
     Channel& requireChannel(uint16_t channel, uint16_t classID, uint16_t methodID);
     Channel* findOpenChannel(uint16_t channel);
     bool deliveryAllowedLocked(const Channel& state,
@@ -150,6 +173,7 @@ private:
                              uint16_t classID, uint16_t methodID);
     std::vector<Delivery> takeUnacked(uint16_t channel, uint64_t tag,
                                       bool multiple);
+    std::vector<Delivery> peekUnacked(uint16_t channel, uint64_t tag, bool multiple) const;
     std::vector<Delivery> allUnacked(uint16_t channel);
     std::vector<Delivery> allUnacked();
     void cleanup();
