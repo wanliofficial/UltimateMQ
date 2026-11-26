@@ -10,3 +10,7 @@
 - https://github.com/boostorg/mqtt5
 - https://github.com/halfgaar/FlashMQ
 - https://github.com/xukeawsl/mqtt-server
+
+
+## 集成redis
+- https://github.com/wanliofficial/rocksredis
