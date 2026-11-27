@@ -77,6 +77,13 @@ public:
     //! "$share/group/" prefix is routing metadata and not part of the topic.
     bool isForbiddenSubscribe(const std::string& username, const std::string& filter) const;
 
+    enum class KafkaOperation {
+        GROUP_READ, GROUP_WRITE, GROUP_DESCRIBE, GROUP_DELETE,
+        TRANSACTIONAL_ID_WRITE, CLUSTER_ADMIN
+    };
+    bool isKafkaForbidden(const std::string& username, const std::string& resource,
+                          KafkaOperation operation) const;
+
     //! Resolve the reason code to send back for a failed authenticate() call
     static ReasonCode badCredentialsReason() { return ReasonCode::BAD_USERNAME_OR_PASSWORD; }
     //! Resolve the reason code to send back for a denied ACL check
@@ -110,6 +117,8 @@ private:
     std::map<std::string, User> users_;
     // (user or "*") -> list of (topicFilter, write) grants
     std::map<std::string, std::vector<std::pair<std::string, bool>>> acl_;
+    std::map<std::string, std::vector<std::pair<std::string, KafkaOperation>>> kafkaAcl_;
+    bool kafkaAclEnabled_ = false;
 
     bool checkAcl(const std::string& username, const std::string& topic, bool write) const;
     static std::string sha256(const std::string& data);

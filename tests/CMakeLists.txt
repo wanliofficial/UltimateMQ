@@ -21,6 +21,9 @@ set(TEST_SOURCES
     ServerTests.cpp
     WebSocketTests.cpp
     AMQPTests.cpp
+    KafkaWireTests.cpp
+    KafkaBrokerTests.cpp
+    KafkaProtocolTests.cpp
 )
 
 # Create the test executable

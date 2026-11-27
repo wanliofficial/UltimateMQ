@@ -11,7 +11,7 @@ class Listener {
     int sockfd;
     struct sockaddr_in address;
 public:
-    Listener(int port);
+    Listener(int port, bool loopback = false);
     ~Listener();
 
     void start();

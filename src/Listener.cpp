@@ -9,9 +9,9 @@
 
 namespace MQTT {
 
-Listener::Listener(int port) : port{port}, sockfd{-1} {
+Listener::Listener(int port, bool loopback) : port{port}, sockfd{-1} {
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_addr.s_addr = htonl(loopback ? INADDR_LOOPBACK : INADDR_ANY);
     address.sin_port = htons(port);
 }
 

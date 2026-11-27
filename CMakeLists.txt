@@ -27,7 +27,16 @@ add_library(flowmq_lib STATIC
     src/AMQPBroker.cpp
     src/AMQPConnection.cpp
     src/AMQPStore.cpp
+    src/KafkaWire.cpp
+    src/KafkaBroker.cpp
+    src/KafkaProtocol.cpp
+    src/KafkaConnection.cpp
+    src/KafkaServer.cpp
+    src/KafkaConnect.cpp
 )
+
+add_executable(flowmq_kafka src/KafkaMain.cpp)
+target_link_libraries(flowmq_kafka PRIVATE flowmq_lib pthread)
 
 # MQTT over QUIC (opt-in). Built only when libmsquic is available; without it
 # the broker compiles and runs exactly as before, minus the FLOWMQ_QUIC_PORT
