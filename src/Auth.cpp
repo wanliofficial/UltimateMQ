@@ -374,7 +374,8 @@ bool Auth::loadAcl(const std::string& path, std::string* error) {
     }
     acl_ = std::move(loadedAcl);
     kafkaAcl_ = std::move(loadedKafkaAcl);
-    aclEnabled_ = true;
+    // Keep explicit-empty MQTT ACLs deny-all without enabling them for Kafka-only files.
+    aclEnabled_ = !acl_.empty() || kafkaAcl_.empty();
     kafkaAclEnabled_ = loadedKafkaAclEnabled;
     return true;
 }

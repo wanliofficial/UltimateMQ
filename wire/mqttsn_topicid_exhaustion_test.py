@@ -17,10 +17,10 @@ REGISTER must get a REGACK (it may be a REJECTED_CONGESTION now that the id spac
 is full) rather than the gateway hanging. Before the fix the gateway stops
 answering entirely.
 
-To keep the probe quick it registers `TARGET` topics (>> enough to exhaust the
-space if the id space were not bounded; a bounded gateway rejects far earlier).
-Sending is done in one burst and the gateway's liveness is checked with a final
-REGISTER that must be answered within a few seconds.
+The test registers distinct topic names one at a time, waiting for each REGACK,
+until the gateway reports that the 16-bit id space is exhausted. This avoids
+UDP packet loss making a burst-based probe end before the space is actually
+full, while still completing in a few seconds on the loopback interface.
 
 Usage: mqttsn_topicid_exhaustion_test.py <binary> <tcp-port>
 Exit code is 0 only when the case passes.
@@ -152,40 +152,28 @@ def case_topicid_exhaustion_does_not_hang():
         sn.sendto(sn_connect("sn-exhaust"), dest)
         assert sn_type(sn_recv(sn)) == 0x05, "no CONNACK to the SN device"
 
-        # Register more distinct topic names than the 16-bit id space holds, in a
-        # burst. A bounded gateway starts rejecting before this; an unbounded one
-        # fills the id space and then spins in its find-a-free-id loop.
-        nsent = 0
-        for i in range(66000):
+        # Register distinct topic names until the 16-bit id space is exhausted.
+        # Waiting for each REGACK keeps UDP loss from truncating the attempt.
+        accepted = 0
+        for i in range(65536):
+            sn.settimeout(5)
             sn.sendto(sn_register("x/%d" % i, (i % 60000) + 1), dest)
-            nsent += 1
-        # Drain whatever REGACKs are queued (best effort, non-blocking).
-        sn.settimeout(0.2)
-        try:
-            while True:
-                sn.recvfrom(2048)
-        except socket.timeout:
-            pass
+            reply = sn_recv(sn, 5.0)
+            assert reply is not None, (
+                "gateway stopped answering after %d accepted REGISTERs" % accepted)
+            assert sn_type(reply) == T_REGACK, (
+                "expected a REGACK, got msg type 0x%02x" % sn_type(reply))
+            rc = sn_body(reply)[4]
+            if rc == 0x01:
+                break
+            assert rc == 0x00, "REGISTER returned 0x%02x" % rc
+            accepted += 1
+        else:
+            raise AssertionError("gateway accepted more than 65535 topic ids")
 
-        # Liveness: the gateway must still answer a fresh REGISTER within a few
-        # seconds. If it is spinning in topicIdFor() it answers nothing.
-        sn.settimeout(5)
-        sn.sendto(sn_register("alive/check", 12345), dest)
-        reply = sn_recv(sn, 5.0)
-        assert reply is not None, (
-            "gateway did not answer after %d REGISTERs: topic-id space "
-            "exhaustion hung the broker event loop" % nsent)
-        assert sn_type(reply) == T_REGACK, (
-            "expected a REGACK, got msg type 0x%02x" % sn_type(reply))
-        # With the id space full the gateway must signal congestion, not accept.
-        body = sn_body(reply)
-        rc = body[4]
-        assert rc == 0x01, (
-            "REGISTER past a full topic-id space returned 0x%02x, expected "
-            "REJECTED_CONGESTION (0x01)" % rc)
         sn.close()
-        return ("gateway answers a REGISTER after %d distinct topics with "
-                "REJECTED_CONGESTION instead of hanging" % nsent)
+        return ("gateway answered %d distinct registrations then returned "
+                "REJECTED_CONGESTION instead of hanging" % accepted)
     finally:
         b.stop()
 
