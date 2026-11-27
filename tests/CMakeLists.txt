@@ -16,11 +16,12 @@ set(TEST_SOURCES
     StoreTests.cpp
     TLSTests.cpp
     SysTopicsTests.cpp
-    Utf8Tests.cpp
+    UTF8Tests.cpp
     MQTTSNTests.cpp
     ServerTests.cpp
     WebSocketTests.cpp
     NonBlockingReadTests.cpp
+    AMQPTests.cpp
 )
 
 # Create the test executable

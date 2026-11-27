@@ -2,7 +2,7 @@
 #include "Connection.h"
 #include "Env.h"
 #include "Topic.h"
-#include "Utf8.h"
+#include "UTF8.h"
 #include "Session.h"
 #include "Broker.h"
 #include "SysTopics.h"
@@ -1147,7 +1147,7 @@ void Connection::handlePublish(std::shared_ptr<PublishPacket> publish) {
         if (pfi != publish->properties.end() &&
             std::holds_alternative<uint8_t>(pfi->second) &&
             std::get<uint8_t>(pfi->second) == 1 &&
-            !Utf8::isValid(publish->payload.data(), publish->payload.size())) {
+            !UTF8::isValid(publish->payload.data(), publish->payload.size())) {
             logDebug("client %s: PUBLISH claims UTF-8 payload but it is malformed",
                      liveSession->getClientId().c_str());
             if (publish->qos == QoS::QOS_1) {

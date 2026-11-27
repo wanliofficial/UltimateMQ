@@ -13,6 +13,9 @@
 #include "Store.h"
 #include "TLS.h"
 #include "MQTTSN.h"
+#include "AMQPBroker.h"
+#include "AMQPConnection.h"
+#include "AMQPStore.h"
 #if defined(FLOWMQ_WITH_QUIC)
 #include "QUIC.h"
 #endif
@@ -49,6 +52,13 @@ private:
     //! Accept one WebSocket client and start serving it. Called when the
     //! optional WebSocket listener has an incoming connection.
     void acceptWebSocket();
+    void acceptAMQP();
+    void handleAMQPClient(const std::shared_ptr<AMQP::Connection>& connection);
+    bool startAMQPThread(int clientSocket,
+                         const std::shared_ptr<AMQP::Connection>& connection);
+    void unregisterAMQPConnection(int clientSocket,
+                                  const std::shared_ptr<AMQP::Connection>& connection);
+    void reapFinishedAMQPThreads();
     //! Register a connection and start the thread that serves it. Returns false
     //! (and starts nothing) once shutdown has begun.
     bool startClientThread(int clientSocket, const std::shared_ptr<Connection>& connection);
@@ -73,6 +83,9 @@ private:
     std::unique_ptr<Listener> websocketListener;
     //! MQTT-SN gateway (UDP), created only when FLOWMQ_MQTT_SN_PORT is set.
     std::unique_ptr<MQTTSN::Gateway> mqttSnGateway;
+    std::unique_ptr<AMQP::Store> amqpStore;
+    std::unique_ptr<AMQP::Broker> amqpBroker;
+    std::unique_ptr<Listener> amqpListener;
 #if defined(FLOWMQ_WITH_QUIC)
     //! MQTT over QUIC listener, created only when FLOWMQ_QUIC_PORT is set.
     //! Built only when libmsquic is available (CMake option).
@@ -90,6 +103,9 @@ private:
         std::shared_ptr<std::atomic<bool>> finished;
     };
     std::vector<ClientThread> clientThreads;
+    std::map<int, std::shared_ptr<AMQP::Connection>> amqpConnections;
+    std::vector<ClientThread> amqpThreads;
+    std::chrono::steady_clock::time_point amqpBackoffUntil_{};
     //! How often the accept loop wakes to drop sessions whose disconnect-time
     //! expiry has elapsed (MQTT-5 Session Expiry Interval on DISCONNECT).
     std::chrono::milliseconds sweepInterval{1000};

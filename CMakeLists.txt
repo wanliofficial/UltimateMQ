@@ -23,6 +23,10 @@ add_library(flowmq_lib STATIC
     src/TLS.cpp
     src/WebSocket.cpp
     src/MQTTSN.cpp
+    src/AMQPWire.cpp
+    src/AMQPBroker.cpp
+    src/AMQPConnection.cpp
+    src/AMQPStore.cpp
 )
 
 # MQTT over QUIC (opt-in). Built only when libmsquic is available; without it

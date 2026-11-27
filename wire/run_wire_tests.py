@@ -58,6 +58,7 @@ PROBES = [
     ("sys_will_bypass_test", "MQTT-4.1.2-2: a client Will on a $SYS topic cannot forge the monitoring tree"),
     ("will_delay_cancel_test", "MQTT 5 Will Delay: a reconnect inside the delay window cancels the pending Will (MQTT-3.1.4-6), while one with no reconnect does fire"),
     ("will_session_end_test", "MQTT 5 §3.1.2.11.3: ending the Session at DISCONNECT publishes an armed Will at once, not after its Will Delay"),
+    ("amqp_broker_test", "AMQP 0-9-1: handshake, topology, routing, Basic.Return, prefetch, requeue, and reserved-bit rejection"),
     ("mqttsn_qos1_ping_will_test", "MQTT-SN QoS 1 PUBACK round-trip, PINGREQ/PINGRESP, Will published on abnormal keep-alive disconnect"),
     ("mqttsn_will_qos3_retained_test", "MQTT-SN §5.3.1: a Will with a raw QoS of 3 (\"QoS -1\") is normalised to QoS 0, so a retained Will cannot poison FLOWMQ_STATE_FILE into a startup abort"),
     ("mqttsn_qos2_reject_test", "MQTT-SN §6.6: a QoS 2 PUBLISH that must be rejected (unknown topic id) is answered with a PUBACK carrying the ReturnCode, not a bare PUBREC indistinguishable from an acceptance, so the client never believes a rejected message was delivered exactly-once"),

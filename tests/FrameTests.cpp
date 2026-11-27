@@ -436,7 +436,7 @@ TEST_F(FrameTest, ParseBinaryDataFieldKeepsArbitraryBytes)
     EXPECT_EQ(parsed, std::string(data.begin(), data.end()));
 }
 
-TEST_F(FrameTest, ParsePublishCorrelationDataWithInvalidUtf8)
+TEST_F(FrameTest, ParsePublishCorrelationDataWithInvalidUTF8)
 {
     // §3.3.2.3.6: Correlation Data is Binary Data; a request id that is not
     // valid UTF-8 must still be routed, not rejected as a malformed packet.

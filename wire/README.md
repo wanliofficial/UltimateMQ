@@ -1,9 +1,9 @@
 # Wire tests
 
-End-to-end MQTT conformance probes. Unlike the gtest suite under `tests/`,
-these launch the real `flowmq` broker binary and drive it over TCP, exercising
-the full path: packet parsing, session state, flow control and the socket
-write loop.
+End-to-end MQTT and AMQP conformance probes. Unlike the gtest suite under
+`tests/`, these launch the real `flowmq` broker binary and drive it over TCP
+(or UDP for MQTT-SN), exercising the full path: packet parsing, session state,
+flow control and the socket write loop.
 
 Each probe is a self-contained Python script that takes `<binary> <port>` and
 exits non-zero if any case fails.
@@ -25,6 +25,7 @@ python3 wire/recvmax_window_test.py build/flowmq 18840
 
 | Script | Covers |
 |---|---|
+| `amqp_broker_test.py` | AMQP 0-9-1: protocol/SASL handshake, topology, direct/fanout/topic/headers routing, multi-frame and empty content, mandatory/immediate `Basic.Return`, publisher confirms, transactions, prefetch, redelivery, durable restart recovery, authentication/ACLs, and reserved-bit rejection. |
 | `recvmax_window_test.py` | MQTT-4.9 / §3.1.2.11.9: the Receive Maximum window holds a QoS 2 message until PUBCOMP (not PUBREC), and at QoS 1 until PUBACK. |
 | `mqtt311_test.py` | MQTT 3.1.1 (protocol level 4) over the wire, a path no other probe exercises: CONNECT/SUBSCRIBE/PUBLISH(QoS 0,1)/PUBACK round-trip with no property section; an invalid topic filter is reported as 0x80 in the SUBACK (not a reason code) and the connection stays open; a QoS 0 publish to an invalid topic is silently dropped without a DISCONNECT. |
 | `retained_messages_test.py` | Core retained-message delivery on the wire: a RETAIN=1 publish reaches a brand-new subscriber with the RETAIN flag still set (§3.3.1-9); a live delivery to an already-subscribed client has RETAIN cleared (§3.3.1-8); a zero-length RETAIN=1 payload clears the retained message; a wildcard subscription receives every matching retained message. |
@@ -99,7 +100,9 @@ the TCP port the runner passes, so several probes can run back to back.
    template: start the broker in a `tempfile.mkdtemp` workdir with an isolated
    `FLOWMQ_STATE_FILE`, drive it over a socket, and `stop()` in a `finally`.
 2. Register it in `PROBES` in `run_wire_tests.py`.
-3. Cite the exact MQTT clause the assertion pins down in the module docstring.
+3. Cite the exact protocol clause the assertion pins down in the module
+   docstring. The AMQP probe enables `FLOWMQ_AMQP_PORT` and uses the adjacent
+   port for its MQTT listener.
 
 A probe that fails first because of a wrong test assertion (not a broker bug)
 should be fixed like any other test; a probe that exposes a real defect should
