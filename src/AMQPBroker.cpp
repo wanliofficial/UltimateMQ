@@ -246,11 +246,16 @@ void Broker::bindQueue(const std::string& queueName, const std::string& exchange
 }
 
 void Broker::unbindQueue(const std::string& queue, const std::string& exchange,
-                         const std::string& routingKey,
+                         const std::string& routingKey, uint64_t connectionID,
                          const std::vector<uint8_t>& arguments) {
     std::lock_guard<std::mutex> lock(mutex);
-    if (queues.find(queue) == queues.end() || exchanges.find(exchange) == exchanges.end()) {
+    auto queueIt = queues.find(queue);
+    if (queueIt == queues.end() || exchanges.find(exchange) == exchanges.end()) {
         throw BrokerError(NOT_FOUND, "queue or exchange not found");
+    }
+    authorizeQueueReadLocked(queue, connectionID);
+    if (queueIt->second.exclusive && queueIt->second.ownerConnectionID != connectionID) {
+        throw BrokerError(RESOURCE_LOCKED, "exclusive queue belongs to another connection");
     }
     Binding binding{exchange, queue, routingKey, arguments, nullptr};
     size_t before = bindings.size();
@@ -535,18 +540,8 @@ void Broker::requeueLocked(const Delivery& delivery) {
     queue->second.messages.push_front(delivery.message);
 }
 
-PublishResult Broker::publish(const Message& input, const std::string& username,
-                              bool mandatory, bool immediate,
-                              uint64_t connectionID, bool synchronize) {
-    (void)mandatory;
-    if (input.body.size() > maxMessageBytes) {
-        throw BrokerError(RESOURCE_LOCKED, "message exceeds broker limit");
-    }
-    if (auth && auth->isForbidden(username, input.routingKey, true)) {
-        throw BrokerError(ACCESS_REFUSED, "publish denied by ACL");
-    }
-    std::unique_lock<std::mutex> dispatch(dispatchMutex);
-    std::unique_lock<std::mutex> lock(mutex);
+void Broker::routeLocked(const Message& input, std::shared_ptr<Message>& message,
+                         std::set<std::string>& routed, bool& durableRouted) {
     auto exchangeIt = exchanges.find(input.exchange);
     if (exchangeIt == exchanges.end()) {
         throw BrokerError(NOT_FOUND, "exchange not found");
@@ -554,10 +549,9 @@ PublishResult Broker::publish(const Message& input, const std::string& username,
     if (exchangeIt->second.internal) {
         throw BrokerError(ACCESS_REFUSED, "cannot publish to an internal exchange");
     }
-    auto message = std::make_shared<Message>(input);
-    PublishResult result;
-    std::set<std::string> routed;
-    bool durableRouted = false;
+    message = std::make_shared<Message>(input);
+    routed.clear();
+    durableRouted = false;
     if (input.exchange.empty()) {
         auto queue = queues.find(input.routingKey);
         if (queue != queues.end()) {
@@ -578,6 +572,74 @@ PublishResult Broker::publish(const Message& input, const std::string& username,
         }
     }
     if (!routed.empty()) markDirtyLocked();
+}
+
+bool Broker::hasImmediateConsumerLocked(const std::string& queueName,
+                                        const Message& message) const {
+    for (const auto& entry : consumers) {
+        const Consumer& candidate = entry.second;
+        if (candidate.queue != queueName) continue;
+        auto owner = candidate.connection.lock();
+        if (owner && (!candidate.noLocal || owner->connectionID() != message.publisherConnectionID) &&
+            canDeliverLocked(candidate, message.body.size())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Broker::removeImmediateLocked(const std::shared_ptr<Message>& message,
+                                   const std::set<std::string>& routed) {
+    bool removed = false;
+    for (const std::string& queueName : routed) {
+        auto found = queues.find(queueName);
+        if (found == queues.end()) continue;
+        auto& queued = found->second.messages;
+        const size_t before = queued.size();
+        queued.erase(std::remove_if(queued.begin(), queued.end(),
+                                    [&](const std::shared_ptr<Message>& item) {
+                                        return item == message;
+                                    }),
+                     queued.end());
+        removed = removed || queued.size() != before;
+    }
+    if (removed) markDirtyLocked();
+    return removed;
+}
+
+PublishResult Broker::publish(const Message& input, const std::string& username,
+                              bool mandatory, bool immediate,
+                              uint64_t connectionID, bool synchronize) {
+    (void)mandatory;
+    if (input.body.size() > maxMessageBytes) {
+        throw BrokerError(RESOURCE_LOCKED, "message exceeds broker limit");
+    }
+    if (auth && auth->isForbidden(username, input.routingKey, true)) {
+        throw BrokerError(ACCESS_REFUSED, "publish denied by ACL");
+    }
+    std::unique_lock<std::mutex> dispatch(dispatchMutex);
+    std::unique_lock<std::mutex> lock(mutex);
+    std::shared_ptr<Message> message;
+    PublishResult result;
+    std::set<std::string> routed;
+    bool durableRouted = false;
+    routeLocked(input, message, routed, durableRouted);
+    if (immediate) {
+        for (const std::string& queueName : routed) {
+            if (!hasImmediateConsumerLocked(queueName, *message)) {
+                auto found = queues.find(queueName);
+                if (found == queues.end()) continue;
+                auto& queued = found->second.messages;
+                const size_t before = queued.size();
+                queued.erase(std::remove_if(queued.begin(), queued.end(),
+                                            [&](const std::shared_ptr<Message>& item) {
+                                                return item == message;
+                                            }),
+                             queued.end());
+                if (queued.size() != before) markDirtyLocked();
+            }
+        }
+    }
     if (synchronize && durableRouted) {
         lock.unlock();
         if (!flush()) {
@@ -645,20 +707,73 @@ PublishResult Broker::publish(const Message& input, const std::string& username,
             }
         }
     }
-    if (immediate) {
-        for (const std::string& queueName : routed) {
-            auto& queued = queues.at(queueName).messages;
-            queued.erase(std::remove_if(queued.begin(), queued.end(),
-                                        [&](const std::shared_ptr<Message>& item) {
-                                            return item == message;
-                                        }),
-                         queued.end());
-        }
-    }
+    if (immediate) removeImmediateLocked(message, routed);
     lock.unlock();
     dispatch.unlock();
     sendTasks(tasks);
     return result;
+}
+
+bool Broker::commitTransaction(const std::vector<TransactionPublish>& publishes,
+                               const std::vector<TransactionAcknowledgement>& acknowledgements,
+                               const std::string& username,
+                               std::vector<PublishResult>& results) {
+    std::unique_lock<std::mutex> dispatch(dispatchMutex);
+    std::unique_lock<std::mutex> lock(mutex);
+    const auto originalQueues = queues;
+    results.clear();
+    results.reserve(publishes.size());
+    std::vector<std::shared_ptr<Message>> messages;
+    std::vector<std::set<std::string>> routedQueues;
+    std::set<const Message*> excludedUnacked;
+    try {
+        for (const TransactionPublish& publish : publishes) {
+            if (publish.message.body.size() > maxMessageBytes) {
+                throw BrokerError(RESOURCE_LOCKED, "message exceeds broker limit");
+            }
+            if (auth && auth->isForbidden(username, publish.message.routingKey, true)) {
+                throw BrokerError(ACCESS_REFUSED, "publish denied by ACL");
+            }
+            std::shared_ptr<Message> message;
+            std::set<std::string> routed;
+            bool durableRouted = false;
+            routeLocked(publish.message, message, routed, durableRouted);
+            if (publish.immediate) {
+                for (const std::string& queueName : routed) {
+                    if (!hasImmediateConsumerLocked(queueName, *message)) {
+                        removeImmediateLocked(message, {queueName});
+                    }
+                }
+            }
+            messages.push_back(std::move(message));
+            routedQueues.push_back(std::move(routed));
+            results.push_back(PublishResult{!routedQueues.back().empty(), 0});
+        }
+        for (const TransactionAcknowledgement& acknowledgement : acknowledgements) {
+            excludedUnacked.insert(acknowledgement.delivery.message.get());
+            if (acknowledgement.requeue) requeueLocked(acknowledgement.delivery);
+        }
+        if (!acknowledgements.empty()) markDirtyLocked();
+        if (!flushLocked(&excludedUnacked)) {
+            queues = originalQueues;
+            return false;
+        }
+    } catch (const BrokerError&) {
+        queues = originalQueues;
+        throw;
+    }
+    auto tasks = dispatchLocked();
+    for (size_t index = 0; index < messages.size(); ++index) {
+        if (!publishes[index].immediate) continue;
+        for (const Task& task : tasks) {
+            if (task.message == messages[index]) ++results[index].immediateDeliveries;
+        }
+        removeImmediateLocked(messages[index], routedQueues[index]);
+    }
+    lock.unlock();
+    dispatch.unlock();
+    sendTasks(tasks);
+    return true;
 }
 
 void Broker::dispatch() {
@@ -779,11 +894,26 @@ void Broker::requeueFailedDelivery(const std::shared_ptr<Connection>& connection
 }
 
 bool Broker::flush() {
-    return !store || store->flushNow([this]() { return snapshotState(); });
+    std::lock_guard<std::mutex> lock(mutex);
+    return flushLocked();
+}
+
+bool Broker::flushLocked(const std::set<const Message*>* excludedUnacked) {
+    if (failNextFlush) {
+        failNextFlush = false;
+        return false;
+    }
+    return !store || store->flushNow([this, excludedUnacked]() {
+        return snapshotStateLocked(excludedUnacked);
+    });
 }
 
 PersistedState Broker::snapshotState() const {
     std::lock_guard<std::mutex> lock(mutex);
+    return snapshotStateLocked();
+}
+
+PersistedState Broker::snapshotStateLocked(const std::set<const Message*>* excludedUnacked) const {
     PersistedState state;
     state.nextQueueID = nextQueueID.load();
     for (const auto& [name, exchange] : exchanges) {
@@ -798,6 +928,7 @@ PersistedState Broker::snapshotState() const {
         auto connection = weak.lock();
         if (!connection) continue;
         for (const Delivery& delivery : connection->snapshotUnacked()) {
+            if (excludedUnacked && excludedUnacked->count(delivery.message.get())) continue;
             unacked[delivery.queue].push_back(delivery);
         }
     }

@@ -55,6 +55,17 @@ struct PublishResult {
     size_t immediateDeliveries = 0;
 };
 
+struct TransactionPublish {
+    Message message;
+    bool mandatory = false;
+    bool immediate = false;
+};
+
+struct TransactionAcknowledgement {
+    Delivery delivery;
+    bool requeue = false;
+};
+
 struct Exchange {
     std::string name;
     std::string type;
@@ -164,7 +175,7 @@ public:
                    const std::string& routingKey, uint64_t connectionID,
                    const std::vector<uint8_t>& arguments = {});
     void unbindQueue(const std::string& queue, const std::string& exchange,
-                     const std::string& routingKey,
+                     const std::string& routingKey, uint64_t connectionID,
                      const std::vector<uint8_t>& arguments = {});
     size_t purgeQueue(const std::string& queue, uint64_t connectionID);
     size_t deleteQueue(const std::string& queue, bool ifUnused, bool ifEmpty,
@@ -186,6 +197,11 @@ public:
                           bool synchronize = false);
     void dispatch();
     bool flush();
+    bool commitTransaction(const std::vector<TransactionPublish>& publishes,
+                           const std::vector<TransactionAcknowledgement>& acknowledgements,
+                           const std::string& username,
+                           std::vector<PublishResult>& results);
+    void failNextFlushForTest() { failNextFlush = true; }
     PersistedState snapshotState() const;
     void restoreState(const PersistedState& state);
     std::shared_ptr<Message> get(const std::string& queue, uint64_t connectionID,
@@ -228,6 +244,7 @@ private:
     std::map<uint64_t, std::string> usernames;
     std::atomic<uint64_t> nextConnectionID{1};
     std::atomic<uint64_t> nextQueueID{1};
+    bool failNextFlush = false;
 
     std::vector<Task> dispatchLocked();
     void sendTasks(const std::vector<Task>& tasks);
@@ -237,6 +254,13 @@ private:
     static bool fieldValueEquals(const FieldValue& left, const FieldValue& right);
     static bool expired(const std::shared_ptr<Message>& message);
     void markDirtyLocked();
+    void routeLocked(const Message& input, std::shared_ptr<Message>& message,
+                     std::set<std::string>& routed, bool& durableRouted);
+    bool hasImmediateConsumerLocked(const std::string& queue, const Message& message) const;
+    bool removeImmediateLocked(const std::shared_ptr<Message>& message,
+                               const std::set<std::string>& routed);
+    bool flushLocked(const std::set<const Message*>* excludedUnacked = nullptr);
+    PersistedState snapshotStateLocked(const std::set<const Message*>* excludedUnacked = nullptr) const;
     void requeueLocked(const Delivery& delivery);
     void removeBindingsLocked(const std::string& queue);
     void eraseConsumersLocked(const std::string& queue);

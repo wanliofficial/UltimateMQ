@@ -7,6 +7,7 @@ empty and multi-frame content, mandatory/immediate Basic.Return, prefetch,
 acknowledgement, redelivery after disconnect, and reserved-bit rejection.
 """
 import os
+import select
 import signal
 import socket
 import struct
@@ -22,6 +23,7 @@ AMQP_PORT = int(sys.argv[2])
 FRAME_METHOD = 1
 FRAME_HEADER = 2
 FRAME_BODY = 3
+FRAME_HEARTBEAT = 8
 FRAME_END = 0xCE
 
 
@@ -535,13 +537,24 @@ def run():
         resumed.open_channel(1)
 
         resumed.declare_queue("queue.exclusive", exclusive=True)
+        resumed.declare_exchange("unbind.exchange", "direct")
+        resumed.bind("queue.exclusive", "unbind.exchange", "key")
         other = Client()
         other.sock.sendall(method(50, 10, struct.pack("!H", 0) +
                                   short_string("queue.exclusive") + b"\x01" +
                                   struct.pack("!I", 0)))
         assert expect_channel_close(other, 405) == (50, 10)
         other.close_channel()
+        other.open_channel()
+        other.sock.sendall(method(50, 50, struct.pack("!H", 0) +
+                                  short_string("queue.exclusive") +
+                                  short_string("unbind.exchange") + short_string("key") +
+                                  struct.pack("!I", 0)))
+        assert expect_channel_close(other, 405) == (50, 50)
+        other.close_channel()
         other.close()
+        resumed.publish("unbind.exchange", "key", b"still.bound")
+        assert resumed.get("queue.exclusive")[2] == b"still.bound"
 
         resumed.sock.sendall(method(50, 10, struct.pack("!H", 0) + short_string("bad.bits")
                                     + b"\x80" + struct.pack("!I", 0)))
@@ -723,6 +736,79 @@ def run_persistence():
             err.close()
 
 
+def run_heartbeat():
+    port = AMQP_PORT + 5
+    proc, _workdir, err = start_broker(port)
+    sock = None
+    try:
+        sock = sasl_start(port, "guest", "guest")
+        tune = expect_method(sock, 10, 30, 0)
+        _channels, _frame_max, _heartbeat = struct.unpack("!HIH", tune)
+        sock.sendall(method(10, 31, struct.pack("!HIH", 2047, 131072, 2), 0))
+        sock.sendall(method(10, 40, short_string("/") + short_string("") + b"\x00", 0))
+        expect_method(sock, 10, 41, 0)
+        sock.sendall(method(20, 10, short_string(""), 1))
+        expect_method(sock, 20, 11, 1)
+
+        deadline = time.monotonic() + 2.5
+        heartbeats = 0
+        while time.monotonic() < deadline:
+            readable, _writable, _exceptional = select.select([sock], [], [], 0.2)
+            if not readable:
+                continue
+            frame_type, channel, payload = read_frame(sock)
+            if frame_type == FRAME_HEARTBEAT:
+                assert channel == 0 and payload == b""
+                heartbeats += 1
+                sock.sendall(frame(FRAME_HEARTBEAT, 0, b""))
+                continue
+            assert frame_type == FRAME_METHOD, (frame_type, channel, payload)
+            class_id, method_id = struct.unpack("!HH", payload[:4])
+            raise AssertionError("heartbeat connection closed or sent unexpected method: %d/%d" %
+                                 (class_id, method_id))
+        assert heartbeats >= 1, "server did not send an idle heartbeat"
+        sock.sendall(method(20, 10, short_string(""), 2))
+        expect_method(sock, 20, 11, 2)
+        sock.close()
+        sock = None
+        print("PASS AMQP idle heartbeat negotiation and liveness")
+    finally:
+        if sock is not None:
+            sock.close()
+        stop_broker(proc, err)
+
+
+def run_immediate_restart():
+    port = AMQP_PORT + 6
+    workdir = tempfile.mkdtemp(prefix="flowmq-amqp-immediate-")
+    proc, _workdir, err = start_broker(port, workdir=workdir)
+    try:
+        client = Client(port)
+        queue = client.declare_queue("durable.immediate", durable=True)
+        client.confirm_select()
+        client.publish("", queue, b"immediate.restart", immediate=True)
+        arguments, _properties, body = read_content(client.sock, 60, 50)
+        assert parse_return(arguments, body) == (313, "NO_CONSUMERS", "", queue,
+                                                 b"immediate.restart")
+        expect_confirm(client.sock, 1)
+        client.close()
+        proc.kill()
+        proc.wait()
+        err.close()
+
+        proc, _workdir, err = start_broker(port, workdir=workdir)
+        client = Client(port)
+        assert client.declare_queue("durable.immediate", durable=True) == queue
+        assert client.get(queue) is None, "returned immediate message reappeared after restart"
+        client.close()
+        print("PASS AMQP confirmed immediate publish stays absent after restart")
+    finally:
+        if proc.poll() is None:
+            stop_broker(proc, err)
+        elif not err.closed:
+            err.close()
+
+
 def run_auth_acl():
     port = AMQP_PORT + 2
     proc, _workdir, err = start_broker(port, authenticate=True)
@@ -757,4 +843,6 @@ if __name__ == "__main__":
     run_auth_acl()
     run_features()
     run_persistence()
+    run_heartbeat()
+    run_immediate_restart()
     print("PASS AMQP password authentication, ACLs, and channel-scoped refusal")

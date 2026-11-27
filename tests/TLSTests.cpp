@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 #include "../src/TLS.h"
+#include "../src/KafkaServer.h"
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
@@ -305,6 +308,58 @@ TEST(TLSSigPipeTest, WritingToADepartedTLSPeerDoesNotRaiseSIGPIPE)
     // A clean shutdown must be equally safe.
     server.teardown();
     ::close(fds[0]);
+}
+
+TEST(KafkaTLSServerTest, StopShutsDownSocketsBeforeJoiningHandshakes)
+{
+    const std::string certPath = tempPath("kafka-stop", "cert");
+    const std::string keyPath = tempPath("kafka-stop", "key");
+    ASSERT_TRUE(generatePki(certPath, keyPath));
+
+    std::string error;
+    auto context = TLSContext::load(certPath, keyPath, false, std::string(), &error);
+    ASSERT_NE(context, nullptr) << error;
+
+    const int probe = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(probe, 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(::bind(probe, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+    socklen_t addressLength = sizeof(address);
+    ASSERT_EQ(::getsockname(probe, reinterpret_cast<sockaddr*>(&address), &addressLength), 0);
+    const int port = ntohs(address.sin_port);
+    ::close(probe);
+
+    Kafka::Server server(port, 1, "127.0.0.1", static_cast<uint16_t>(port), {},
+                         1024 * 1024, 1024 * 1024, 1024 * 1024, 64, 1000,
+                         context, std::make_unique<Auth>());
+    std::thread runner([&] { server.run(); });
+
+    std::vector<int> peers;
+    for (int attempt = 0; attempt < 100 && peers.empty(); ++attempt) {
+        const int peer = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (peer >= 0 && ::connect(peer, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0) {
+            peers.push_back(peer);
+        } else if (peer >= 0) {
+            ::close(peer);
+        }
+        if (peers.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_EQ(peers.size(), 1U);
+    for (int index = 1; index < 16; ++index) {
+        const int peer = ::socket(AF_INET, SOCK_STREAM, 0);
+        ASSERT_GE(peer, 0);
+        ASSERT_EQ(::connect(peer, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+        peers.push_back(peer);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    server.stop();
+    runner.join();
+    for (int peer : peers) ::close(peer);
+    std::remove(certPath.c_str());
+    std::remove(keyPath.c_str());
 }
 
 } // namespace MQTT

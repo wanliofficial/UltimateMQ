@@ -324,6 +324,8 @@ bool Auth::loadAcl(const std::string& path, std::string* error) {
         return false;
     }
     std::map<std::string, std::vector<std::pair<std::string, bool>>> loadedAcl;
+    std::map<std::string, std::vector<std::pair<std::string, KafkaOperation>>> loadedKafkaAcl;
+    bool loadedKafkaAclEnabled = false;
     std::string line;
     int lineNo = 0;
     while (std::getline(in, line)) {
@@ -331,33 +333,49 @@ bool Auth::loadAcl(const std::string& path, std::string* error) {
         std::string trimmed = trim(line);
         if (trimmed.empty() || trimmed[0] == '#') continue;
         std::stringstream ss(trimmed);
-        std::string user, action, topic;
-        if (!std::getline(ss, user, ',') || !std::getline(ss, action, ',') || !std::getline(ss, topic)) {
-            if (error) *error = "acl file line " + std::to_string(lineNo) + ": expected user,read|write,topic-filter";
+        std::string user, action, resource;
+        if (!std::getline(ss, user, ',') || !std::getline(ss, action, ',') || !std::getline(ss, resource)) {
+            if (error) *error = "acl file line " + std::to_string(lineNo) + ": expected user,action,resource";
             return false;
         }
         user = trim(user);
         action = trim(action);
-        topic = trim(topic);
-        bool write;
-        if (action == "write") write = true;
-        else if (action == "read") write = false;
-        else {
-            if (error) *error = "acl file line " + std::to_string(lineNo) + ": action must be read or write";
+        resource = trim(resource);
+        if (user.empty() || resource.empty()) {
+            if (error) *error = "acl file line " + std::to_string(lineNo) + ": empty user or resource";
             return false;
         }
-        if (user.empty() || topic.empty()) {
-            if (error) *error = "acl file line " + std::to_string(lineNo) + ": empty user or topic";
+        if (action == "read" || action == "write") {
+            loadedAcl[user].emplace_back(resource, action == "write");
+            continue;
+        }
+        std::optional<KafkaOperation> operation;
+        if (action == "group-read") operation = KafkaOperation::GROUP_READ;
+        else if (action == "group-write") operation = KafkaOperation::GROUP_WRITE;
+        else if (action == "group-describe") operation = KafkaOperation::GROUP_DESCRIBE;
+        else if (action == "group-delete") operation = KafkaOperation::GROUP_DELETE;
+        else if (action == "txn-id-write") operation = KafkaOperation::TRANSACTIONAL_ID_WRITE;
+        else if (action == "cluster-admin") {
+            if (resource != "cluster") {
+                if (error) *error = "acl file line " + std::to_string(lineNo) + ": cluster resource must be cluster";
+                return false;
+            }
+            operation = KafkaOperation::CLUSTER_ADMIN;
+        } else {
+            if (error) *error = "acl file line " + std::to_string(lineNo) + ": unsupported action " + action;
             return false;
         }
-        loadedAcl[user].emplace_back(topic, write);
+        loadedKafkaAcl[user].emplace_back(resource, *operation);
+        loadedKafkaAclEnabled = true;
     }
     if (in.bad()) {
         if (error) *error = "cannot read acl file: " + path;
         return false;
     }
     acl_ = std::move(loadedAcl);
+    kafkaAcl_ = std::move(loadedKafkaAcl);
     aclEnabled_ = true;
+    kafkaAclEnabled_ = loadedKafkaAclEnabled;
     return true;
 }
 
@@ -423,6 +441,24 @@ bool Auth::isForbidden(const std::string& username, const std::string& topic, bo
         return false;
     }
     return !checkAcl(username, topic, write);
+}
+
+bool Auth::isKafkaForbidden(const std::string& username, const std::string& resource,
+                            KafkaOperation operation) const {
+    if (!kafkaAclEnabled_) return false;
+    for (const std::string& key : {username, std::string("*")}) {
+        auto found = kafkaAcl_.find(key);
+        if (found == kafkaAcl_.end()) continue;
+        for (const auto& rule : found->second) {
+            if (rule.second != operation) continue;
+            const std::string& pattern = rule.first;
+            if (pattern == "*" || pattern == resource ||
+                (pattern.back() == '*' && resource.compare(0, pattern.size() - 1, pattern, 0, pattern.size() - 1) == 0)) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 bool Auth::isForbiddenSubscribe(const std::string& username, const std::string& filter) const {

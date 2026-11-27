@@ -1,9 +1,11 @@
 #include "AMQPBroker.h"
+#include "AMQPConnection.h"
 #include "AMQPStore.h"
 #include "AMQPWire.h"
 #include <gtest/gtest.h>
 #include <cstdio>
 #include <memory>
+#include <sys/socket.h>
 #include <unistd.h>
 
 using namespace AMQP;
@@ -205,6 +207,26 @@ TEST(AMQPBrokerTests, PassiveDeclarationHonorsExclusiveOwnership) {
                  BrokerError);
 }
 
+TEST(AMQPBrokerTests, UnbindHonorsExclusiveQueueOwnership) {
+    Broker broker;
+    broker.declareExchange("unbind.exchange", "direct", false, false, false, false, 1);
+    broker.declareQueue("unbind.queue", false, false, true, false, 1);
+    broker.bindQueue("unbind.queue", "unbind.exchange", "key", 1);
+
+    EXPECT_THROW(broker.unbindQueue("unbind.queue", "unbind.exchange", "key", 2),
+                 BrokerError);
+    Message message;
+    message.exchange = "unbind.exchange";
+    message.routingKey = "key";
+    message.body = {'x'};
+    EXPECT_TRUE(broker.publish(message, "", false, false, 1).routed);
+    EXPECT_EQ(broker.queueMessageCount("unbind.queue"), 1u);
+
+    EXPECT_NO_THROW(broker.unbindQueue("unbind.queue", "unbind.exchange", "key", 1));
+    EXPECT_FALSE(broker.publish(message, "", false, false, 1).routed);
+    EXPECT_EQ(broker.queueMessageCount("unbind.queue"), 1u);
+}
+
 TEST(AMQPBrokerTests, AutoDeleteExchangeIsRemovedAfterLastBinding) {
     Broker broker;
     broker.declareExchange("auto.exchange", "direct", false, false, true, false, 1);
@@ -212,7 +234,7 @@ TEST(AMQPBrokerTests, AutoDeleteExchangeIsRemovedAfterLastBinding) {
     broker.bindQueue("queue.auto", "auto.exchange", "key", 1);
     EXPECT_NO_THROW(broker.declareExchange("auto.exchange", "direct", true, false, true,
                                            false, 1));
-    broker.unbindQueue("queue.auto", "auto.exchange", "key");
+    broker.unbindQueue("queue.auto", "auto.exchange", "key", 1);
     EXPECT_THROW(broker.declareExchange("auto.exchange", "direct", true, false, true,
                                         false, 1), BrokerError);
 }
@@ -325,6 +347,118 @@ TEST(AMQPStoreTests, DurableTopologyBindingsAndMessagesSurviveRestart) {
         restored.publish(message, "", false, false, 1);
         EXPECT_EQ(restored.queueMessageCount("durable.queue"), 1u);
     }
+    std::remove(path.c_str());
+    std::remove((path + ".tmp").c_str());
+}
+
+TEST(AMQPStoreTests, ConfirmedImmediateWithoutConsumersDoesNotReappear) {
+    const std::string path = "/tmp/flowmq_amqp_immediate_" + std::to_string(::getpid());
+    std::remove(path.c_str());
+    std::remove((path + ".tmp").c_str());
+    {
+        Store store(path, std::chrono::milliseconds(1000));
+        Broker broker(nullptr, 4096, 1024 * 1024, &store);
+        broker.declareQueue("durable.immediate", false, true, false, false, 1);
+        Message message;
+        message.routingKey = "durable.immediate";
+        message.body = {'x'};
+        const PublishResult result = broker.publish(message, "", false, true, 1, true);
+        EXPECT_TRUE(result.routed);
+        EXPECT_EQ(result.immediateDeliveries, 0u);
+        ASSERT_TRUE(broker.flush());
+
+        PersistedState loaded;
+        std::string error;
+        ASSERT_TRUE(store.load(loaded, &error)) << error;
+        Broker restored(nullptr, 4096, 1024 * 1024, &store);
+        restored.restoreState(loaded);
+        EXPECT_EQ(restored.queueMessageCount("durable.immediate"), 0u);
+    }
+    std::remove(path.c_str());
+    std::remove((path + ".tmp").c_str());
+}
+
+TEST(AMQPBrokerTests, TransactionPublishFailureRollsBackQueueAndSnapshot) {
+    const std::string path = "/tmp/flowmq_amqp_tx_failure_" + std::to_string(::getpid());
+    std::remove(path.c_str());
+    std::remove((path + ".tmp").c_str());
+    {
+        Store store(path, std::chrono::milliseconds(1000));
+        Broker broker(nullptr, 4096, 1024 * 1024, &store);
+        broker.declareQueue("durable.tx", false, true, false, false, 1);
+        ASSERT_TRUE(broker.flush());
+        Message message;
+        message.routingKey = "durable.tx";
+        message.body = {'x'};
+        const std::vector<TransactionPublish> publishes{TransactionPublish{message, false, false}};
+        std::vector<PublishResult> results;
+
+        broker.failNextFlushForTest();
+        EXPECT_FALSE(broker.commitTransaction(publishes, {}, "", results));
+        EXPECT_EQ(broker.queueMessageCount("durable.tx"), 0u);
+        PersistedState loaded;
+        std::string error;
+        ASSERT_TRUE(store.load(loaded, &error)) << error;
+        Broker restored(nullptr, 4096, 1024 * 1024, &store);
+        restored.restoreState(loaded);
+        EXPECT_EQ(restored.queueMessageCount("durable.tx"), 0u);
+
+        ASSERT_TRUE(broker.commitTransaction(publishes, {}, "", results));
+        ASSERT_EQ(results.size(), 1u);
+        EXPECT_TRUE(results[0].routed);
+        EXPECT_EQ(broker.queueMessageCount("durable.tx"), 1u);
+        ASSERT_TRUE(store.load(loaded, &error)) << error;
+        restored.restoreState(loaded);
+        EXPECT_EQ(restored.queueMessageCount("durable.tx"), 1u);
+    }
+    std::remove(path.c_str());
+    std::remove((path + ".tmp").c_str());
+}
+
+TEST(AMQPBrokerTests, TransactionAcknowledgementFailureKeepsDeliveryAndSnapshot) {
+    const std::string path = "/tmp/flowmq_amqp_tx_ack_" + std::to_string(::getpid());
+    std::remove(path.c_str());
+    std::remove((path + ".tmp").c_str());
+    int sockets[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
+    {
+        Store store(path, std::chrono::milliseconds(1000));
+        Broker broker(nullptr, 4096, 1024 * 1024, &store);
+        auto connection = std::make_shared<Connection>(sockets[0], &broker, nullptr, 1000,
+                                                       1024 * 1024);
+        const uint64_t connectionID = broker.registerConnection(connection);
+        connection->openChannelForTest(1, "consumer", "durable.ack");
+        broker.declareQueue("durable.ack", false, true, false, false, connectionID);
+        broker.consume(connection, 1, "durable.ack", "consumer", false, false, false,
+                       connectionID);
+        Message message;
+        message.routingKey = "durable.ack";
+        message.body = {'x'};
+        ASSERT_TRUE(broker.publish(message, "", false, false, connectionID).routed);
+        const auto unacked = connection->snapshotUnacked();
+        ASSERT_EQ(unacked.size(), 1u);
+        ASSERT_TRUE(broker.flush());
+        const std::vector<TransactionAcknowledgement> acknowledgements{
+            TransactionAcknowledgement{unacked.front(), false}};
+        std::vector<PublishResult> results;
+
+        broker.failNextFlushForTest();
+        EXPECT_FALSE(broker.commitTransaction({}, acknowledgements, "", results));
+        EXPECT_EQ(connection->snapshotUnacked().size(), 1u);
+        PersistedState loaded;
+        std::string error;
+        ASSERT_TRUE(store.load(loaded, &error)) << error;
+        Broker restored(nullptr, 4096, 1024 * 1024, &store);
+        restored.restoreState(loaded);
+        EXPECT_EQ(restored.queueMessageCount("durable.ack"), 1u);
+
+        ASSERT_TRUE(broker.commitTransaction({}, acknowledgements, "", results));
+        EXPECT_TRUE(connection->discardDelivery(1, unacked.front().deliveryTag).has_value());
+        ASSERT_TRUE(store.load(loaded, &error)) << error;
+        restored.restoreState(loaded);
+        EXPECT_EQ(restored.queueMessageCount("durable.ack"), 0u);
+    }
+    ::close(sockets[1]);
     std::remove(path.c_str());
     std::remove((path + ".tmp").c_str());
 }
