@@ -117,7 +117,7 @@ void Server::joinClients() {
     {
         std::lock_guard<std::mutex> lock(clientsMutex);
         remaining.swap(clients);
-        for (auto& entry : connections) entry.second->close();
+        for (auto& entry : connections) entry.second->shutdown();
         connections.clear();
     }
     for (Client& client : remaining) {

@@ -379,7 +379,8 @@ void Broker::enforceRetentionLocked(Topic& topic, Partition& partition) {
         partition.records.pop_front();
         dirty = true;
     };
-    while (!partition.records.empty() &&
+    const int64_t stableOffset = lastStableOffsetLocked(topic, partition);
+    while (!partition.records.empty() && partition.records.front().offset < stableOffset &&
            ((retentionMs >= 0 && now - partition.records.front().timestamp >= retentionMs) ||
             (retentionBytes >= 0 && partition.bytes > static_cast<size_t>(retentionBytes)))) {
         removeOldest();
@@ -437,6 +438,8 @@ ProduceResult Broker::produce(const std::string& topicName, int32_t partitionID,
         if (result.error != Error::NONE) return result;
         if (producer) producer->partitionOffsets.emplace(std::make_pair(topicName, partitionID), result.baseOffset);
         recordSequenceLocked(topicName, partitionID, records, result.baseOffset);
+        enforceRetentionLocked(topic, partition);
+        result.logStartOffset = partition.logStartOffset;
         if (requiredAcks != 0 && !flushLocked()) {
             partition = std::move(originalPartition);
             if (originalSequence) sequences[sequenceKey] = *originalSequence;
@@ -495,7 +498,6 @@ ProduceResult Broker::appendLocked(Topic& topic, Partition& partition,
         partition.records.push_back(std::move(record));
     }
     dirty = true;
-    enforceRetentionLocked(topic, partition);
     return {Error::NONE, baseOffset, partition.logStartOffset};
 }
 
@@ -1255,8 +1257,11 @@ bool Broker::flushLocked() {
         return true;
     }
     try {
-        writeSnapshot(stateFile);
+        const bool directorySynced = writeSnapshot(stateFile);
         dirty = false;
+        if (!directorySynced) {
+            MQTT::logError("Kafka state replaced but parent-directory fsync failed");
+        }
         return true;
     } catch (const std::exception& error) {
         MQTT::logError("cannot persist Kafka state: %s", error.what());
@@ -1264,7 +1269,7 @@ bool Broker::flushLocked() {
     }
 }
 
-void Broker::writeSnapshot(const std::string& path) const {
+bool Broker::writeSnapshot(const std::string& path) const {
     Writer body;
     body.writeInt32(id);
     body.writeArrayLength(topicMap.size());
@@ -1373,7 +1378,13 @@ void Broker::writeSnapshot(const std::string& path) const {
         }
         written += static_cast<size_t>(count);
     }
-    if (::fsync(descriptor) != 0) {
+    if (::fsync(descriptor) != 0 || failNextFileSync) {
+        if (failNextFileSync) {
+            failNextFileSync = false;
+            ::close(descriptor);
+            ::unlink(temporary.c_str());
+            throw std::runtime_error("injected state-file fsync failure");
+        }
         ::close(descriptor);
         ::unlink(temporary.c_str());
         throw std::runtime_error(std::strerror(errno));
@@ -1386,14 +1397,26 @@ void Broker::writeSnapshot(const std::string& path) const {
         ::unlink(temporary.c_str());
         throw std::runtime_error(std::strerror(errno));
     }
+    if (failNextDirectorySync) {
+        failNextDirectorySync = false;
+        MQTT::logError("injected Kafka parent-directory fsync failure");
+        return false;
+    }
     const size_t slash = path.find_last_of('/');
     const std::string directory = slash == std::string::npos ? "." : path.substr(0, slash);
     const int directoryDescriptor = ::open(directory.c_str(), O_RDONLY);
-    if (directoryDescriptor < 0) throw std::runtime_error(std::strerror(errno));
+    if (directoryDescriptor < 0) {
+        MQTT::logError("cannot open Kafka state directory %s: %s", directory.c_str(), std::strerror(errno));
+        return false;
+    }
     const int syncResult = ::fsync(directoryDescriptor);
     const int syncError = errno;
     ::close(directoryDescriptor);
-    if (syncResult != 0) throw std::runtime_error(std::strerror(syncError));
+    if (syncResult != 0) {
+        MQTT::logError("cannot fsync Kafka state directory %s: %s", directory.c_str(), std::strerror(syncError));
+        return false;
+    }
+    return true;
 }
 
 bool Broker::load() {

@@ -49,8 +49,7 @@ bool flag(uint8_t bits, unsigned shift) {
 }
 
 std::chrono::milliseconds heartbeatTimeout(uint16_t value) {
-    return value == 0 ? std::chrono::milliseconds(250)
-                      : std::chrono::milliseconds(static_cast<int>(value) * 1000 / 2);
+    return std::chrono::seconds(value);
 }
 
 std::vector<uint8_t> closeArguments(uint16_t code, const std::string& text,
@@ -289,7 +288,7 @@ std::optional<Frame> Connection::readFrame() {
         if (now - lastActivity >= timeout) {
             throw ConnectionError(CONNECTION_FORCED, "heartbeat timeout");
         }
-        if (now - lastWrite >= std::chrono::seconds(heartbeat)) {
+        if (now - lastWrite >= std::chrono::milliseconds(static_cast<int64_t>(heartbeat) * 500)) {
             if (!writeFrame(encodeFrame(FRAME_HEARTBEAT, 0, {}, frameMax))) {
                 return std::nullopt;
             }
@@ -861,7 +860,8 @@ void Connection::handleQueue(const Method& method, uint16_t channel) {
         std::string routingKey = reader.shortString();
         auto arguments = reader.table();
         reader.requireEnd();
-        broker->unbindQueue(queue, exchange, routingKey, Writer{}.table(arguments).data());
+        broker->unbindQueue(queue, exchange, routingKey, id,
+                            Writer{}.table(arguments).data());
         if (!sendMethod(CLASS_QUEUE, 51, {}, channel)) close();
         return;
     }
@@ -1214,8 +1214,8 @@ void Connection::handleTX(const Method& method, uint16_t channel) {
     }
     case 20: {
         reader.requireEnd();
-        std::vector<StagedPublish> publishes;
-        std::vector<TransactionAck> acknowledgements;
+        std::vector<TransactionPublish> publishes;
+        std::vector<TransactionAcknowledgement> acknowledgements;
         {
             std::lock_guard<std::mutex> lock(stateMutex);
             Channel& state = requireChannel(channel, CLASS_TX, method.methodID);
@@ -1225,30 +1225,49 @@ void Connection::handleTX(const Method& method, uint16_t channel) {
                 throw ChannelError(PRECONDITION_FAILED, "channel is not transacted",
                                    CLASS_TX, method.methodID);
             }
-            publishes.swap(state.transactionPublishes);
+            publishes.reserve(state.transactionPublishes.size());
+            for (const StagedPublish& publish : state.transactionPublishes) {
+                publishes.push_back(TransactionPublish{publish.message, publish.mandatory,
+                                                        publish.immediate});
+            }
             acknowledgements.reserve(state.transactionAcks.size());
-            for (auto& [tag, acknowledgement] : state.transactionAcks) {
+            for (const auto& [tag, acknowledgement] : state.transactionAcks) {
                 (void)tag;
-                acknowledgements.push_back(std::move(acknowledgement));
-            }
-            state.transactionAcks.clear();
-        }
-        for (auto& publish : publishes) {
-            if (!publishNow(channel, publish.message, publish.mandatory, publish.immediate, 0)) {
-                return;
+                acknowledgements.push_back(TransactionAcknowledgement{
+                    acknowledgement.delivery, acknowledgement.requeue});
             }
         }
-        for (const auto& acknowledgement : acknowledgements) {
-            const uint64_t tag = acknowledgement.delivery.deliveryTag;
-            broker->acknowledge(shared_from_this(), channel, [this, channel, tag]() {
-                auto delivery = discardDelivery(channel, tag);
-                return delivery ? std::vector<Delivery>{*delivery} : std::vector<Delivery>{};
-            }, acknowledgement.requeue, id);
-        }
-        if (!broker->flush()) {
+        std::vector<PublishResult> results;
+        if (!broker->commitTransaction(publishes, acknowledgements, user, results)) {
             failChannel(channel, ChannelError(RESOURCE_ERROR, "failed to persist transaction",
                                               CLASS_TX, method.methodID));
             return;
+        }
+        for (const TransactionAcknowledgement& acknowledgement : acknowledgements) {
+            (void)discardDelivery(channel, acknowledgement.delivery.deliveryTag);
+        }
+        {
+            std::lock_guard<std::mutex> lock(stateMutex);
+            auto state = channels.find(channel);
+            if (state != channels.end()) {
+                state->second.transactionPublishes.clear();
+                state->second.transactionAcks.clear();
+            }
+        }
+        for (size_t index = 0; index < publishes.size(); ++index) {
+            const TransactionPublish& publish = publishes[index];
+            const PublishResult& result = results[index];
+            if (publish.mandatory && !result.routed) {
+                if (!sendReturn(channel, REPLY_NO_ROUTE, "NO_ROUTE", publish.message)) {
+                    close();
+                    return;
+                }
+            } else if (publish.immediate && result.immediateDeliveries == 0) {
+                if (!sendReturn(channel, REPLY_NO_CONSUMERS, "NO_CONSUMERS", publish.message)) {
+                    close();
+                    return;
+                }
+            }
         }
         if (!sendMethod(CLASS_TX, 21, {}, channel)) close();
         return;
@@ -1294,7 +1313,11 @@ void Connection::handleAcknowledgement(uint16_t channel, uint64_t tag, bool mult
     std::lock_guard<std::mutex> lock(stateMutex);
     Channel& state = requireChannel(channel, CLASS_BASIC, 80);
     for (const Delivery& delivery : deliveries) {
-        state.transactionAcks[delivery.deliveryTag] = TransactionAck{delivery, requeue};
+        if (!state.transactionAcks.emplace(delivery.deliveryTag,
+                                           TransactionAck{delivery, requeue}).second) {
+            throw ChannelError(PRECONDITION_FAILED, "delivery tag already acknowledged",
+                               CLASS_BASIC, 80);
+        }
     }
 }
 
@@ -1477,6 +1500,13 @@ std::vector<Delivery> Connection::snapshotUnacked() const {
         }
     }
     return result;
+}
+
+void Connection::openChannelForTest(uint16_t channel, const std::string& consumerTag,
+                                    const std::string& queue) {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    channels[channel].open = true;
+    if (!consumerTag.empty()) channels[channel].consumerQueues[consumerTag] = queue;
 }
 
 std::vector<Delivery> Connection::allUnacked(uint16_t channel) {

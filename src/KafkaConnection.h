@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -29,6 +30,7 @@ public:
     Connection& operator=(const Connection&) = delete;
 
     void run();
+    void shutdown();
     void close();
     void setUsername(std::string username) { user = std::move(username); }
 
@@ -44,6 +46,7 @@ private:
     bool authenticated = false;
     bool authenticationFailed = false;
     std::atomic<bool> closed{false};
+    std::mutex closeMutex;
     std::string user;
     bool suppressResponse = false;
 

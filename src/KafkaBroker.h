@@ -215,6 +215,9 @@ public:
     bool load();
     bool flush();
 
+    void failNextFileSyncForTest() { failNextFileSync = true; }
+    void failNextDirectorySyncForTest() { failNextDirectorySync = true; }
+
 private:
     struct Partition {
         int64_t logStartOffset = 0;
@@ -275,6 +278,8 @@ private:
     std::map<int64_t, int16_t> producerEpochs;
     int64_t nextProducerID = 1;
     bool dirty = false;
+    mutable bool failNextFileSync = false;
+    mutable bool failNextDirectorySync = false;
 
     Topic& requireTopic(const std::string& name, const std::string& username, bool write);
     void checkWritePermission(const std::string& topic, const std::string& username) const;
@@ -304,7 +309,7 @@ private:
     bool flushLocked();
     void expireGroupsLocked();
     void expireTransactionsLocked();
-    void writeSnapshot(const std::string& path) const;
+    bool writeSnapshot(const std::string& path) const;
 };
 
 } // namespace Kafka

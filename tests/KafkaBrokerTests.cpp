@@ -339,6 +339,86 @@ TEST(KafkaBrokerTest, TransactionTimeoutAbortsAndReleasesLSO) {
     EXPECT_FALSE(fetched.records[1].controlCommit);
 }
 
+TEST(KafkaBrokerTest, RetentionDoesNotDeleteOpenTransactionRecords) {
+    Broker broker;
+    broker.createTopic("events", 1, 1, {{"retention.ms", "1"}}, {});
+    std::vector<ProducedRecord> stable;
+    stable.push_back({std::nullopt, std::vector<uint8_t>{'a'}, 0, {}});
+    ASSERT_EQ(broker.produce("events", 0, stable, 1, {}).error, Error::NONE);
+
+    const auto producer = broker.initProducerID("txn", 30000, "client");
+    ASSERT_EQ(producer.error, Error::NONE);
+    ASSERT_EQ(broker.addPartitionsToTxn("txn", producer.producerID, producer.producerEpoch,
+                                        {{"events", {0}}}, {}).at({"events", 0}), Error::NONE);
+    std::vector<ProducedRecord> transactional;
+    transactional.push_back({std::nullopt, std::vector<uint8_t>{'b'}, 0, {},
+                             producer.producerID, producer.producerEpoch, 0});
+    ASSERT_EQ(broker.produce("events", 0, transactional, 1, {}, "txn").error, Error::NONE);
+    std::vector<ProducedRecord> later;
+    later.push_back({std::nullopt, std::vector<uint8_t>{'c'}, 0, {}});
+    ASSERT_EQ(broker.produce("events", 0, later, 1, {}).error, Error::NONE);
+
+    const FetchResult fetched = broker.fetch("events", 0, 1, 1024, {});
+    EXPECT_EQ(fetched.logStartOffset, 1);
+    EXPECT_EQ(fetched.highWatermark, 3);
+    ASSERT_EQ(fetched.records.size(), 2U);
+    EXPECT_EQ(fetched.records[0].offset, 1);
+    EXPECT_TRUE(fetched.records[0].transactional);
+    EXPECT_EQ(fetched.records[1].offset, 2);
+    EXPECT_EQ(broker.fetch("events", 0, 1, 1024, {}, true).lastStableOffset, 1);
+}
+
+TEST(KafkaBrokerTest, FileSyncFailureRollsBackUnpublishedProduce) {
+    const std::string path = temporaryStatePath();
+    std::remove(path.c_str());
+    {
+        Broker broker(nullptr, 1, path);
+        broker.createTopic("events", 1, 1, {}, {});
+        std::vector<ProducedRecord> first;
+        first.push_back({std::nullopt, std::vector<uint8_t>{'a'}, 1000, {}});
+        ASSERT_EQ(broker.produce("events", 0, first, 1, {}).error, Error::NONE);
+
+        broker.failNextFileSyncForTest();
+        std::vector<ProducedRecord> failed;
+        failed.push_back({std::nullopt, std::vector<uint8_t>{'b'}, 1001, {}});
+        EXPECT_EQ(broker.produce("events", 0, failed, 1, {}).error, Error::UNKNOWN_SERVER_ERROR);
+        EXPECT_EQ(broker.fetch("events", 0, 0, 1024, {}).highWatermark, 1);
+
+        Broker restored(nullptr, 1, path);
+        ASSERT_TRUE(restored.load());
+        EXPECT_EQ(restored.fetch("events", 0, 0, 1024, {}).highWatermark, 1);
+    }
+    std::remove(path.c_str());
+}
+
+TEST(KafkaBrokerTest, DirectorySyncFailureKeepsInstalledSnapshotAndMemory) {
+    const std::string path = temporaryStatePath();
+    std::remove(path.c_str());
+    {
+        Broker broker(nullptr, 1, path);
+        broker.createTopic("events", 1, 1, {}, {});
+        std::vector<ProducedRecord> first;
+        first.push_back({std::nullopt, std::vector<uint8_t>{'a'}, 1000, {}});
+        ASSERT_EQ(broker.produce("events", 0, first, 1, {}).error, Error::NONE);
+
+        broker.failNextDirectorySyncForTest();
+        std::vector<ProducedRecord> installed;
+        installed.push_back({std::nullopt, std::vector<uint8_t>{'b'}, 1001, {}});
+        const ProduceResult result = broker.produce("events", 0, installed, 1, {});
+        ASSERT_EQ(result.error, Error::NONE) << result.error;
+        EXPECT_EQ(result.baseOffset, 1);
+        EXPECT_EQ(broker.fetch("events", 0, 0, 1024, {}).highWatermark, 2);
+
+        Broker restored(nullptr, 1, path);
+        ASSERT_TRUE(restored.load());
+        const FetchResult fetched = restored.fetch("events", 0, 0, 1024, {});
+        EXPECT_EQ(fetched.highWatermark, 2);
+        ASSERT_EQ(fetched.records.size(), 2U);
+        EXPECT_EQ(fetched.records[1].value, std::optional<std::vector<uint8_t>>(std::vector<uint8_t>{'b'}));
+    }
+    std::remove(path.c_str());
+}
+
 TEST(KafkaBrokerTest, SingleNodeElectionRequiresClusterAdministration) {
     Broker broker;
     broker.createTopic("events", 1, 1, {}, {});

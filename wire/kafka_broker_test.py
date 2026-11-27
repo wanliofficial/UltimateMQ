@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Kafka wire probe: Produce/Fetch, ApiVersions, partition management and Connect.
 
-Wire layouts follow the Apache Kafka protocol message schemas: Produce v3,
-Fetch v0, ApiVersions v0, ElectLeaders v1, and flexible AlterPartitions v0
+Wire layouts follow the Apache Kafka protocol message schemas: Produce v2/v3,
+Fetch v0, ApiVersions v0/v4, ElectLeaders v1, and flexible AlterPartitions v0
 (request header v2 / response header v1). Connect endpoints follow the Kafka
 Connect REST API; this broker intentionally reports no running connector tasks.
 """
@@ -115,8 +115,30 @@ def uvarint(value):
     return bytes(result)
 
 
+def varint(value):
+    return uvarint(value * 2 if value >= 0 else -value * 2 - 1)
+
+
+def crc32c(data):
+    crc = 0xffffffff
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ (0x82f63b78 if crc & 1 else 0)
+    return crc ^ 0xffffffff
+
+
 def compact_string(value):
     return uvarint(len(value.encode()) + 1) + value.encode()
+
+
+def record_batch(value):
+    timestamp = 1700000000000
+    record = (b"\x00" + varint(0) + varint(0) + varint(-1) +
+              varint(len(value)) + value + varint(0))
+    body = (i16(0) + i32(0) + i64(timestamp) + i64(timestamp) + i64(-1) +
+            i16(-1) + i32(-1) + i32(1) + varint(len(record)) + record)
+    return i64(0) + i32(len(body) + 9) + i32(-1) + i8(2) + struct.pack(">I", crc32c(body)) + body
 
 
 def legacy_record(value):
@@ -237,6 +259,16 @@ def run(binary, port):
             assert ranges[56] == (0, 0) and ranges[43] == (0, 1)
             versions.done()
 
+            versions_v4 = client.request(18, 4, compact_string("wire-probe") +
+                                         compact_string("1") + uvarint(0), flexible=True)
+            assert versions_v4.i16() == 35
+            ranges_v4 = {}
+            for _ in range(versions_v4.array()):
+                key, minimum, maximum = versions_v4.i16(), versions_v4.i16(), versions_v4.i16()
+                ranges_v4[key] = (minimum, maximum)
+            assert ranges_v4[18] == (0, 2)
+            versions_v4.done()
+
             metadata = client.request(3, 0, i32(-1))
             metadata.array()
             assert metadata.i32() == 1
@@ -300,6 +332,26 @@ def run(binary, port):
             assert limited.array() == 1 and limited.i32() == 0 and limited.i16() == 0
             assert limited.i64() == 1 and limited.take(limited.i32()) == b""
             limited.done()
+
+            record_v2 = record_batch(b"wire-v2")
+            produce_v2 = client.request(0, 2, i16(1) + i32(5000) + i32(1) +
+                                        string("events.v2") + i32(1) + i32(0) +
+                                        i32(len(record_v2)) + record_v2)
+            assert produce_v2.i32() == 1 and produce_v2.string() == "events.v2"
+            assert produce_v2.array() == 1 and produce_v2.i32() == 0
+            assert produce_v2.i16() == 0 and produce_v2.i64() == 0
+            assert produce_v2.i64() == -1 and produce_v2.i32() == 0
+            produce_v2.done()
+
+            record_v3 = record_batch(b"wire-v3")
+            produce_v3 = client.request(0, 3, i16(-1) + i16(1) + i32(5000) + i32(1) +
+                                        string("events.v3") + i32(1) + i32(0) +
+                                        i32(len(record_v3)) + record_v3)
+            assert produce_v3.i32() == 1 and produce_v3.string() == "events.v3"
+            assert produce_v3.array() == 1 and produce_v3.i32() == 0
+            assert produce_v3.i16() == 0 and produce_v3.i64() == 0
+            assert produce_v3.i64() == -1 and produce_v3.i32() == 0
+            produce_v3.done()
 
             alter_body = (uvarint(2) + compact_string("events") + uvarint(2) +
                           i32(0) + i32(1) + uvarint(2) + i32(1) +

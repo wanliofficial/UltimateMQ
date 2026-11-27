@@ -103,8 +103,8 @@ std::string peerHost(int descriptor) {
     return source && ::inet_ntop(address.ss_family, source, host, sizeof(host)) ? host : "";
 }
 
-void writeApiVersions(Writer& writer, int16_t version) {
-    writer.writeInt16(Error::NONE);
+void writeApiVersions(Writer& writer, int16_t version, int16_t error = Error::NONE) {
+    writer.writeInt16(error);
     writer.writeArrayLength(apiRanges().size());
     for (const APIRange& range : apiRanges()) {
         writer.writeInt16(range.key);
@@ -154,7 +154,8 @@ void writeMetadata(Writer& writer, Broker& broker, Reader& reader,
 void handleProduce(Writer& writer, Broker& broker, Reader& reader,
                    int16_t version, const std::string& username, bool& suppressResponse) {
     std::string transactionalID;
-    if (version >= 2) transactionalID = reader.readNullableString();
+    // Kafka Produce v3 adds transactionalId; v2 still starts with requiredAcks.
+    if (version >= 3) transactionalID = reader.readNullableString();
     const int16_t requiredAcks = reader.readInt16();
     suppressResponse = requiredAcks == 0;
     (void)reader.readInt32();
@@ -174,7 +175,8 @@ void handleProduce(Writer& writer, Broker& broker, Reader& reader,
         const int32_t partitionCount = reader.readArrayLength();
         for (int32_t partitionIndex = 0; partitionIndex < partitionCount; ++partitionIndex) {
             const int32_t partitionID = reader.readInt32();
-            const std::vector<uint8_t> messageSet = reader.readBytes();
+            const std::vector<uint8_t> messageSet = version >= 3
+                ? reader.readNullableBytes() : reader.readBytes();
             try {
                 std::vector<ProducedRecord> records =
                     decodeProduceRecords(messageSet, version, broker.maxMessageBytes(),
@@ -989,11 +991,20 @@ Connection::~Connection() {
     close();
 }
 
+void Connection::shutdown() {
+    std::lock_guard<std::mutex> lock(closeMutex);
+    if (descriptor >= 0) ::shutdown(descriptor, SHUT_RDWR);
+}
+
 void Connection::close() {
+    std::lock_guard<std::mutex> lock(closeMutex);
     if (closed.exchange(true)) return;
-    ::shutdown(descriptor, SHUT_RDWR);
+    if (descriptor >= 0) ::shutdown(descriptor, SHUT_RDWR);
     if (transport) transport->teardown();
-    ::close(descriptor);
+    if (descriptor >= 0) {
+        ::close(descriptor);
+        descriptor = -1;
+    }
 }
 
 bool Connection::readExact(uint8_t* data, size_t size) {
@@ -1031,11 +1042,12 @@ void Connection::run() {
         header.apiKey = reader.readInt16();
         header.apiVersion = reader.readInt16();
         header.correlationID = reader.readInt32();
-        header.clientID = header.apiKey == ALTER_PARTITIONS
-                              ? reader.readCompactNullableString() : reader.readNullableString();
-        if (header.apiKey == ALTER_PARTITIONS) skipTags(reader, "request header");
+        const bool flexible = header.apiKey == ALTER_PARTITIONS ||
+                              (header.apiKey == API_VERSIONS && header.apiVersion >= 3);
+        header.clientID = flexible ? reader.readCompactNullableString() : reader.readNullableString();
+        if (flexible) skipTags(reader, "request header");
         if (header.clientID.size() > 256) throw ProtocolError("Kafka client id is too long");
-        if (!supported(header)) {
+        if (!supported(header) && header.apiKey != API_VERSIONS) {
             throw ProtocolError("unsupported Kafka API " + std::to_string(header.apiKey) +
                                 " version " + std::to_string(header.apiVersion));
         }
@@ -1074,10 +1086,23 @@ std::vector<uint8_t> Connection::dispatch(const RequestHeader& header, Reader& r
     }
     Writer writer;
     writer.writeInt32(header.correlationID);
-    if (header.apiKey == ALTER_PARTITIONS) writer.writeUnsignedVarint(0);
+    const bool flexible = header.apiKey == ALTER_PARTITIONS ||
+                          (header.apiKey == API_VERSIONS && header.apiVersion >= 3);
+    if (flexible) writer.writeUnsignedVarint(0);
     switch (header.apiKey) {
     case API_VERSIONS:
-        writeApiVersions(writer, header.apiVersion);
+        if (supported(header)) {
+            writeApiVersions(writer, header.apiVersion);
+        } else {
+            if (header.apiVersion >= 3) {
+                (void)reader.readCompactNullableString();
+                (void)reader.readCompactNullableString();
+                skipTags(reader, "ApiVersions body");
+            }
+            // Kafka ApiVersions v3+ uses response header v1 but an unsupported
+            // version is answered with the v0 body, including no throttle time.
+            writeApiVersions(writer, 0, Error::UNSUPPORTED_VERSION);
+        }
         break;
     case METADATA:
         writeMetadata(writer, *broker, reader, header.apiVersion, user);

@@ -57,6 +57,8 @@ public:
     void discardQueue(const std::string& queue);
     std::optional<Delivery> discardDelivery(uint16_t channel, uint64_t deliveryTag);
     std::vector<Delivery> snapshotUnacked() const;
+    void openChannelForTest(uint16_t channel, const std::string& consumerTag = "",
+                            const std::string& queue = "");
 
 private:
     enum class Phase { PROTOCOL, START, TUNE, OPEN, CLOSED };
